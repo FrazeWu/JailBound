@@ -1,0 +1,26 @@
+[project]
+name = "comprehensive-bench"
+version = "0.1.0"
+description = "Implementation code and offline review tests for a modular benchmark workflow."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = ["requests>=2.31"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/corpora", "tests/test_python_sources_compile.py"]
+pythonpath = ["src"]
+addopts = "-ra"

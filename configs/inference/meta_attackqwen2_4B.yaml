@@ -1,0 +1,19 @@
+# qwen2.5-4b-infer-lora.yaml
+### model
+model_name_or_path: zemelee/qwen2.5-jailbreak
+adapter_name_or_path: saves/qwen2.5-4B/lora/meta-attack
+trust_remote_code: true
+
+### template
+template: qwen3
+
+### inference
+finetuning_type: lora
+infer_backend: huggingface
+infer_dtype: bfloat16
+max_new_tokens: 512
+temperature: 0.7
+top_p: 0.9
+top_k: 50
+repetition_penalty: 1.05
+do_sample: true

@@ -1,0 +1,47 @@
+# Ablation experiment matrix
+experiments:
+  B0_pair:
+    name: "PAIR Baseline"
+    method: "pair"
+    target_model: "qwen_72b"
+    num_iterations: 20
+    behaviors_file: "data/harmbench_behaviors.jsonl"
+
+  B1_tap:
+    name: "TAP Baseline"
+    method: "tap"
+    target_model: "qwen_72b"
+    tree_width: 10
+    tree_depth: 10
+    behaviors_file: "data/harmbench_behaviors.jsonl"
+
+  A1_gpo:
+    name: "GPO Only"
+    method: "gpo_only"
+    target_model: "qwen_72b"
+    num_epochs: 3
+    behaviors_file: "data/harmbench_behaviors.jsonl"
+
+  A2_unalign:
+    name: "Unalignment Model Only"
+    method: "unalign_only"
+    target_model: "qwen_72b"
+    adapter_path: "../attack_model/LLaMA-Factory/saves/qwen3-4b/lora/meta-attack"
+    behaviors_file: "data/harmbench_behaviors.jsonl"
+
+  A3_gpo_unalign:
+    name: "GPO + Unalignment"
+    method: "gpo_unalign"
+    target_model: "qwen_72b"
+    num_epochs: 3
+    adapter_path: "../attack_model/LLaMA-Factory/saves/qwen3-4b/lora/meta-attack"
+    behaviors_file: "data/harmbench_behaviors.jsonl"
+
+  A4_full:
+    name: "Full Framework"
+    method: "full"
+    target_model: "qwen_72b"
+    num_epochs: 3
+    adapter_path: "../attack_model/LLaMA-Factory/saves/qwen3-4b/lora/meta-attack"
+    use_quote: true
+    behaviors_file: "data/harmbench_behaviors.jsonl"

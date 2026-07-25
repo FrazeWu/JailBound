@@ -1,0 +1,152 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ============================================================
+# AI agent context files (not versioned)
+# ============================================================
+CLAUDE.md
+AGENTS.md
+CURRENT_STATUS.md
+overview.md
+**/AGENTS.md
+.sisyphus/
+.claude/
+.codex/
+.cursor/
+.aider*
+.continue/
+.copilot/
+.windsurf/
+.roo/
+.kilocode/
+.cline/
+.agents/
+.agent/
+agent_sessions/
+agent-cache/
+agent_cache/
+
+# ============================================================
+# Runtime logs
+# ============================================================
+nohup.out
+logs/*.log
+logs/*.json
+
+# ============================================================
+# Data (regeneratable / large / external)
+# ============================================================
+data/**
+!data/.gitkeep
+!data/**/.gitkeep
+!data/**/README.md
+
+# ============================================================
+# Outputs (experiment products, checkpoints, figures)
+# ============================================================
+outputs/**
+!outputs/.gitkeep
+!outputs/**/.gitkeep
+!outputs/**/README.md
+
+# ============================================================
+# Third-party (LLaMA-Factory is a submodule; don't track its contents here)
+# ============================================================
+third_party/LLaMA-Factory/
+
+# Paper LaTeX build artefacts
+paper/**/*.aux
+paper/**/*.log
+paper/**/*.out
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.toc
+paper/**/_minted-*/
+
+# Training framework artefacts
+**/wandb/
+**/saves/
+
+# Lockfiles
+*.lock
+!uv.lock
+
+# Local-only research material
+docs/superpowers/
+01benchmark-datasets/
+datasets/
+paper/
+logs/
+configs/review_artifact/
+src/review_artifact/
+tests/review_artifact/
+.gitmodules
+comments.md
+uv.lock
+data/**
+outputs/**
+
+# Dataset, result, and generated-artifact files.
+*.jsonl
+*.zip
+*.tar
+*.tar.gz
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.csv
+*.parquet
+!datasets/review_artifact/synthetic_records.jsonl
+src/generator/s_eval/full/
+src/generator/s_eval/large/
+src/generator/s_eval/small/
+src/generator/s_eval/output/
+
+# Generated Python packaging and cache files.
+**/__pycache__/
+*.egg-info/
+
+# Reviewer documentation is intentionally limited to the release notes.
+docs/*
+!docs/release/
+!docs/release/**
+
+# Local model inventories, training catalogues, and deployment-only scripts.
+configs/models/
+configs/training/llamafactory_dataset_info.json
+configs/benchmark/reviewer_additions.yaml
+scripts/manage_models.py
+scripts/download_llama70_remaining.py
+scripts/monitor_downloads.sh
+scripts/reorganize_llm_datasets.sh
+scripts/reorganize_phase2.sh
+scripts/attack/sft_build/build_sft_seval_full.py
+tests/benchmark/test_wildguard_support.py
+tests/benchmark/
+tests/reviewer_eval/
