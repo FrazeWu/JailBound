@@ -1,14 +1,112 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping, NoReturn, Self
 
 from omegaconf import OmegaConf
 from pydantic import BaseModel, ConfigDict, model_validator
 
 
+_MODEL_COPY_UPDATE_UNSET = object()
+
+
+class FrozenList(list[Any]):
+    def _reject_mutation(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise TypeError("frozen list cannot be modified")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __iadd__ = _reject_mutation
+    __imul__ = _reject_mutation
+    append = _reject_mutation
+    clear = _reject_mutation
+    extend = _reject_mutation
+    insert = _reject_mutation
+    pop = _reject_mutation
+    remove = _reject_mutation
+    reverse = _reject_mutation
+    sort = _reject_mutation
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(self) -> tuple[Any, tuple[list[Any]]]:
+        return (_restore_frozen_list, (list(self),))
+
+
+class FrozenDict(dict[Any, Any]):
+    def _reject_mutation(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise TypeError("frozen dict cannot be modified")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __ior__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[Any, Any]]]:
+        return (_restore_frozen_dict, (dict(self),))
+
+
+def _restore_frozen_list(values: list[Any]) -> FrozenList:
+    return FrozenList(values)
+
+
+def _restore_frozen_dict(values: dict[Any, Any]) -> FrozenDict:
+    return FrozenDict(values)
+
+
+def _freeze_nested(value: Any) -> Any:
+    if isinstance(value, (FrozenList, FrozenDict)):
+        return value
+    if isinstance(value, list):
+        return FrozenList(_freeze_nested(item) for item in value)
+    if isinstance(value, dict):
+        return FrozenDict(
+            (key, _freeze_nested(item)) for key, item in value.items()
+        )
+    if isinstance(value, tuple):
+        return tuple(_freeze_nested(item) for item in value)
+    return value
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    def model_post_init(self, __context: Any) -> None:
+        for field_name in type(self).model_fields:
+            object.__setattr__(
+                self,
+                field_name,
+                _freeze_nested(getattr(self, field_name)),
+            )
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | object = _MODEL_COPY_UPDATE_UNSET,
+        deep: bool = False,
+    ) -> Self:
+        if update is not _MODEL_COPY_UPDATE_UNSET:
+            raise TypeError(
+                "StrictModel.model_copy does not accept update; "
+                "use model_dump() and model_validate()"
+            )
+        return super().model_copy(deep=deep)
 
 
 class RunConfig(StrictModel):
@@ -16,6 +114,7 @@ class RunConfig(StrictModel):
     seed: Literal[20260725]
     output_root: Path
     locked_config_name: str
+    attention_implementation: Literal["eager"]
 
 
 class DataConfig(StrictModel):
@@ -41,7 +140,6 @@ class ModelsConfig(StrictModel):
     targets: list[ModelSpec]
     semantic_encoder: ModelSpec
     octopus: ModelSpec
-    wildguard: ModelSpec
 
 
 class OptimizationConfig(StrictModel):
@@ -76,6 +174,9 @@ class JudgeSpec(StrictModel):
     key: str
     threshold: float
     threshold_offsets: list[float]
+    model: str | None = None
+    endpoint: str | None = None
+    temperature: float = 0.0
 
 
 class JudgingConfig(StrictModel):
@@ -137,15 +238,10 @@ class ExperimentConfig(StrictModel):
             "jailbound_o_plus",
             "dual_branch",
         ]
-        expected_targets = [
-            "qwen2_5_14b",
-            "qwen2_5_7b",
-            "llama3_1_8b",
-            "gemma2_9b",
-        ]
-        if self.data.sources != expected_sources or self.data.samples_per_source != 50:
+        expected_targets = ["qwen2_5_7b"]
+        if self.data.sources != expected_sources or self.data.samples_per_source != 17:
             raise ValueError(
-                "controlled data must use seven approved sources with 50 samples each"
+                "controlled data must use seven approved sources with 17 samples each"
             )
         if self.optimization.methods != expected_methods:
             raise ValueError("optimization method identities or order changed")
@@ -157,16 +253,37 @@ class ExperimentConfig(StrictModel):
             raise ValueError("checkpoint policy must be 0/25/50/100")
         if [model.key for model in self.models.targets] != expected_targets:
             raise ValueError("target models must remain in the approved serial order")
-        if self.models.surrogate.key != "qwen2_5_14b":
-            raise ValueError("white-box surrogate must be Qwen2.5-14B-Instruct")
+        if self.models.surrogate.key != "qwen2_5_7b":
+            raise ValueError("white-box surrogate must be the local Qwen2.5-7B-Instruct")
+        primary = self.judging.primary
+        if (
+            primary.key,
+            primary.model,
+            primary.endpoint,
+            primary.temperature,
+        ) != ("octopus_seval_14b", None, None, 0.0):
+            raise ValueError("primary judge must remain the approved local Octopus definition")
+        secondary = self.judging.secondary
+        if (
+            secondary.key,
+            secondary.model,
+            secondary.endpoint,
+            secondary.temperature,
+        ) != (
+            "qwen32_compat",
+            "qwen3-32b-awq",
+            "http://localhost:8001/v1",
+            0.0,
+        ):
+            raise ValueError("secondary judge must remain the approved local Qwen compatibility endpoint")
         if (
             self.fol.validation_per_source,
             self.fol.low,
             self.fol.middle,
             self.fol.high,
-        ) != (31, 11, 9, 11):
+        ) != (17, 7, 3, 7):
             raise ValueError(
-                "FOL validation must retain the approved 11/9/11 split within 31"
+                "FOL validation must retain the approved 7/3/7 split within 17"
             )
         if self.fol.sources != ["jailbound", "s_eval"]:
             raise ValueError(

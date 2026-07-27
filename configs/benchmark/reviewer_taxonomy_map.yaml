@@ -1,0 +1,125 @@
+schema_version: reviewer_taxonomy.v1
+
+risk_categories:
+  discrimination_toxicity: {description: "Discrimination, exclusion, harassment, or toxic content."}
+  sexual_graphic: {description: "Sexually explicit or graphically violent material."}
+  privacy_personal_data: {description: "Exposure, extraction, or misuse of personal data."}
+  sensitive_org_gov: {description: "Sensitive organizational or government information."}
+  cybersecurity_misuse: {description: "Misuse of digital systems, vulnerabilities, or security tools."}
+  illegal_criminal: {description: "Illegal wrongdoing or criminal enablement."}
+  fraud_scam: {description: "Fraud, scams, deception, or social engineering."}
+  malicious_influence: {description: "Manipulative influence or coordinated disinformation campaigns."}
+  misinformation_reliability: {description: "Misinformation, unreliable claims, or factual harms."}
+  high_stakes_advice: {description: "Unsafe advice in health, law, finance, or safety-critical contexts."}
+  unsafe_unethical: {description: "Unsafe, self-harm-related, or unethical behavioral encouragement."}
+  human_chatbot_harm: {description: "Harms arising from reliance on or manipulation through chatbot interactions."}
+
+threat_domains:
+  public_security_law_enforcement: {source_label: "Public Security / Law Enforcement", description: "Policing, investigations, incident reporting, and public safety workflows."}
+  healthcare_medicine: {source_label: "Healthcare / Medicine", description: "Health information, treatment, and patient-facing assistance."}
+  finance_payments: {source_label: "Finance / Payments", description: "Financial services, payments, and transaction workflows."}
+  legal_government_services: {source_label: "Legal / Government Services", description: "Legal, policy, and public service guidance."}
+  education: {source_label: "Education", description: "Teaching, learning, and academic assistance."}
+  science_research: {source_label: "Science / Research", description: "Scientific research and laboratory workflows."}
+  enterprise_knowledge_base_rag: {source_label: "Enterprise Knowledge Base / RAG", description: "Internal retrieval, document, and enterprise knowledge systems."}
+  security_operations_cybersecurity: {source_label: "Security Operations / CyberSecurity", description: "Security monitoring, analysis, and incident response."}
+  content_platforms_community_moderation: {source_label: "Content Platforms / Community Moderation", description: "Content review, moderation, and community governance."}
+  developer_tools_code: {source_label: "Developer Tools / Code", description: "Coding assistants, tools, and agentic development workflows."}
+
+attack_types:
+  persuasion_deception: {source_label: "Persuasion & Deception", description: "Persuasive, deceptive, or authority-based framing."}
+  scenario_nesting: {source_label: "Scenario Nesting", description: "Nested fictional, hypothetical, or role-play framing."}
+  input_fragmentation: {source_label: "Input Fragmentation", description: "Distributed or fragmented request construction."}
+  contextual_demonstration: {source_label: "Contextual Demonstration", description: "Contextual examples or demonstrations that shape completion."}
+  obfuscation_encryption: {source_label: "Obfuscation & Encryption", description: "Obfuscated, encoded, or alternative representations."}
+  formal_language: {source_label: "Formal Language Exploitation", description: "Formal, academic, legal, or technical framing."}
+  prefix_injection: {source_label: "Prefix Injection", description: "Injected or overriding instruction prefixes."}
+  code_injection: {source_label: "Code Injection", description: "Injected instructions in code or tool contexts."}
+  compositional_hybrid: {source_label: "Compositional / Hybrid Attacks", description: "Combinations of multiple prompt strategies."}
+  direct_request: {source_label: "direct_request", description: "Unmodified direct-request control."}
+
+jailbound_attack_type:
+  "Persuasion & Deception": persuasion_deception
+  "Scenario Nesting": scenario_nesting
+  "Input Fragmentation": input_fragmentation
+  "Contextual Demonstration": contextual_demonstration
+  "Obfuscation & Encryption": obfuscation_encryption
+  "Formal Language Exploitation": formal_language
+  "Prefix Injection": prefix_injection
+  "Code Injection": code_injection
+  "Compositional / Hybrid Attacks": compositional_hybrid
+
+jailbound_risk_category:
+  "Human-Chatbot Interaction Harms": human_chatbot_harm
+  "Human–Chatbot Interaction Harms": human_chatbot_harm
+  "Discrimination, Exclusion & Toxicity": discrimination_toxicity
+  "Sexual & Graphic Content": sexual_graphic
+  "Privacy & Personal Data": privacy_personal_data
+  "Sensitive Organizational / Government Information": sensitive_org_gov
+  "Cybersecurity Misuse": cybersecurity_misuse
+  "Illegal Wrongdoing & Criminal Enablement": illegal_criminal
+  "Fraud, Scams & Social Engineering": fraud_scam
+  "Malicious Influence & Disinformation Campaigns": malicious_influence
+  "Misinformation & Reliability Harms": misinformation_reliability
+  "High-stakes Advice Harm": high_stakes_advice
+  "Unsafe or Unethical Behavioral Encouragement": unsafe_unethical
+
+s_eval_risk_category:
+  Crimes_and_Illegal_Activities: illegal_criminal
+  Cybersecurity: cybersecurity_misuse
+  Data_Privacy: privacy_personal_data
+  Ethics_and_Morality: unsafe_unethical
+  Extremism: malicious_influence
+  Hate_Speech: discrimination_toxicity
+  Inappropriate_Suggestions: high_stakes_advice
+  Physical_and_Mental_Health: high_stakes_advice
+
+s_eval_attack_type:
+  chain_of_utterances: input_fragmentation
+  code_injection: code_injection
+  compositional_instructions: compositional_hybrid
+  deepinception: scenario_nesting
+  goal_hijacking: prefix_injection
+  in_context_attack: contextual_demonstration
+  instruction_encryption: obfuscation_encryption
+  instruction_jailbreak: formal_language
+  positive_induction: persuasion_deception
+  reverse_induction: persuasion_deception
+
+exact_risk_category:
+  harmbench:
+    chemical_biological: illegal_criminal
+    cybercrime_intrusion: cybersecurity_misuse
+    harassment_bullying: discrimination_toxicity
+  safetybench:
+    "Ethics and Morality": unsafe_unethical
+    "Illegal Activities": illegal_criminal
+    "Mental Health": unsafe_unethical
+    "Offensiveness": discrimination_toxicity
+    "Physical Health": high_stakes_advice
+    "Privacy and Property": privacy_personal_data
+    "Unfairness and Bias": discrimination_toxicity
+  jailbreakbench:
+    Disinformation: misinformation_reliability
+    "Economic harm": fraud_scam
+    "Expert advice": high_stakes_advice
+    "Fraud/Deception": fraud_scam
+    "Government decision-making": sensitive_org_gov
+    "Harassment/Discrimination": discrimination_toxicity
+    "Malware/Hacking": cybersecurity_misuse
+    "Physical harm": unsafe_unethical
+    Privacy: privacy_personal_data
+    "Sexual/Adult content": sexual_graphic
+  sg_bench:
+    O1: discrimination_toxicity
+    O2: discrimination_toxicity
+    O3: misinformation_reliability
+    O4: privacy_personal_data
+
+broad_risk_candidates:
+  harmbench.illegal: [illegal_criminal, fraud_scam, privacy_personal_data]
+  harmbench.harmful: [discrimination_toxicity, sexual_graphic, high_stakes_advice, unsafe_unethical, human_chatbot_harm]
+  harmbench.misinformation_disinformation: [malicious_influence, misinformation_reliability]
+  sg_bench.O5: [illegal_criminal, cybersecurity_misuse, unsafe_unethical, high_stakes_advice]
+  sg_bench.O6: [illegal_criminal, fraud_scam, cybersecurity_misuse, privacy_personal_data]
+  advbench.unlabeled: [discrimination_toxicity, sexual_graphic, privacy_personal_data, sensitive_org_gov, cybersecurity_misuse, illegal_criminal, fraud_scam, malicious_influence, misinformation_reliability, high_stakes_advice, unsafe_unethical, human_chatbot_harm]

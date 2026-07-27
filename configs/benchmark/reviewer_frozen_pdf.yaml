@@ -1,0 +1,36 @@
+pdf:
+  sha256: f44b5bf816d333218f109ca0af216b6635dd0921875f56eaaa488bf6b7cf2b91
+results:
+  - {table: 2, pdf_page: 7, row: AdvBench, column: Init, value: 0.9}
+  - {table: 2, pdf_page: 7, row: AdvBench, column: High-value, value: 61.9}
+  - {table: 2, pdf_page: 7, row: AdvBench, column: Safety Boundary, value: 71.8}
+  - {table: 2, pdf_page: 7, row: AdvBench, column: Avg., value: 66.9}
+  - {table: 2, pdf_page: 7, row: HarmBench, column: Init, value: 15.5}
+  - {table: 2, pdf_page: 7, row: HarmBench, column: High-value, value: 56.4}
+  - {table: 2, pdf_page: 7, row: HarmBench, column: Safety Boundary, value: 54.5}
+  - {table: 2, pdf_page: 7, row: HarmBench, column: Avg., value: 55.5}
+  - {table: 2, pdf_page: 7, row: SafetyBench, column: Init, value: 1.8}
+  - {table: 2, pdf_page: 7, row: SafetyBench, column: High-value, value: 16.4}
+  - {table: 2, pdf_page: 7, row: SafetyBench, column: Safety Boundary, value: 28.2}
+  - {table: 2, pdf_page: 7, row: SafetyBench, column: Avg., value: 22.3}
+  - {table: 2, pdf_page: 7, row: SG-Bench, column: Init, value: 6.4}
+  - {table: 2, pdf_page: 7, row: SG-Bench, column: High-value, value: 68.2}
+  - {table: 2, pdf_page: 7, row: SG-Bench, column: Safety Boundary, value: 60.0}
+  - {table: 2, pdf_page: 7, row: SG-Bench, column: Avg., value: 64.1}
+  - {table: 2, pdf_page: 7, row: JailbreakBench, column: Init, value: 7.0}
+  - {table: 2, pdf_page: 7, row: JailbreakBench, column: High-value, value: 37.0}
+  - {table: 2, pdf_page: 7, row: JailbreakBench, column: Safety Boundary, value: 24.0}
+  - {table: 2, pdf_page: 7, row: JailbreakBench, column: Avg., value: 30.5}
+  - {table: 2, pdf_page: 7, row: JailBound, column: Init, value: 16.4}
+  - {table: 2, pdf_page: 7, row: JailBound, column: High-value, value: 71.6}
+  - {table: 2, pdf_page: 7, row: JailBound, column: Safety Boundary, value: 48.4}
+  - {table: 2, pdf_page: 7, row: JailBound, column: Avg., value: 60.0}
+  - {table: 4, pdf_page: 8, row: Qwen2.5-7B-Instruct, column: Init, value: 18.8}
+  - {table: 4, pdf_page: 8, row: Qwen2.5-7B-Instruct, column: High-value, value: 57.8}
+  - {table: 4, pdf_page: 8, row: Qwen2.5-7B-Instruct, column: Safety Boundary, value: 43.4}
+  - {table: 4, pdf_page: 8, row: Qwen2.5-7B-Instruct, column: Avg., value: 50.6}
+  - {table: 4, pdf_page: 8, row: Qwen2.5-7B-Instruct, column: RCR, value: 41.3}
+  - {table: 5, pdf_page: 9, row: Qwen2.5-7B-Instruct, column: Init, value: 28.8}
+  - {table: 5, pdf_page: 9, row: Qwen2.5-7B-Instruct, column: High-value, value: 31.5}
+  - {table: 5, pdf_page: 9, row: Qwen2.5-7B-Instruct, column: Safety Boundary, value: 52.3}
+  - {table: 5, pdf_page: 9, row: Qwen2.5-7B-Instruct, column: Avg., value: 41.9}
