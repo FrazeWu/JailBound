@@ -10,22 +10,23 @@ from typing import Any
 
 import torch
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.execution import _anchor_token_ids, _embedding_device, load_local_qwen
-from benchmark.reviewer_eval.fol_boundary import (
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.execution import _anchor_token_ids, _embedding_device, load_local_qwen
+from benchmark.safety_eval.fol_records import resolved_terminal_payloads
+from benchmark.safety_eval.fol_boundary import (
     LabeledEditableState,
     interpolate_joint_states,
     random_joint_direction,
     select_nearest_opposite_label_pairs,
 )
-from benchmark.reviewer_eval.io import atomic_write_jsonl, canonical_hash, read_jsonl
-from benchmark.reviewer_eval.materialization import materialize_checkpoint
-from benchmark.reviewer_eval.objective import EditableState
-from benchmark.reviewer_eval.pipeline import generate_materialized_records, write_stage_records
-from benchmark.reviewer_eval.runtime import validate_model_assets
-from benchmark.reviewer_eval.schema import BenchmarkExample, JudgmentRecord, OptimizationRecord, RecordStatus, stable_id
-from benchmark.reviewer_eval.semantic import QwenHiddenMeanEncoder
-from benchmark.reviewer_eval.transformer_objective import TransformerAttackObjective
+from benchmark.safety_eval.io import atomic_write_jsonl, canonical_hash, read_jsonl
+from benchmark.safety_eval.materialization import materialize_checkpoint
+from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.pipeline import generate_materialized_records, write_stage_records
+from benchmark.safety_eval.runtime import validate_model_assets
+from benchmark.safety_eval.schema import BenchmarkExample, JudgmentRecord, OptimizationRecord, RecordStatus, stable_id
+from benchmark.safety_eval.semantic import QwenHiddenMeanEncoder
+from benchmark.safety_eval.transformer_objective import TransformerAttackObjective
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +55,7 @@ def _records(root: Path, source: str) -> tuple[dict[str, BenchmarkExample], dict
     }
     optimized = {
         row.sample_id: row
-        for row in (OptimizationRecord.model_validate(row) for row in read_jsonl(root / "optimization" / source / "jailbound_o_plus" / "records.jsonl"))
+        for row in (OptimizationRecord.model_validate(row) for row in resolved_terminal_payloads(root, source).values())
         if row.checkpoint == 100 and row.status is RecordStatus.complete and row.state_path
     }
     if set(examples) != set(optimized):

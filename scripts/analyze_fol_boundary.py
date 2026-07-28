@@ -7,9 +7,14 @@ import csv
 import json
 from pathlib import Path
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.analysis import FolFlipPrediction, grouped_flip_prediction_comparison
-from benchmark.reviewer_eval.fol_boundary import (
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.analysis import (
+    FolClaimEvidence,
+    FolFlipPrediction,
+    decide_fol_claim,
+    grouped_flip_prediction_comparison,
+)
+from benchmark.safety_eval.fol_boundary import (
     FolPerturbationOutcome,
     InterpolationPoint,
     MarginCalibrationRow,
@@ -20,8 +25,9 @@ from benchmark.reviewer_eval.fol_boundary import (
     summarize_interpolation_peaks,
     summarize_fol_bfr,
 )
-from benchmark.reviewer_eval.io import atomic_write_json, read_jsonl
-from benchmark.reviewer_eval.schema import JudgmentRecord, OptimizationRecord, RecordStatus
+from benchmark.safety_eval.fol_records import resolved_terminal_payloads
+from benchmark.safety_eval.io import atomic_write_json, read_jsonl
+from benchmark.safety_eval.schema import JudgmentRecord, OptimizationRecord, RecordStatus
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -495,7 +501,7 @@ def _write_d50(destination: Path, rows: list[dict[str, object]]) -> None:
 def _terminal_fol(root: Path, sources: tuple[str, ...]) -> dict[tuple[str, str], float]:
     values: dict[tuple[str, str], float] = {}
     for source in sources:
-        for payload in read_jsonl(root / "optimization" / source / "jailbound_o_plus" / "records.jsonl"):
+        for payload in resolved_terminal_payloads(root, source).values():
             record = OptimizationRecord.model_validate(payload)
             if record.checkpoint != 100 or record.status is not RecordStatus.complete:
                 continue
@@ -584,12 +590,65 @@ def _write_h1(destination: Path, rows: tuple[FolPerturbationOutcome, ...], minim
             })
 
 
+def _claim_payload(
+    *,
+    h3: dict[str, dict[str, object]],
+    failures: dict[str, int],
+    usable_directions: int,
+    minimum_paths: int,
+) -> dict[str, object]:
+    sources = tuple(sorted(h3))
+    valid_paths = {
+        source: int(h3[source].get("valid_paths", 0))
+        for source in sources
+    }
+    if usable_directions < 0 or minimum_paths < 1 or any(value < 0 for value in failures.values()):
+        raise ValueError("FOL claim inputs are invalid")
+    observed_minimum = min(valid_paths.values(), default=0)
+    evidence = FolClaimEvidence(
+        h1=False,
+        h2=False,
+        h3=all(h3[source].get("status") == "ready" for source in sources),
+        h4=False,
+        secondary_same_direction=False,
+        valid_paths=observed_minimum,
+        usable_fraction=1.0 if usable_directions else 0.0,
+        band_acceptance_difference=0.0,
+        h1_interval_width=float("inf"),
+        h2_interval_width=float("inf"),
+    )
+    decision = decide_fol_claim(evidence)
+    reason = "interpolation_underpowered" if observed_minimum < minimum_paths else "hypothesis_evidence_incomplete"
+    return {
+        "decision": decision,
+        "provenance": "new_run",
+        "reason": reason,
+        "quality_gates": {
+            "minimum_valid_paths_per_source": minimum_paths,
+            **{f"{source}_valid_paths": valid_paths[source] for source in sources},
+            "interpolation_gate_passed": observed_minimum >= minimum_paths,
+        },
+        "execution": {
+            "dual_judge_usable_directions": usable_directions,
+            "judgment_failures": sum(failures.values()),
+        },
+        "interpretation": "No boundary-proximity claim is supported when the pre-registered interpolation quality gate is not met.",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--fol-root", type=Path)
+    parser.add_argument("--state-fol-root", type=Path)
     args = parser.parse_args()
     config = load_config(args.config)
-    root = ROOT / config.run.output_root / "fol_boundary"
+    root = args.fol_root or (ROOT / config.run.output_root / "fol_boundary")
+    if not root.is_absolute():
+        root = ROOT / root
+    state_root = args.state_fol_root or root
+    if not state_root.is_absolute():
+        state_root = ROOT / state_root
     rows, failures = _outcomes(
         root,
         primary_key=config.judging.primary.key,
@@ -607,7 +666,7 @@ def main() -> int:
     _write_h2(
         analysis / "fol_h2_d50.csv",
         d50_rows,
-        _terminal_fol(root, tuple(config.fol.sources)),
+        _terminal_fol(state_root, tuple(config.fol.sources)),
     )
     _write_h1(analysis / "fol_h1_bfr.csv", rows, config.fol.minimum_accepted_directions)
     h3 = _write_h3(
@@ -638,6 +697,15 @@ def main() -> int:
         "interpolation": h3,
         "controls": h4,
     })
+    atomic_write_json(
+        analysis / "fol_boundary_claim.json",
+        _claim_payload(
+            h3=h3,
+            failures=failures,
+            usable_directions=len(rows),
+            minimum_paths=config.fol.minimum_valid_paths,
+        ),
+    )
     print(json.dumps({"directions": len(rows), "judgment_failures": failures}, sort_keys=True))
     return 0
 

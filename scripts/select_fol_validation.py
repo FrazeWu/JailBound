@@ -10,13 +10,14 @@ from typing import Any
 
 import torch
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.execution import load_local_qwen
-from benchmark.reviewer_eval.fol_runtime import causal_perplexity, select_fol_experiment
-from benchmark.reviewer_eval.io import atomic_write_json, atomic_write_jsonl, read_jsonl
-from benchmark.reviewer_eval.manifest import FolCandidate
-from benchmark.reviewer_eval.runtime import validate_model_assets
-from benchmark.reviewer_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.execution import load_local_qwen
+from benchmark.safety_eval.fol_records import resolved_terminal_payloads
+from benchmark.safety_eval.fol_runtime import causal_perplexity, select_fol_experiment
+from benchmark.safety_eval.io import atomic_write_json, atomic_write_jsonl, read_jsonl
+from benchmark.safety_eval.manifest import FolCandidate
+from benchmark.safety_eval.runtime import validate_model_assets
+from benchmark.safety_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +56,7 @@ def _candidates(root: Path, source: str, *, model: Any, tokenizer: Any) -> tuple
         row.sample_id: row
         for row in (
             OptimizationRecord.model_validate(row)
-            for row in read_jsonl(root / "optimization" / source / "jailbound_o_plus" / "records.jsonl")
+            for row in resolved_terminal_payloads(root, source).values()
         )
         if row.checkpoint == 100 and row.status is RecordStatus.complete
     }
@@ -112,6 +113,10 @@ def main() -> int:
                 "middle": list(selection.middle),
                 "high": list(selection.high),
                 "radius_calibration": list(selection.radius_calibration),
+                "matching": {
+                    "caliper": selection.matching_caliper,
+                    "pair_distances": list(selection.matching_distances),
+                },
             }
     finally:
         handle.close()

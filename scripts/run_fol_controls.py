@@ -10,18 +10,31 @@ from typing import Any
 
 import torch
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.execution import _anchor_token_ids, _embedding_device, load_local_qwen
-from benchmark.reviewer_eval.fol_boundary import random_joint_direction
-from benchmark.reviewer_eval.fol_runtime import causal_perplexity
-from benchmark.reviewer_eval.io import atomic_write_jsonl, canonical_hash, read_jsonl
-from benchmark.reviewer_eval.objective import EditableState
-from benchmark.reviewer_eval.runtime import validate_model_assets
-from benchmark.reviewer_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus
-from benchmark.reviewer_eval.transformer_objective import TransformerAttackObjective
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.execution import _anchor_token_ids, _embedding_device, load_local_qwen
+from benchmark.safety_eval.fol_records import resolved_terminal_payloads
+from benchmark.safety_eval.fol_boundary import random_joint_direction
+from benchmark.safety_eval.fol_runtime import causal_perplexity
+from benchmark.safety_eval.io import JsonlLedger, canonical_hash, read_jsonl
+from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.runtime import validate_model_assets
+from benchmark.safety_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus
+from benchmark.safety_eval.transformer_objective import TransformerAttackObjective
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _selected_sources(configured: tuple[str, ...], requested: list[str] | None) -> tuple[str, ...]:
+    sources = tuple(requested or configured)
+    if set(sources) - set(configured):
+        raise ValueError("FOL controls requested an unconfigured source")
+    return sources
+
+
+def _append_control_rows(path: Path, rows: list[dict[str, object]]) -> int:
+    ledger = JsonlLedger(path, key_fields=("source", "sample_id"))
+    return sum(ledger.append_once(row) for row in rows)
 
 
 def _validation_ids(root: Path, source: str) -> set[str]:
@@ -45,7 +58,7 @@ def _records(root: Path, source: str) -> tuple[dict[str, BenchmarkExample], dict
     }
     terminal = {
         row.sample_id: row
-        for row in (OptimizationRecord.model_validate(row) for row in read_jsonl(root / "optimization" / source / "jailbound_o_plus" / "records.jsonl"))
+        for row in (OptimizationRecord.model_validate(row) for row in resolved_terminal_payloads(root, source).values())
         if row.checkpoint == 100 and row.status is RecordStatus.complete and row.state_path
     }
     if set(examples) != set(terminal):
@@ -133,8 +146,10 @@ def _perplexity(example: BenchmarkExample, *, model: Any, tokenizer: Any) -> flo
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--source", action="append")
     args = parser.parse_args()
     config = load_config(args.config)
+    sources = _selected_sources(tuple(config.fol.sources), args.source)
     root = ROOT / config.run.output_root / "fol_boundary"
     model_path = config.models.surrogate.local_path
     if model_path is None:
@@ -146,7 +161,7 @@ def main() -> int:
             raise ValueError("local FOL control model did not load")
         device, dtype = handle.model.get_input_embeddings().weight.device, handle.model.get_input_embeddings().weight.dtype
         rows: list[dict[str, object]] = []
-        for source in config.fol.sources:
+        for source in sources:
             examples, terminal = _records(root, source)
             validation_ids = _validation_ids(root, source)
             if len(validation_ids) != config.fol.validation_per_source:
@@ -177,8 +192,8 @@ def main() -> int:
                 })
     finally:
         handle.close()
-    atomic_write_jsonl(root / "controls.jsonl", rows)
-    print(json.dumps({"controls": len(rows)}, sort_keys=True))
+    written = _append_control_rows(root / "controls.jsonl", rows)
+    print(json.dumps({"controls": len(rows), "written": written}, sort_keys=True))
     return 0
 
 

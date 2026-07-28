@@ -6,13 +6,13 @@ import argparse
 import json
 from pathlib import Path
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.execution import load_local_qwen
-from benchmark.reviewer_eval.io import read_jsonl
-from benchmark.reviewer_eval.judging import OctopusLocalJudge, Qwen32CompatJudge
-from benchmark.reviewer_eval.pipeline import judge_response_records
-from benchmark.reviewer_eval.runtime import validate_model_assets
-from benchmark.reviewer_eval.schema import ResponseRecord
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.execution import load_local_qwen
+from benchmark.safety_eval.io import read_jsonl
+from benchmark.safety_eval.judging import OctopusLocalJudge, Qwen32CompatJudge
+from benchmark.safety_eval.pipeline import judge_response_records
+from benchmark.safety_eval.runtime import validate_model_assets
+from benchmark.safety_eval.schema import ResponseRecord
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,12 +54,15 @@ def main() -> int:
     parser.add_argument("--judge", choices=("primary", "secondary"), required=True)
     parser.add_argument("--method", choices=("fol_boundary", "fol_interpolation"), default="fol_boundary")
     parser.add_argument("--source", action="append")
+    parser.add_argument("--fol-root", type=Path)
     args = parser.parse_args()
     config = load_config(args.config)
     sources = tuple(args.source or config.fol.sources)
     if set(sources) - set(config.fol.sources):
         raise ValueError("FOL judging requested an unconfigured source")
-    root = ROOT / config.run.output_root / "fol_boundary"
+    root = args.fol_root or (ROOT / config.run.output_root / "fol_boundary")
+    if not root.is_absolute():
+        root = ROOT / root
     target_key = config.models.targets[0].key
     responses = _responses(root, target_key=target_key, sources=sources, method=args.method)
     if args.judge == "primary":

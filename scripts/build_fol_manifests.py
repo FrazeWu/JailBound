@@ -6,16 +6,16 @@ import argparse
 import hashlib
 from pathlib import Path
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.datasets import load_source_with_report
-from benchmark.reviewer_eval.fol_runtime import select_fol_candidates
-from benchmark.reviewer_eval.io import atomic_write_json, read_jsonl, sha256_file
-from benchmark.reviewer_eval.manifest import (
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.datasets import load_source_with_report
+from benchmark.safety_eval.fol_runtime import select_fol_candidates
+from benchmark.safety_eval.io import atomic_write_json, read_jsonl, sha256_file
+from benchmark.safety_eval.manifest import (
     map_raw_candidates,
     write_controlled_manifest,
 )
-from benchmark.reviewer_eval.runtime import lock_runtime_config
-from benchmark.reviewer_eval.semantic import QwenHiddenMeanEncoder, load_taxonomy_mapping
+from benchmark.safety_eval.runtime import lock_runtime_config
+from benchmark.safety_eval.semantic import QwenHiddenMeanEncoder, load_taxonomy_mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +40,7 @@ def main() -> int:
     model_path = config.models.semantic_encoder.local_path
     if model_path is None:
         raise ValueError("FOL manifest construction requires a local semantic encoder")
-    mapping = load_taxonomy_mapping(ROOT / "configs/benchmark/reviewer_taxonomy_map.yaml")
+    mapping = load_taxonomy_mapping(ROOT / "configs/benchmark/safety_eval_taxonomy_map.yaml")
     labels = list(mapping["risk_categories"]) + list(mapping["threat_domains"])
     descriptions = [
         mapping["risk_categories"].get(label, mapping["threat_domains"].get(label))["description"]

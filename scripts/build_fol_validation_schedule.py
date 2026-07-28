@@ -6,9 +6,9 @@ import argparse
 import json
 from pathlib import Path
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.fol_runtime import build_perturbation_schedule
-from benchmark.reviewer_eval.io import atomic_write_json, atomic_write_jsonl
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.fol_runtime import build_perturbation_schedule
+from benchmark.safety_eval.io import atomic_write_json, atomic_write_jsonl
 
 
 ROOT = Path(__file__).resolve().parents[1]

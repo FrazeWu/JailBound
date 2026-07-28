@@ -10,15 +10,17 @@ from typing import Any
 
 import torch
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.execution import load_local_qwen
-from benchmark.reviewer_eval.fol_boundary import random_joint_direction, select_base_radius
-from benchmark.reviewer_eval.io import JsonlLedger, atomic_write_json, read_jsonl
-from benchmark.reviewer_eval.materialization import materialize_continuous_state
-from benchmark.reviewer_eval.objective import EditableState
-from benchmark.reviewer_eval.runtime import validate_model_assets
-from benchmark.reviewer_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus
-from benchmark.reviewer_eval.semantic import QwenHiddenMeanEncoder
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.execution import load_local_qwen
+from benchmark.safety_eval.fol_records import resolved_terminal_payloads
+from benchmark.safety_eval.fol_boundary import random_joint_direction, select_base_radius
+from benchmark.safety_eval.fol_runtime import PerturbationScheduleRow, select_schedule_shard
+from benchmark.safety_eval.io import JsonlLedger, atomic_write_json, read_jsonl
+from benchmark.safety_eval.materialization import materialize_continuous_state
+from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.runtime import validate_model_assets
+from benchmark.safety_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus
+from benchmark.safety_eval.semantic import QwenHiddenMeanEncoder
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +52,7 @@ def _records(root: Path, source: str) -> tuple[dict[str, BenchmarkExample], dict
         row.sample_id: row
         for row in (
             OptimizationRecord.model_validate(row)
-            for row in read_jsonl(root / "optimization" / source / "jailbound_o_plus" / "records.jsonl")
+            for row in resolved_terminal_payloads(root, source).values()
         )
         if row.checkpoint == 100 and row.status is RecordStatus.complete and row.state_path
     }
@@ -103,6 +105,8 @@ def main() -> int:
     parser.add_argument("--outcomes-name", default="radius_calibration_outcomes.jsonl")
     parser.add_argument("--source", action="append")
     parser.add_argument("--skip-base-radius", action="store_true")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     args = parser.parse_args()
     config = load_config(args.config)
     root = ROOT / config.run.output_root / "fol_boundary"
@@ -118,6 +122,25 @@ def main() -> int:
     ]
     if not schedule:
         raise ValueError("FOL semantic-evaluation schedule is missing for the selected sources")
+    schedule_identities = tuple(
+        PerturbationScheduleRow(
+            perturbation_id=str(row["perturbation_id"]),
+            sample_id=str(row["sample_id"]),
+            radius=float(row["radius"]),
+            direction_index=int(row["direction_index"]),
+            direction_seed=int(row["direction_seed"]),
+        )
+        for row in schedule
+    )
+    selected_ids = {
+        row.perturbation_id
+        for row in select_schedule_shard(
+            schedule_identities,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
+        )
+    }
+    schedule = [row for row in schedule if row.get("perturbation_id") in selected_ids]
     model_path = config.models.surrogate.local_path
     if model_path is None:
         raise ValueError("FOL radius calibration requires a local surrogate")
@@ -163,18 +186,33 @@ def main() -> int:
         print(json.dumps({"outcome_count": len(outcomes), "status": "complete"}, sort_keys=True))
         return 0
     acceptance: dict[float, list[bool]] = {}
+    source_acceptance: dict[str, dict[float, list[bool]]] = {}
     for row in outcomes:
         radius = row.get("radius")
         accepted = row.get("accepted")
-        if isinstance(radius, (int, float)) and type(accepted) is bool:
+        source = row.get("source")
+        if isinstance(radius, (int, float)) and type(accepted) is bool and isinstance(source, str):
             acceptance.setdefault(float(radius), []).append(accepted)
-    base_radius = select_base_radius(acceptance, minimum_rate=0.8)
+            source_acceptance.setdefault(source, {}).setdefault(float(radius), []).append(accepted)
+    base_radius = select_base_radius(
+        acceptance,
+        minimum_rate=0.8,
+        source_acceptance=source_acceptance,
+        minimum_source_rate=0.75,
+    )
     atomic_write_json(root / "base_radius.json", {
         "base_radius": base_radius,
         "semantic_threshold": threshold,
         "acceptance": {
             str(radius): {"accepted": sum(values), "total": len(values)}
             for radius, values in sorted(acceptance.items())
+        },
+        "source_acceptance": {
+            source: {
+                str(radius): {"accepted": sum(values), "total": len(values)}
+                for radius, values in sorted(by_radius.items())
+            }
+            for source, by_radius in sorted(source_acceptance.items())
         },
     })
     print(json.dumps({"base_radius": base_radius, "outcome_count": len(outcomes)}, sort_keys=True))

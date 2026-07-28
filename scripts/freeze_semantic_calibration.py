@@ -11,16 +11,17 @@ from typing import Any
 
 import torch
 
-from benchmark.reviewer_eval.config import ExperimentConfig, load_config
-from benchmark.reviewer_eval.datasets import load_source_with_report
-from benchmark.reviewer_eval.execution import load_local_qwen
-from benchmark.reviewer_eval.io import atomic_write_json, read_jsonl
-from benchmark.reviewer_eval.manifest import map_raw_candidates
-from benchmark.reviewer_eval.runtime import validate_model_assets
-from benchmark.reviewer_eval.semantic import (
+from benchmark.safety_eval.config import ExperimentConfig, load_config
+from benchmark.safety_eval.datasets import load_source_with_report
+from benchmark.safety_eval.execution import load_local_qwen
+from benchmark.safety_eval.io import atomic_write_json, read_jsonl
+from benchmark.safety_eval.manifest import map_raw_candidates
+from benchmark.safety_eval.runtime import validate_model_assets
+from benchmark.safety_eval.semantic import (
     CalibrationCandidate,
+    CalibrationPoolExhausted,
     QwenHiddenMeanEncoder,
-    build_calibration_pairs,
+    build_calibration_pairs_from_pool,
     choose_canonical_label,
     freeze_semantic_calibration,
     load_taxonomy_mapping,
@@ -62,8 +63,14 @@ def _paraphrase(model: Any, tokenizer: Any, text: str) -> str:
         add_generation_prompt=True,
         return_tensors="pt",
     ).to(_model_device(model))
+    attention_mask = torch.ones_like(input_ids)
     with torch.inference_mode():
-        output_ids = model.generate(input_ids, max_new_tokens=256, do_sample=False)
+        output_ids = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=256,
+            do_sample=False,
+        )
     generated = output_ids[0][input_ids.shape[-1] :]
     return str(tokenizer.decode(generated, skip_special_tokens=True)).strip()
 
@@ -71,6 +78,7 @@ def _paraphrase(model: Any, tokenizer: Any, text: str) -> str:
 def _candidates(
     config: ExperimentConfig,
     *,
+    candidate_pool_per_source: int,
     encoder: QwenHiddenMeanEncoder,
     mapping: dict[str, Any],
     label_embeddings: dict[str, Any],
@@ -86,7 +94,7 @@ def _candidates(
         chosen = sorted(
             raw,
             key=lambda row: hashlib.sha256(f"{config.run.seed}|{row.source_row_id}".encode()).hexdigest(),
-        )[:200]
+        )[:candidate_pool_per_source]
         mapped = map_raw_candidates(
             chosen,
             mapping=mapping,
@@ -133,14 +141,21 @@ def main() -> int:
             model=handle.model,
             revision=resolved.revision,
         )
-        mapping = load_taxonomy_mapping(ROOT / "configs/benchmark/reviewer_taxonomy_map.yaml")
+        mapping = load_taxonomy_mapping(ROOT / "configs/benchmark/safety_eval_taxonomy_map.yaml")
         labels = list(mapping["risk_categories"]) + list(mapping["threat_domains"])
         descriptions = [
             mapping["risk_categories"].get(label, mapping["threat_domains"].get(label))["description"]
             for label in labels
         ]
         label_embeddings = dict(zip(labels, encoder.encode(descriptions), strict=True))
-        candidates = _candidates(config, encoder=encoder, mapping=mapping, label_embeddings=label_embeddings)
+        holdout_pool_per_source = 400
+        candidates = _candidates(
+            config,
+            candidate_pool_per_source=holdout_pool_per_source,
+            encoder=encoder,
+            mapping=mapping,
+            label_embeddings=label_embeddings,
+        )
         holdouts = []
         for source in config.data.sources:
             controlled_ids = frozenset(
@@ -151,8 +166,9 @@ def main() -> int:
                 select_calibration_holdouts(
                     candidates[source],
                     controlled_ids=controlled_ids,
-                    per_source=config.semantic.calibration_examples_per_source,
+                    per_source=holdout_pool_per_source,
                     seed=config.run.seed,
+                    allow_shortfall=True,
                 )
             )
 
@@ -166,14 +182,26 @@ def main() -> int:
             vectors = encoder.encode([left, right])
             return float(vectors[0] @ vectors[1])
 
-        pairs = build_calibration_pairs(
-            tuple(holdouts),
-            paraphrase=lambda text: _paraphrase(handle.model, handle.tokenizer, text),
-            category_for_text=category_for_text,
-            entities_preserved=_entities_preserved,
-            similarity=similarity,
-            max_attempts=config.semantic.max_mutation_attempts,
-        )
+        # Greedy decoding is deterministic, so retries cannot produce a new candidate.
+        paraphrase_attempts = 1
+        try:
+            pairs = build_calibration_pairs_from_pool(
+                tuple(holdouts),
+                per_source=config.semantic.calibration_examples_per_source,
+                paraphrase=lambda text: _paraphrase(handle.model, handle.tokenizer, text),
+                category_for_text=category_for_text,
+                entities_preserved=_entities_preserved,
+                similarity=similarity,
+                max_attempts=paraphrase_attempts,
+            )
+        except CalibrationPoolExhausted as exc:
+            print(json.dumps({
+                "status": "insufficient_calibration_pairs",
+                "accepted_by_source": exc.accepted_by_source,
+                "rejected_paraphrase_by_source": exc.rejected_paraphrase_by_source,
+                "rejected_similarity_by_source": exc.rejected_similarity_by_source,
+            }, sort_keys=True))
+            return 2
     finally:
         handle.close()
     expected = 2 * len(config.data.sources) * config.semantic.calibration_examples_per_source
@@ -184,7 +212,11 @@ def main() -> int:
         target_recall=config.semantic.target_positive_recall,
         encoder_revision=resolved.revision,
     )
-    artifact.update({"config_hash": json.loads((output_root / "run_manifest.json").read_text(encoding="utf-8"))["config_hash"]})
+    artifact.update({
+        "config_hash": json.loads((output_root / "run_manifest.json").read_text(encoding="utf-8"))["config_hash"],
+        "holdout_pool_per_source": holdout_pool_per_source,
+        "paraphrase_attempts": paraphrase_attempts,
+    })
     atomic_write_json(artifact_path, artifact)
     print(json.dumps({"artifact": str(artifact_path), "pair_count": artifact["pair_count"], "status": "frozen"}, sort_keys=True))
     return 0

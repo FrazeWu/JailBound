@@ -10,21 +10,23 @@ from typing import Any
 
 import torch
 
-from benchmark.reviewer_eval.config import load_config
-from benchmark.reviewer_eval.execution import load_local_qwen
-from benchmark.reviewer_eval.fol_boundary import random_joint_direction
-from benchmark.reviewer_eval.fol_runtime import (
+from benchmark.safety_eval.config import load_config
+from benchmark.safety_eval.execution import load_local_qwen
+from benchmark.safety_eval.fol_records import resolved_terminal_payloads
+from benchmark.safety_eval.fol_boundary import random_joint_direction
+from benchmark.safety_eval.fol_runtime import (
     PerturbationScheduleRow,
+    select_id_shard,
     select_accepted_perturbations,
 )
-from benchmark.reviewer_eval.io import JsonlLedger, read_jsonl
-from benchmark.reviewer_eval.materialization import materialize_checkpoint
-from benchmark.reviewer_eval.pipeline import (
+from benchmark.safety_eval.io import JsonlLedger, read_jsonl
+from benchmark.safety_eval.materialization import materialize_checkpoint
+from benchmark.safety_eval.pipeline import (
     generate_materialized_records,
     write_materialization_records,
 )
-from benchmark.reviewer_eval.runtime import validate_model_assets
-from benchmark.reviewer_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus, stable_id
+from benchmark.safety_eval.runtime import validate_model_assets
+from benchmark.safety_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus, stable_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +44,7 @@ def _final_records(root: Path, source: str) -> tuple[dict[str, BenchmarkExample]
         row.sample_id: row
         for row in (
             OptimizationRecord.model_validate(row)
-            for row in read_jsonl(root / "optimization" / source / "jailbound_o_plus" / "records.jsonl")
+            for row in resolved_terminal_payloads(root, source).values()
         )
         if row.checkpoint == 100 and row.status is RecordStatus.complete and row.state_path
     }
@@ -177,6 +179,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--source", action="append")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     args = parser.parse_args()
     config = load_config(args.config)
     sources = tuple(args.source or config.fol.sources)
@@ -184,6 +188,12 @@ def main() -> int:
         raise ValueError("FOL generation requested an unconfigured source")
     root = ROOT / config.run.output_root / "fol_boundary"
     metadata = _accepted_metadata(root, sources=sources, directions_per_radius=config.fol.directions_per_radius)
+    selected_ids = set(select_id_shard(
+        tuple(str(row["perturbation_id"]) for row in metadata),
+        shard_index=args.shard_index,
+        shard_count=args.shard_count,
+    ))
+    metadata = tuple(row for row in metadata if str(row["perturbation_id"]) in selected_ids)
     metadata_ledger = JsonlLedger(root / "selected_perturbations.jsonl", key_fields=("perturbation_id",))
     for row in metadata:
         metadata_ledger.append_once(row)
