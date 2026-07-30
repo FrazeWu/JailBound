@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -121,6 +122,143 @@ def test_builder_validates_frozen_annotation_provenance_before_transport(
         builder.build_manifests(config, candidate_pool=25, sources=("s_eval",))
 
 
+def test_build_input_snapshot_keeps_hash_and_consumed_bytes_identical(tmp_path) -> None:
+    builder = _load_builder()
+    originals = {
+        "config": tmp_path / "config.yaml",
+        "confidence_artifact": tmp_path / "confidence.json",
+        "annotation_template": tmp_path / "annotation.txt",
+        "taxonomy_mapping": tmp_path / "taxonomy.yaml",
+        "harmbench_targets": tmp_path / "targets.json",
+        "source:s_eval": tmp_path / "S-Eval_attack_en_full.jsonl",
+    }
+    original_bytes = {
+        name: f"version-a:{name}\n".encode() for name in originals
+    }
+    for name, path in originals.items():
+        path.write_bytes(original_bytes[name])
+
+    with builder.snapshot_build_inputs(originals) as snapshot:
+        snapshot_paths = dict(snapshot.paths)
+        for name, path in originals.items():
+            path.write_bytes(f"version-b:{name}\n".encode())
+            assert snapshot.paths[name].read_bytes() == original_bytes[name]
+            assert snapshot.hashes[name] == hashlib.sha256(
+                original_bytes[name]
+            ).hexdigest()
+        assert snapshot.paths["source:s_eval"].name == (
+            "S-Eval_attack_en_full.jsonl"
+        )
+
+    assert all(not path.exists() for path in snapshot_paths.values())
+
+
+def test_builder_loads_s_eval_from_hashed_snapshot_after_source_replacement(
+    tmp_path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    source = tmp_path / "S-Eval_attack_en_full.jsonl"
+    original_bytes = b'{"prompt":"version-a"}\n'
+    source.write_bytes(original_bytes)
+    config_path = _config(tmp_path)
+    payload = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
+    assert isinstance(payload, dict)
+    payload["data"]["paths"]["s_eval"] = str(source)
+    OmegaConf.save(config=OmegaConf.create(payload), f=config_path)
+    _confidence(tmp_path / "confidence.json")
+
+    original_snapshotter = builder.snapshot_build_inputs
+
+    @contextmanager
+    def replace_after_snapshot(paths):
+        with original_snapshotter(paths) as snapshot:
+            if "source:s_eval" in paths:
+                source.write_bytes(b'{"prompt":"version-b"}\n')
+            yield snapshot
+
+    observed: dict[str, object] = {}
+
+    class ObservedSnapshot(RuntimeError):
+        pass
+
+    def observe_source(source_name, path, targets_path):
+        observed.update(
+            source=source_name,
+            path=path,
+            bytes=Path(path).read_bytes(),
+            targets_path=targets_path,
+        )
+        return (
+            [
+                builder.RawExample(
+                    source="s_eval",
+                    source_row=0,
+                    intent="fixture intent",
+                    attack_text="fixture prompt",
+                    target_text=None,
+                    source_risk_label="risk",
+                    source_attack_label="direct_request",
+                    source_domain_label=None,
+                    language="en",
+                    preprocessing=(),
+                )
+            ],
+            SimpleNamespace(raw_count=1, eligible_count=1, exclusions={}),
+        )
+
+    def observe_annotation(*args, **kwargs):
+        observed["source_file"] = kwargs["source_file"]
+        raise ObservedSnapshot
+
+    class FakeEncoder:
+        resolved_revision = "fixture-encoder"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode(self, texts):
+            return [[0.0] for _ in texts]
+
+    monkeypatch.setattr(builder, "snapshot_build_inputs", replace_after_snapshot)
+    monkeypatch.setattr(builder, "load_source_with_report", observe_source)
+    monkeypatch.setattr(builder, "annotate_raw_candidates", observe_annotation)
+    monkeypatch.setattr(
+        builder,
+        "load_taxonomy_mapping",
+        lambda path: {
+            "risk_categories": {"risk": {"description": "risk"}},
+            "threat_domains": {"domain": {"description": "domain"}},
+        },
+    )
+    monkeypatch.setattr(builder, "QwenHiddenMeanEncoder", FakeEncoder)
+    monkeypatch.setattr(builder, "SpanAnnotator", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        builder, "resolve_annotation_transport", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        builder,
+        "_lock_v2_runtime_config",
+        lambda *args, **kwargs: SimpleNamespace(
+            run_id="run:fixture", config_hash="a" * 64
+        ),
+    )
+
+    with pytest.raises(ObservedSnapshot):
+        builder.build_manifests(
+            config_path,
+            candidate_pool=25,
+            sources=("s_eval",),
+        )
+
+    snapshot_path = observed["path"]
+    assert observed["source"] == "s_eval"
+    assert observed["bytes"] == original_bytes
+    assert Path(snapshot_path).name == source.name
+    assert Path(snapshot_path) != source
+    assert observed["source_file"] == str(source)
+    assert not Path(snapshot_path).exists()
+
+
 @pytest.mark.parametrize(
     "changed_input", ("confidence_artifact", "harmbench_targets")
 )
@@ -183,7 +321,7 @@ def test_insufficient_builder_run_freezes_failures_before_raising(tmp_path) -> N
             prompt_sha256="b" * 64,
             intent_sha256="c" * 64,
             failure_kind=FailureKind.annotation,
-            failure_reason="SpanAnnotationError: fixture",
+            failure_reason="annotation_error",
         ),
         AnnotationFailure(
             schema_version="reviewer_eval.v2",
@@ -195,7 +333,7 @@ def test_insufficient_builder_run_freezes_failures_before_raising(tmp_path) -> N
             prompt_sha256="e" * 64,
             intent_sha256="f" * 64,
             failure_kind=FailureKind.transport,
-            failure_reason="RuntimeError: fixture",
+            failure_reason="transport_error",
         ),
     )
     candidates = {

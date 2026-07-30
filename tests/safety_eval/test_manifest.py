@@ -7,6 +7,7 @@ import pytest
 
 from benchmark.safety_eval.datasets import RawExample
 from benchmark.safety_eval.manifest import (
+    AnnotationFailure,
     FolCandidate,
     annotate_raw_candidates,
     build_v2_controlled_manifests,
@@ -188,6 +189,64 @@ def test_annotation_failures_are_audited_and_cannot_enter_selection(tmp_path) ->
         )
 
 
+@pytest.mark.parametrize(
+    ("error", "expected_kind", "expected_code"),
+    [
+        (
+            SpanAnnotationError("SECRET_PROMPT SECRET_RESPONSE request-id=abc"),
+            "annotation",
+            "annotation_error",
+        ),
+        (
+            RuntimeError("SECRET_INTENT SECRET_RESPONSE request-id=xyz"),
+            "transport",
+            "transport_error",
+        ),
+    ],
+)
+def test_annotation_failure_ledger_never_persists_exception_content(
+    tmp_path, error: Exception, expected_kind: str, expected_code: str
+) -> None:
+    class SecretFailingAnnotator:
+        def annotate(self, *args, **kwargs):
+            raise error
+
+    _, failures = annotate_raw_candidates(
+        [_raw("advbench", 0, prompt="SECRET_PROMPT")],
+        annotator=SecretFailingAnnotator(),
+        taxonomy_mapper=_mapping,
+        source_file="advbench.csv",
+        source_sha256="a" * 64,
+        seed=20260725,
+    )
+    write_v2_annotation_failures(tmp_path, failures)
+    persisted = (tmp_path / "manifests/v2/annotation_failures.jsonl").read_text(
+        encoding="utf-8"
+    )
+
+    assert failures[0].failure_kind == expected_kind
+    assert failures[0].failure_reason == expected_code
+    assert "SECRET" not in str(failures[0].as_dict())
+    assert "SECRET" not in persisted
+    assert "request-id" not in persisted
+
+
+def test_annotation_failure_record_rejects_content_bearing_reason() -> None:
+    with pytest.raises(ValueError, match="stable failure code"):
+        AnnotationFailure(
+            schema_version="reviewer_eval.v2",
+            example_id="advbench:000000:fixture",
+            source="advbench",
+            source_file="advbench.csv",
+            source_row=0,
+            source_sha256="a" * 64,
+            prompt_sha256="b" * 64,
+            intent_sha256="c" * 64,
+            failure_kind="annotation",
+            failure_reason="SpanAnnotationError: SECRET_RESPONSE",
+        )
+
+
 def test_v2_manifest_uses_isolated_schema_and_requires_byte_identical_rerun(
     tmp_path,
 ) -> None:
@@ -253,6 +312,26 @@ def test_v2_manifest_writer_rejects_legacy_records(tmp_path) -> None:
     assert not (tmp_path / "manifests/v2/controlled_synthetic.jsonl").exists()
 
 
+def test_v2_manifest_writer_validates_conflicting_header_before_jsonl_write(
+    tmp_path,
+) -> None:
+    header = tmp_path / "manifests/v2/controlled_synthetic.header.json"
+    header.parent.mkdir(parents=True)
+    header.write_text('{"conflict":true}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="immutable v2 manifest differs"):
+        write_v2_controlled_manifest(
+            tmp_path,
+            "synthetic",
+            _v2_rows(1),
+            source_file_sha256="a" * 64,
+            config_hash="c" * 64,
+        )
+
+    assert not (tmp_path / "manifests/v2/controlled_synthetic.jsonl").exists()
+    assert header.read_text(encoding="utf-8") == '{"conflict":true}\n'
+
+
 def test_v2_manifest_builder_rejects_legacy_records_before_selection(tmp_path) -> None:
     with pytest.raises(ValueError, match="V2BenchmarkExample"):
         build_v2_controlled_manifests(
@@ -268,6 +347,25 @@ def test_v2_manifest_builder_rejects_legacy_records_before_selection(tmp_path) -
         )
 
     assert not list((tmp_path / "manifests/v2").glob("controlled_*.jsonl"))
+
+
+def test_v2_manifest_builder_validates_all_sources_before_any_write(tmp_path) -> None:
+    with pytest.raises(ValueError, match="requested source"):
+        build_v2_controlled_manifests(
+            {
+                "first": _v2_rows(1, source="first"),
+                "second": _v2_rows(1, source="different"),
+            },
+            output_root=tmp_path,
+            source_hashes={"first": "a" * 64, "second": "b" * 64},
+            config_hash="c" * 64,
+            seed=20260725,
+            samples_per_source=1,
+        )
+
+    manifests = tmp_path / "manifests/v2"
+    assert not list(manifests.glob("controlled_*.jsonl"))
+    assert not list(manifests.glob("controlled_*.header.json"))
 
 
 def test_concurrent_v2_manifest_writers_cannot_overwrite_each_other(tmp_path) -> None:
@@ -304,6 +402,19 @@ def test_controlled_selection_is_order_invariant_and_deduplicates() -> None:
     assert len(first) == 50
     assert len({row.prompt_sha256 for row in first}) == 50
     assert first_report.duplicate_count == 1
+
+
+def test_controlled_selection_rejects_duplicate_example_ids_before_quotas() -> None:
+    first = _example(0)
+    duplicate_id = _example(1).model_copy(update={"example_id": first.example_id})
+
+    with pytest.raises(ValueError, match="example_id.*unique"):
+        select_controlled(
+            [first, duplicate_id, _example(2)],
+            n=3,
+            seed=20260725,
+            coverage_dimensions=("risk_category", "attack_type"),
+        )
 
 
 def test_fol_split_uses_prime_reported_groups_and_is_disjoint() -> None:

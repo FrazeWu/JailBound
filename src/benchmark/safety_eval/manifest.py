@@ -45,6 +45,16 @@ class AnnotationFailure:
     failure_kind: FailureKind
     failure_reason: str
 
+    def __post_init__(self) -> None:
+        expected_codes = {
+            FailureKind.annotation: "annotation_error",
+            FailureKind.transport: "transport_error",
+        }
+        if expected_codes.get(self.failure_kind) != self.failure_reason:
+            raise ValueError(
+                "annotation failures require the stable failure code for their kind"
+            )
+
     def as_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
@@ -209,15 +219,23 @@ def _require_v2_records(records: Sequence[object]) -> None:
         raise ValueError("v2 manifests require V2BenchmarkExample records")
 
 
-def write_v2_controlled_manifest(
+@dataclass(frozen=True)
+class _PreparedV2Manifest:
+    header: ManifestHeader
+    manifest_path: Path
+    header_path: Path
+    manifest_bytes: bytes
+    header_bytes: bytes
+
+
+def _prepare_v2_controlled_manifest(
     output_root: str | Path,
     source: str,
     records: Sequence[V2BenchmarkExample],
     *,
     source_file_sha256: str,
     config_hash: str,
-) -> ManifestHeader:
-    """Freeze one schema-v2 manifest without overwriting concurrent output."""
+) -> _PreparedV2Manifest:
     if not source or Path(source).name != source:
         raise ValueError("manifest source must be a non-empty path-safe name")
     _require_v2_records(records)
@@ -241,17 +259,75 @@ def write_v2_controlled_manifest(
     header_bytes = (
         canonical_json(header.model_dump(mode="json")) + "\n"
     ).encode("utf-8")
+    return _PreparedV2Manifest(
+        header=header,
+        manifest_path=path,
+        header_path=header_path,
+        manifest_bytes=manifest_bytes,
+        header_bytes=header_bytes,
+    )
+
+
+def _validate_prepared_v2_manifest(
+    prepared: _PreparedV2Manifest, *, mismatch: str
+) -> None:
+    for path, payload in (
+        (prepared.manifest_path, prepared.manifest_bytes),
+        (prepared.header_path, prepared.header_bytes),
+    ):
+        if path.exists() and path.read_bytes() != payload:
+            raise ValueError(mismatch)
+
+
+def _commit_prepared_v2_manifests(
+    prepared_manifests: Sequence[_PreparedV2Manifest],
+) -> None:
+    if not prepared_manifests:
+        return
+    manifests = prepared_manifests[0].manifest_path.parent
+    if any(item.manifest_path.parent != manifests for item in prepared_manifests):
+        raise ValueError("prepared v2 manifests must share one output root")
     manifests.mkdir(parents=True, exist_ok=True)
-    lock_path = manifests / f"controlled_{source}.build.lock"
+    lock_path = manifests / ".controlled_manifests.build.lock"
     mismatch = "immutable v2 manifest differs from existing output"
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            _write_no_clobber(path, manifest_bytes, mismatch=mismatch)
-            _write_no_clobber(header_path, header_bytes, mismatch=mismatch)
+            for prepared in prepared_manifests:
+                _validate_prepared_v2_manifest(prepared, mismatch=mismatch)
+            for prepared in prepared_manifests:
+                _write_no_clobber(
+                    prepared.manifest_path,
+                    prepared.manifest_bytes,
+                    mismatch=mismatch,
+                )
+                _write_no_clobber(
+                    prepared.header_path,
+                    prepared.header_bytes,
+                    mismatch=mismatch,
+                )
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    return header
+
+
+def write_v2_controlled_manifest(
+    output_root: str | Path,
+    source: str,
+    records: Sequence[V2BenchmarkExample],
+    *,
+    source_file_sha256: str,
+    config_hash: str,
+) -> ManifestHeader:
+    """Freeze one schema-v2 manifest without overwriting concurrent output."""
+    prepared = _prepare_v2_controlled_manifest(
+        output_root,
+        source,
+        records,
+        source_file_sha256=source_file_sha256,
+        config_hash=config_hash,
+    )
+    _commit_prepared_v2_manifests((prepared,))
+    return prepared.header
 
 
 def write_v2_annotation_failures(
@@ -298,7 +374,7 @@ def build_v2_controlled_manifests(
     for records in records_by_source.values():
         _require_v2_records(records)
 
-    headers: dict[str, ManifestHeader] = {}
+    prepared_manifests: list[_PreparedV2Manifest] = []
     for source, records in records_by_source.items():
         dimensions = (
             ("risk_category", "threat_domain", "attack_type")
@@ -311,14 +387,17 @@ def build_v2_controlled_manifests(
             seed=seed,
             coverage_dimensions=dimensions,
         )
-        headers[source] = write_v2_controlled_manifest(
+        prepared_manifests.append(_prepare_v2_controlled_manifest(
             output_root,
             source,
             selected,
             source_file_sha256=source_hashes[source],
             config_hash=config_hash,
-        )
-    return headers
+        ))
+    _commit_prepared_v2_manifests(prepared_manifests)
+    return {
+        prepared.header.source: prepared.header for prepared in prepared_manifests
+    }
 
 
 def _annotation_failure(
@@ -327,9 +406,11 @@ def _annotation_failure(
     source_file: str,
     source_sha256: str,
     kind: FailureKind,
-    error: Exception,
 ) -> AnnotationFailure:
-    reason = f"{type(error).__name__}: {error}"
+    reason = {
+        FailureKind.annotation: "annotation_error",
+        FailureKind.transport: "transport_error",
+    }[kind]
     return AnnotationFailure(
         schema_version="reviewer_eval.v2",
         example_id=raw.source_row_id,
@@ -374,25 +455,23 @@ def annotate_raw_candidates(
                 seed_intent=raw.intent,
                 source_hints=source_hints,
             )
-        except SpanAnnotationError as error:
+        except SpanAnnotationError:
             failures.append(
                 _annotation_failure(
                     raw,
                     source_file=source_file,
                     source_sha256=source_sha256,
                     kind=FailureKind.annotation,
-                    error=error,
                 )
             )
             continue
-        except Exception as error:
+        except Exception:
             failures.append(
                 _annotation_failure(
                     raw,
                     source_file=source_file,
                     source_sha256=source_sha256,
                     kind=FailureKind.transport,
-                    error=error,
                 )
             )
             continue
@@ -474,6 +553,9 @@ def select_controlled(
 ) -> tuple[tuple[BenchmarkExample, ...], SelectionReport]:
     """Select a fixed-size, order-invariant, coverage-first subset."""
     record_list = tuple(records)
+    example_ids = [record.example_id for record in record_list]
+    if len(example_ids) != len(set(example_ids)):
+        raise ValueError("controlled selection example_id values must be unique")
     by_prompt: dict[str, BenchmarkExample] = {}
     for record in sorted(record_list, key=lambda row: row.example_id):
         by_prompt.setdefault(record.prompt_sha256, record)
@@ -511,6 +593,10 @@ def select_controlled(
         if len(selected) == n: break
         if row not in selected:
             selected.append(row)
+    if len(selected) != n:
+        raise RuntimeError(
+            f"controlled selection quota invariant failed: selected {len(selected)} of {n}"
+        )
     selected.sort(key=lambda row: row.example_id)
     return tuple(selected), SelectionReport(len(record_list) - len(eligible), len(eligible), len(selected))
 

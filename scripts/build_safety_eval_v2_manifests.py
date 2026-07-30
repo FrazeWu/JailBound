@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -12,11 +13,12 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any
+import tempfile
+from typing import Any, NamedTuple
 
 from benchmark.safety_eval.config import AnnotationConfig, load_v2_config
 from benchmark.safety_eval.datasets import RawExample, load_source_with_report
-from benchmark.safety_eval.io import atomic_write_json, canonical_hash, sha256_file
+from benchmark.safety_eval.io import atomic_write_json, canonical_hash
 from benchmark.safety_eval.manifest import (
     AnnotationFailure,
     annotate_raw_candidates,
@@ -43,6 +45,33 @@ from calibrate_span_annotation_confidence import OpenAIAnnotationTransport  # no
 ROOT = Path(__file__).resolve().parents[1]
 APPROVED_ARTIFACT_VERSION = "span_annotation_confidence.v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class BuildInputSnapshots(NamedTuple):
+    paths: Mapping[str, Path]
+    hashes: Mapping[str, str]
+
+
+@contextmanager
+def snapshot_build_inputs(
+    paths: Mapping[str, Path],
+) -> Iterator[BuildInputSnapshots]:
+    """Yield read-only temp files whose hashes come from the exact same bytes."""
+    with tempfile.TemporaryDirectory(prefix="safety-eval-v2-inputs-") as directory:
+        snapshot_root = Path(directory)
+        snapshot_paths: dict[str, Path] = {}
+        hashes: dict[str, str] = {}
+        for index, (name, original_path) in enumerate(sorted(paths.items())):
+            original = Path(original_path)
+            payload = original.read_bytes()
+            target_dir = snapshot_root / f"{index:03d}"
+            target_dir.mkdir()
+            target = target_dir / original.name
+            target.write_bytes(payload)
+            target.chmod(0o400)
+            snapshot_paths[name] = target
+            hashes[name] = hashlib.sha256(payload).hexdigest()
+        yield BuildInputSnapshots(paths=snapshot_paths, hashes=hashes)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -310,162 +339,202 @@ def build_manifests(
     """Run v2 manifest construction; model calls occur only through the transport."""
     if type(candidate_pool) is not int or candidate_pool < 1:
         raise ValueError("candidate_pool must be a positive integer")
-    config_path = Path(config_path)
-    config = load_v2_config(config_path)
-    root = _config_root(config_path)
-    selected_sources = _selected_sources(config.data.sources, sources)
-    output_root = _rooted(root, config.run.output_root)
-    _reject_v1_manifests(output_root)
+    original_config_path = Path(config_path)
+    root = _config_root(original_config_path)
+    with snapshot_build_inputs(
+        {"config": original_config_path}
+    ) as config_snapshot:
+        config = load_v2_config(config_snapshot.paths["config"])
+        selected_sources = _selected_sources(config.data.sources, sources)
+        output_root = _rooted(root, config.run.output_root)
+        _reject_v1_manifests(output_root)
 
-    annotation_payload = config.annotation.model_dump(mode="json")
-    annotation_payload["template_path"] = _rooted(root, config.annotation.template_path)
-    annotation_payload["confidence_artifact"] = _rooted(
-        root, config.annotation.confidence_artifact
-    )
-    annotation_config = AnnotationConfig.model_validate(annotation_payload)
-    threshold = _load_confidence_threshold(
-        annotation_config.confidence_artifact,
-        annotation=annotation_config,
-        configured_sources=config.data.sources,
-    )
-
-    source_paths = {
-        source: _rooted(root, config.data.paths[source]) for source in selected_sources
-    }
-    source_hashes = {
-        source: sha256_file(path) for source, path in source_paths.items()
-    }
-    taxonomy_mapping_path = root / "configs/benchmark/safety_eval_taxonomy_map.yaml"
-    build_input_paths = {
-        "config": config_path,
-        "confidence_artifact": annotation_config.confidence_artifact,
-        "annotation_template": annotation_config.template_path,
-        "taxonomy_mapping": taxonomy_mapping_path,
-    }
-    if "harmbench" in selected_sources:
-        build_input_paths["harmbench_targets"] = _rooted(
-            root, config.data.harmbench_targets_path
+        taxonomy_mapping_path = (
+            root / "configs/benchmark/safety_eval_taxonomy_map.yaml"
         )
-    build_input_hashes = {
-        name: sha256_file(path) for name, path in build_input_paths.items()
-    }
-    locked = _lock_v2_runtime_config(
-        config,
-        output_root=output_root,
-        source_hashes=source_hashes,
-        build_input_hashes=build_input_hashes,
-    )
-    transport = resolve_annotation_transport(annotation_config, seed=config.run.seed)
-    annotator = SpanAnnotator(
-        annotation_config,
-        transport,
-        confidence_threshold=threshold,
-    )
-
-    mapping = load_taxonomy_mapping(taxonomy_mapping_path)
-    labels = list(mapping["risk_categories"]) + list(mapping["threat_domains"])
-    descriptions = [
-        mapping["risk_categories"].get(
-            label, mapping["threat_domains"].get(label)
-        )["description"]
-        for label in labels
-    ]
-    encoder = QwenHiddenMeanEncoder(config.models.semantic_encoder.local_path)
-    vectors = encoder.encode(descriptions)
-    embeddings = dict(zip(labels, vectors, strict=True))
-
-    candidates: dict[str, tuple[Any, ...]] = {}
-    all_failures: list[AnnotationFailure] = []
-    reports: dict[str, dict[str, object]] = {}
-    harmbench_targets = _rooted(root, config.data.harmbench_targets_path)
-    for source in selected_sources:
-        raw, load_report = load_source_with_report(
-            source,
-            source_paths[source],
-            harmbench_targets if source == "harmbench" else None,
-        )
-        chosen = tuple(
-            sorted(raw, key=lambda row: _sample_key(config.run.seed, row))[
-                :candidate_pool
-            ]
-        )
-        mapping_audit: dict[str, object] = {}
-
-        def taxonomy_mapper(row: RawExample) -> MappingDecision:
-            decision = map_raw_example(row, mapping, embeddings, encoder)
-            mapping_audit[row.source_row_id] = decision.audit_entry
-            return decision
-
-        annotated, failures = annotate_raw_candidates(
-            chosen,
-            annotator=annotator,
-            taxonomy_mapper=taxonomy_mapper,
-            source_file=str(config.data.paths[source]),
-            source_sha256=source_hashes[source],
-            seed=config.run.seed,
-        )
-        unique_eligible = _unique_prompt_count(annotated)
-        failures_by_kind = Counter(failure.failure_kind.value for failure in failures)
-        reports[source] = {
-            "raw_count": load_report.raw_count,
-            "source_eligible_count": load_report.eligible_count,
-            "exclusions": dict(sorted(load_report.exclusions.items())),
-            "candidate_pool": len(chosen),
-            "annotated_count": len(annotated),
-            "annotation_failure_count": len(failures),
-            "unique_eligible_count": unique_eligible,
-            "failure_counts": dict(sorted(failures_by_kind.items())),
-            "mapping_audit": dict(sorted(mapping_audit.items())),
+        remaining_input_paths = {
+            "confidence_artifact": _rooted(
+                root, config.annotation.confidence_artifact
+            ),
+            "annotation_template": _rooted(
+                root, config.annotation.template_path
+            ),
+            "taxonomy_mapping": taxonomy_mapping_path,
+            **{
+                f"source:{source}": _rooted(root, config.data.paths[source])
+                for source in selected_sources
+            },
         }
-        candidates[source] = annotated
-        all_failures.extend(failures)
+        if "harmbench" in selected_sources:
+            remaining_input_paths["harmbench_targets"] = _rooted(
+                root, config.data.harmbench_targets_path
+            )
 
-    report_identity = {
-        "schema_version": "reviewer_eval.v2",
-        "run_id": locked.run_id,
-        "config_hash": locked.config_hash,
-        "source_hashes": dict(sorted(source_hashes.items())),
-        "build_input_hashes": dict(sorted(build_input_hashes.items())),
-        "encoder_revision": encoder.resolved_revision,
-        "sources": reports,
-    }
-    audit_and_require_sufficient_candidates(
-        output_root=output_root,
-        candidates=candidates,
-        failures=all_failures,
-        sources=selected_sources,
-        required=config.data.samples_per_source,
-        report=report_identity,
-    )
+        with snapshot_build_inputs(remaining_input_paths) as inputs:
+            annotation_payload = config.annotation.model_dump(mode="json")
+            annotation_payload["template_path"] = inputs.paths[
+                "annotation_template"
+            ]
+            annotation_payload["confidence_artifact"] = inputs.paths[
+                "confidence_artifact"
+            ]
+            annotation_config = AnnotationConfig.model_validate(
+                annotation_payload
+            )
+            threshold = _load_confidence_threshold(
+                annotation_config.confidence_artifact,
+                annotation=annotation_config,
+                configured_sources=config.data.sources,
+            )
+            source_hashes = {
+                source: inputs.hashes[f"source:{source}"]
+                for source in selected_sources
+            }
+            build_input_hashes = {
+                "config": config_snapshot.hashes["config"],
+                **{
+                    name: inputs.hashes[name]
+                    for name in (
+                        "confidence_artifact",
+                        "annotation_template",
+                        "taxonomy_mapping",
+                    )
+                },
+            }
+            if "harmbench" in selected_sources:
+                build_input_hashes["harmbench_targets"] = inputs.hashes[
+                    "harmbench_targets"
+                ]
+            locked = _lock_v2_runtime_config(
+                config,
+                output_root=output_root,
+                source_hashes=source_hashes,
+                build_input_hashes=build_input_hashes,
+            )
+            transport = resolve_annotation_transport(
+                annotation_config, seed=config.run.seed
+            )
+            annotator = SpanAnnotator(
+                annotation_config,
+                transport,
+                confidence_threshold=threshold,
+            )
 
-    headers = build_v2_controlled_manifests(
-        candidates,
-        output_root=output_root,
-        source_hashes=source_hashes,
-        config_hash=locked.config_hash,
-        seed=config.run.seed,
-        samples_per_source=config.data.samples_per_source,
-    )
-    build_report = {
-        **report_identity,
-        "status": "complete",
-        "required_counts_by_source": {
-            source: config.data.samples_per_source
-            for source in sorted(selected_sources)
-        },
-        "eligible_counts_by_source": {
-            source: reports[source]["unique_eligible_count"]
-            for source in sorted(selected_sources)
-        },
-        "failure_counts_by_source_and_kind": {
-            source: reports[source]["failure_counts"] for source in selected_sources
-        },
-        "manifest_hashes": {
-            source: headers[source].manifest_hash for source in selected_sources
-        },
-    }
-    write_v2_build_report(output_root, build_report)
-    return build_report
+            mapping = load_taxonomy_mapping(inputs.paths["taxonomy_mapping"])
+            labels = list(mapping["risk_categories"]) + list(
+                mapping["threat_domains"]
+            )
+            descriptions = [
+                mapping["risk_categories"].get(
+                    label, mapping["threat_domains"].get(label)
+                )["description"]
+                for label in labels
+            ]
+            encoder = QwenHiddenMeanEncoder(
+                config.models.semantic_encoder.local_path
+            )
+            vectors = encoder.encode(descriptions)
+            embeddings = dict(zip(labels, vectors, strict=True))
+
+            candidates: dict[str, tuple[Any, ...]] = {}
+            all_failures: list[AnnotationFailure] = []
+            reports: dict[str, dict[str, object]] = {}
+            harmbench_targets = inputs.paths.get("harmbench_targets")
+            for source in selected_sources:
+                raw, load_report = load_source_with_report(
+                    source,
+                    inputs.paths[f"source:{source}"],
+                    harmbench_targets if source == "harmbench" else None,
+                )
+                chosen = tuple(
+                    sorted(
+                        raw,
+                        key=lambda row: _sample_key(config.run.seed, row),
+                    )[:candidate_pool]
+                )
+                mapping_audit: dict[str, object] = {}
+
+                def taxonomy_mapper(row: RawExample) -> MappingDecision:
+                    decision = map_raw_example(
+                        row, mapping, embeddings, encoder
+                    )
+                    mapping_audit[row.source_row_id] = decision.audit_entry
+                    return decision
+
+                annotated, failures = annotate_raw_candidates(
+                    chosen,
+                    annotator=annotator,
+                    taxonomy_mapper=taxonomy_mapper,
+                    source_file=str(config.data.paths[source]),
+                    source_sha256=source_hashes[source],
+                    seed=config.run.seed,
+                )
+                unique_eligible = _unique_prompt_count(annotated)
+                failures_by_kind = Counter(
+                    failure.failure_kind.value for failure in failures
+                )
+                reports[source] = {
+                    "raw_count": load_report.raw_count,
+                    "source_eligible_count": load_report.eligible_count,
+                    "exclusions": dict(sorted(load_report.exclusions.items())),
+                    "candidate_pool": len(chosen),
+                    "annotated_count": len(annotated),
+                    "annotation_failure_count": len(failures),
+                    "unique_eligible_count": unique_eligible,
+                    "failure_counts": dict(sorted(failures_by_kind.items())),
+                    "mapping_audit": dict(sorted(mapping_audit.items())),
+                }
+                candidates[source] = annotated
+                all_failures.extend(failures)
+
+            report_identity = {
+                "schema_version": "reviewer_eval.v2",
+                "run_id": locked.run_id,
+                "config_hash": locked.config_hash,
+                "source_hashes": dict(sorted(source_hashes.items())),
+                "build_input_hashes": dict(sorted(build_input_hashes.items())),
+                "encoder_revision": encoder.resolved_revision,
+                "sources": reports,
+            }
+            audit_and_require_sufficient_candidates(
+                output_root=output_root,
+                candidates=candidates,
+                failures=all_failures,
+                sources=selected_sources,
+                required=config.data.samples_per_source,
+                report=report_identity,
+            )
+
+            headers = build_v2_controlled_manifests(
+                candidates,
+                output_root=output_root,
+                source_hashes=source_hashes,
+                config_hash=locked.config_hash,
+                seed=config.run.seed,
+                samples_per_source=config.data.samples_per_source,
+            )
+            build_report = {
+                **report_identity,
+                "status": "complete",
+                "required_counts_by_source": {
+                    source: config.data.samples_per_source
+                    for source in sorted(selected_sources)
+                },
+                "eligible_counts_by_source": {
+                    source: reports[source]["unique_eligible_count"]
+                    for source in sorted(selected_sources)
+                },
+                "failure_counts_by_source_and_kind": {
+                    source: reports[source]["failure_counts"]
+                    for source in selected_sources
+                },
+                "manifest_hashes": {
+                    source: headers[source].manifest_hash
+                    for source in selected_sources
+                },
+            }
+            write_v2_build_report(output_root, build_report)
+            return build_report
 
 
 def main(argv: Sequence[str] | None = None) -> None:
