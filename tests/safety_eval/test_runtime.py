@@ -129,6 +129,23 @@ def test_validate_model_assets_identity_is_independent_of_root_and_creation_orde
     assert first_resolved.tokenizer_hash == second_resolved.tokenizer_hash
 
 
+def test_validate_model_assets_identity_ignores_downloader_metadata(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "model"
+    _write_model_snapshot(
+        model, ("config.json", "tokenizer.json", "model.safetensors")
+    )
+    metadata = model / ".cache/huggingface/download/config.json.lock"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("download-state-a\n", encoding="utf-8")
+    original = validate_model_assets(model)
+
+    metadata.write_text("download-state-b\n", encoding="utf-8")
+
+    assert validate_model_assets(model) == original
+
+
 def test_validate_model_assets_hashes_symlinked_loader_inputs(tmp_path: Path) -> None:
     blobs = tmp_path / "blobs"
     _write_model_snapshot(

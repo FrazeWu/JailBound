@@ -44,6 +44,7 @@ _TOKENIZER_ASSET_NAMES = frozenset(
         "vocab.txt",
     }
 )
+_SNAPSHOT_METADATA_DIRECTORIES = frozenset({".cache", ".git", "__pycache__"})
 
 
 def validate_model_assets(path: str | Path) -> ResolvedModel:
@@ -54,6 +55,10 @@ def validate_model_assets(path: str | Path) -> ResolvedModel:
             item
             for item in root.rglob("*")
             if item.is_file()
+            and not any(
+                part in _SNAPSHOT_METADATA_DIRECTORIES
+                for part in item.relative_to(root).parts
+            )
         ),
         key=lambda item: item.relative_to(root).as_posix(),
     )
