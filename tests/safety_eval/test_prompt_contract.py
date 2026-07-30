@@ -283,6 +283,75 @@ def test_huggingface_style_batched_tensors_normalize_to_one_sequence() -> None:
     assert prompt.editable_positions == (1,)
 
 
+@pytest.mark.parametrize(
+    "input_ids",
+    [
+        pytest.param(torch.tensor([1.9]), id="float"),
+        pytest.param(torch.tensor([float("nan")]), id="nan"),
+        pytest.param(torch.tensor([1 + 2j]), id="complex"),
+        pytest.param(torch.tensor([True]), id="bool"),
+        pytest.param(torch.tensor([-1]), id="negative"),
+    ],
+)
+def test_tokenizer_input_ids_must_be_non_negative_integers(
+    input_ids: torch.Tensor,
+) -> None:
+    tokenizer = _FixtureTokenizer(
+        {
+            "input_ids": input_ids,
+            "attention_mask": [1],
+            "offset_mapping": [(0, 1)],
+        }
+    )
+
+    with pytest.raises(ValueError, match="input_ids"):
+        tokenize_editable_prompt("a", (_span("a", 0, 1),), tokenizer, "fixture-r1")
+
+
+@pytest.mark.parametrize(
+    "attention_mask",
+    [
+        pytest.param(torch.tensor([1.0]), id="float"),
+        pytest.param(torch.tensor([1 + 0j]), id="complex"),
+        pytest.param(torch.tensor([2]), id="non-binary-integer"),
+    ],
+)
+def test_tokenizer_attention_mask_must_be_boolean_or_binary_integer(
+    attention_mask: torch.Tensor,
+) -> None:
+    tokenizer = _FixtureTokenizer(
+        {
+            "input_ids": [1],
+            "attention_mask": attention_mask,
+            "offset_mapping": [(0, 1)],
+        }
+    )
+
+    with pytest.raises(ValueError, match="attention_mask"):
+        tokenize_editable_prompt("a", (_span("a", 0, 1),), tokenizer, "fixture-r1")
+
+
+def test_tokenizer_token_fields_normalize_to_independent_long_tensors() -> None:
+    input_ids = torch.tensor([7], dtype=torch.int32)
+    attention_mask = torch.tensor([True])
+    tokenizer = _FixtureTokenizer(
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "offset_mapping": [(0, 1)],
+        }
+    )
+
+    prompt = tokenize_editable_prompt(
+        "a", (_span("a", 0, 1),), tokenizer, "fixture-r1"
+    )
+
+    assert prompt.base_token_ids.dtype == torch.long
+    assert prompt.attention_mask.dtype == torch.long
+    assert prompt.base_token_ids.data_ptr() != input_ids.data_ptr()
+    assert prompt.attention_mask.data_ptr() != attention_mask.data_ptr()
+
+
 def test_gather_editable_ids_returns_sequence_dimension_values() -> None:
     prompt = TokenizedEditablePrompt(
         full_text="abc",
@@ -328,6 +397,58 @@ def test_tokenized_prompt_rejects_internally_inconsistent_shapes_and_partitions(
 
     with pytest.raises(ValueError):
         TokenizedEditablePrompt(**fields)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("base_token_ids", torch.tensor([[1.9]]), id="ids-float"),
+        pytest.param(
+            "base_token_ids",
+            torch.tensor([[float("nan")]]),
+            id="ids-nan",
+        ),
+        pytest.param("base_token_ids", torch.tensor([[1 + 2j]]), id="ids-complex"),
+        pytest.param("base_token_ids", torch.tensor([[True]]), id="ids-bool"),
+        pytest.param("base_token_ids", torch.tensor([[-1]]), id="ids-negative"),
+        pytest.param("attention_mask", torch.tensor([[1.0]]), id="mask-float"),
+        pytest.param("attention_mask", torch.tensor([[1 + 0j]]), id="mask-complex"),
+        pytest.param("attention_mask", torch.tensor([[2]]), id="mask-non-binary"),
+    ],
+)
+def test_tokenized_prompt_rejects_invalid_token_field_values(
+    field: str,
+    value: torch.Tensor,
+) -> None:
+    fields: dict[str, Any] = {
+        "full_text": "a",
+        "base_token_ids": torch.tensor([[1]]),
+        "attention_mask": torch.tensor([[1]]),
+        "editable_positions": (0,),
+        "frozen_positions": (),
+        "token_offsets": ((0, 1),),
+        "boundary_expansions": ((0, 1),),
+        "tokenizer_revision": "fixture-r1",
+    }
+    fields[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        TokenizedEditablePrompt(**fields)
+
+
+def test_tokenized_prompt_accepts_boolean_attention_mask() -> None:
+    prompt = TokenizedEditablePrompt(
+        full_text="a",
+        base_token_ids=torch.tensor([[1]]),
+        attention_mask=torch.tensor([[True]]),
+        editable_positions=(0,),
+        frozen_positions=(),
+        token_offsets=((0, 1),),
+        boundary_expansions=((0, 1),),
+        tokenizer_revision="fixture-r1",
+    )
+
+    assert prompt.attention_mask.dtype == torch.bool
 
 
 def test_scatter_replaces_token_ids_without_mutating_base_or_frozen_positions() -> None:

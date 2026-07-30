@@ -10,6 +10,21 @@ import torch
 
 
 TokenOffset = tuple[int, int]
+_INTEGER_DTYPES = frozenset(
+    {
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
+)
+_UNSIGNED_INTEGER_DTYPES = frozenset(
+    {torch.uint8, torch.uint16, torch.uint32, torch.uint64}
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +49,8 @@ class TokenizedEditablePrompt:
             self.attention_mask, torch.Tensor
         ):
             raise ValueError("base_token_ids and attention_mask must be tensors")
+        _validate_input_ids(self.base_token_ids, "base_token_ids")
+        _validate_attention_mask(self.attention_mask, "attention_mask")
         if self.base_token_ids.ndim != 2 or self.base_token_ids.shape[0] != 1:
             raise ValueError("base_token_ids must have shape [1, tokens]")
         if self.attention_mask.shape != self.base_token_ids.shape:
@@ -235,7 +252,26 @@ def _normalize_token_field(value: Any, field: str) -> torch.Tensor:
         tensor = tensor.unsqueeze(0)
     elif tensor.ndim != 2 or tensor.shape[0] != 1:
         raise ValueError(f"tokenizer output {field} must contain exactly one sequence")
+    if tensor.numel() != 0:
+        if field == "input_ids":
+            _validate_input_ids(tensor, f"tokenizer output {field}")
+        else:
+            _validate_attention_mask(tensor, f"tokenizer output {field}")
     return tensor.to(dtype=torch.long).clone()
+
+
+def _validate_input_ids(tensor: torch.Tensor, field: str) -> None:
+    if tensor.dtype not in _INTEGER_DTYPES:
+        raise ValueError(f"{field} must be a non-negative integer tensor")
+    if tensor.dtype not in _UNSIGNED_INTEGER_DTYPES and torch.any(tensor < 0).item():
+        raise ValueError(f"{field} must be a non-negative integer tensor")
+
+
+def _validate_attention_mask(tensor: torch.Tensor, field: str) -> None:
+    if tensor.dtype != torch.bool and tensor.dtype not in _INTEGER_DTYPES:
+        raise ValueError(f"{field} must be a boolean or binary integer tensor")
+    if torch.any((tensor != 0) & (tensor != 1)).item():
+        raise ValueError(f"{field} must be a boolean or binary integer tensor")
 
 
 def _normalize_offsets(value: Any) -> tuple[TokenOffset, ...]:
