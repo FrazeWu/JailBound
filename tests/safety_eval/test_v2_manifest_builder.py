@@ -84,6 +84,20 @@ def _model_snapshot(path: Path, *, weight_bytes: bytes) -> Path:
     return path
 
 
+def _configured_local_build(tmp_path: Path) -> tuple[Path, Path]:
+    model = _model_snapshot(tmp_path / "semantic-model", weight_bytes=b"weights")
+    source = tmp_path / "S-Eval_attack_en_full.jsonl"
+    source.write_text('{"prompt":"fixture"}\n', encoding="utf-8")
+    config_path = _config(tmp_path)
+    payload = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
+    assert isinstance(payload, dict)
+    payload["models"]["semantic_encoder"]["local_path"] = str(model)
+    payload["data"]["paths"]["s_eval"] = str(source)
+    OmegaConf.save(config=OmegaConf.create(payload), f=config_path)
+    _confidence(tmp_path / "confidence.json")
+    return config_path, model
+
+
 def test_builder_rejects_v1_config_before_resolving_transport(tmp_path) -> None:
     builder = _load_builder()
     config = _config(tmp_path, schema_version="reviewer_eval.v1")
@@ -334,6 +348,8 @@ def test_runtime_lock_rejects_changed_build_input_bytes(
         output_root=output_root,
         source_hashes={"s_eval": "a" * 64},
         build_input_hashes=input_hashes(),
+        build_parameters={"candidate_pool": 25},
+        repository_root=ROOT,
     )
     run_manifest = json.loads(
         (output_root / "run_manifest.json").read_text(encoding="utf-8")
@@ -350,6 +366,8 @@ def test_runtime_lock_rejects_changed_build_input_bytes(
             output_root=output_root,
             source_hashes={"s_eval": "a" * 64},
             build_input_hashes=input_hashes(),
+            build_parameters={"candidate_pool": 25},
+            repository_root=ROOT,
         )
 
 
@@ -364,6 +382,8 @@ def test_runtime_lock_completes_exact_matching_partial_pair(
         "output_root": output_root,
         "source_hashes": {"s_eval": "a" * 64},
         "build_input_hashes": {"semantic_encoder": "b" * 64},
+        "build_parameters": {"candidate_pool": 25},
+        "repository_root": ROOT,
     }
     first = builder._lock_v2_runtime_config(config, **arguments)
     expected = {
@@ -397,6 +417,8 @@ def test_runtime_lock_rejects_mismatched_partial_pair_without_completing_it(
             output_root=output_root,
             source_hashes={"s_eval": "a" * 64},
             build_input_hashes={"semantic_encoder": "b" * 64},
+            build_parameters={"candidate_pool": 25},
+            repository_root=ROOT,
         )
 
     assert config_lock.read_text(encoding="utf-8") == '{"different":true}\n'
@@ -424,6 +446,8 @@ def test_runtime_lock_recovers_after_crash_between_pair_publications(
         "output_root": output_root,
         "source_hashes": {"s_eval": "a" * 64},
         "build_input_hashes": {"semantic_encoder": "b" * 64},
+        "build_parameters": {"candidate_pool": 25},
+        "repository_root": ROOT,
     }
     with pytest.raises(RuntimeError, match="injected publication crash"):
         builder._lock_v2_runtime_config(config, **arguments)
@@ -438,6 +462,188 @@ def test_runtime_lock_recovers_after_crash_between_pair_publications(
     assert json.loads(
         (output_root / "run_manifest.json").read_text(encoding="utf-8")
     )["run_id"] == locked.run_id
+
+
+def test_runtime_lock_identity_includes_candidate_pool(tmp_path: Path) -> None:
+    builder = _load_builder()
+    config = builder.load_v2_config(_config(tmp_path))
+    common = {
+        "source_hashes": {"s_eval": "a" * 64},
+        "build_input_hashes": {"semantic_encoder": "b" * 64},
+        "repository_root": ROOT,
+    }
+
+    first = builder._lock_v2_runtime_config(
+        config,
+        output_root=tmp_path / "first",
+        build_parameters={"candidate_pool": 25},
+        **common,
+    )
+    second = builder._lock_v2_runtime_config(
+        config,
+        output_root=tmp_path / "second",
+        build_parameters={"candidate_pool": 50},
+        **common,
+    )
+
+    first_manifest = json.loads(
+        (tmp_path / "first/run_manifest.json").read_text(encoding="utf-8")
+    )
+    second_manifest = json.loads(
+        (tmp_path / "second/run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert first_manifest["build_parameters"] == {"candidate_pool": 25}
+    assert second_manifest["build_parameters"] == {"candidate_pool": 50}
+    assert first.run_id != second.run_id
+
+
+def test_v2_runtime_lock_is_byte_identical_across_process_cwds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    config = builder.load_v2_config(_config(tmp_path))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    arguments = {
+        "source_hashes": {"s_eval": "a" * 64},
+        "build_input_hashes": {"semantic_encoder": "b" * 64},
+        "build_parameters": {"candidate_pool": 25},
+        "repository_root": ROOT,
+    }
+
+    monkeypatch.chdir(ROOT)
+    builder._lock_v2_runtime_config(
+        config, output_root=tmp_path / "first", **arguments
+    )
+    monkeypatch.chdir(elsewhere)
+    builder._lock_v2_runtime_config(
+        config, output_root=tmp_path / "second", **arguments
+    )
+
+    for name in ("locked_config.json", "run_manifest.json"):
+        assert (tmp_path / "first" / name).read_bytes() == (
+            tmp_path / "second" / name
+        ).read_bytes()
+
+
+def test_builder_reports_candidate_pool_as_build_parameter(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    config_path, _ = _configured_local_build(tmp_path)
+
+    class FakeEncoder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode(self, texts):
+            return [[0.0] for _ in texts]
+
+    raw = builder.RawExample(
+        source="s_eval",
+        source_row=0,
+        intent="fixture intent",
+        attack_text="fixture prompt",
+        target_text=None,
+        source_risk_label="risk",
+        source_attack_label="direct_request",
+        source_domain_label=None,
+        language="en",
+        preprocessing=(),
+    )
+    monkeypatch.setattr(builder, "QwenHiddenMeanEncoder", FakeEncoder)
+    monkeypatch.setattr(
+        builder,
+        "load_taxonomy_mapping",
+        lambda path: {
+            "risk_categories": {"risk": {"description": "risk"}},
+            "threat_domains": {"domain": {"description": "domain"}},
+        },
+    )
+    monkeypatch.setattr(
+        builder,
+        "load_source_with_report",
+        lambda *args, **kwargs: (
+            [raw],
+            SimpleNamespace(raw_count=1, eligible_count=1, exclusions={}),
+        ),
+    )
+    monkeypatch.setattr(
+        builder, "annotate_raw_candidates", lambda *args, **kwargs: ((), ())
+    )
+    monkeypatch.setattr(
+        builder, "resolve_annotation_transport", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(builder, "SpanAnnotator", lambda *args, **kwargs: object())
+
+    with pytest.raises(ValueError, match="insufficient successfully annotated"):
+        builder.build_manifests(
+            config_path,
+            candidate_pool=7,
+            sources=("s_eval",),
+        )
+
+    run_manifest = json.loads(
+        (tmp_path / "output/run_manifest.json").read_text(encoding="utf-8")
+    )
+    report = json.loads(
+        (
+            tmp_path / "output/manifests/v2/source_ingestion_report.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert run_manifest["build_parameters"] == {"candidate_pool": 7}
+    assert report["build_parameters"] == {"candidate_pool": 7}
+
+
+def test_builder_rejects_changed_candidate_pool_before_transport_resolution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    config_path, _ = _configured_local_build(tmp_path)
+
+    class FakeEncoder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode(self, texts):
+            return [[0.0] for _ in texts]
+
+    class FirstTransportResolution(RuntimeError):
+        pass
+
+    transport_calls = 0
+
+    def stop_after_runtime_lock(*args, **kwargs):
+        nonlocal transport_calls
+        transport_calls += 1
+        raise FirstTransportResolution
+
+    monkeypatch.setattr(builder, "QwenHiddenMeanEncoder", FakeEncoder)
+    monkeypatch.setattr(
+        builder,
+        "load_taxonomy_mapping",
+        lambda path: {
+            "risk_categories": {"risk": {"description": "risk"}},
+            "threat_domains": {"domain": {"description": "domain"}},
+        },
+    )
+    monkeypatch.setattr(builder, "resolve_annotation_transport", stop_after_runtime_lock)
+
+    with pytest.raises(FirstTransportResolution):
+        builder.build_manifests(
+            config_path,
+            candidate_pool=7,
+            sources=("s_eval",),
+        )
+
+    with pytest.raises(ValueError, match="runtime lock differs"):
+        builder.build_manifests(
+            config_path,
+            candidate_pool=8,
+            sources=("s_eval",),
+        )
+
+    assert transport_calls == 1
 
 
 def test_builder_rejects_changed_semantic_snapshot_before_loading_model(

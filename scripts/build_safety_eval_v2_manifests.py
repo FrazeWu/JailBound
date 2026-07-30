@@ -18,8 +18,8 @@ from typing import Any, NamedTuple
 
 from benchmark.safety_eval.config import (
     AnnotationConfig,
-    _structured_artifact_contains_v1,
     load_v2_config,
+    structured_artifact_contains_v1,
 )
 from benchmark.safety_eval.datasets import RawExample, load_source_with_report
 from benchmark.safety_eval.io import canonical_hash, canonical_json
@@ -31,7 +31,11 @@ from benchmark.safety_eval.manifest import (
     write_v2_annotation_failures,
     write_v2_build_report,
 )
-from benchmark.safety_eval.runtime import LockedRuntime, _git, validate_model_assets
+from benchmark.safety_eval.runtime import (
+    LockedRuntime,
+    git_provenance,
+    validate_model_assets,
+)
 from benchmark.safety_eval.semantic import (
     MappingDecision,
     QwenHiddenMeanEncoder,
@@ -133,7 +137,7 @@ def _reject_v1_artifacts(output_root: Path) -> None:
         for path in output_root.rglob("*")
         if path.is_file()
         and path.suffix.lower() in {".json", ".jsonl"}
-        and _structured_artifact_contains_v1(path)
+        and structured_artifact_contains_v1(path)
     )
     if structured:
         raise ValueError(
@@ -227,6 +231,8 @@ def _lock_v2_runtime_config(
     output_root: Path,
     source_hashes: dict[str, str],
     build_input_hashes: dict[str, str],
+    build_parameters: Mapping[str, object],
+    repository_root: Path,
 ) -> LockedRuntime:
     """Create the runtime lock once and validate exact reruns without clobbering."""
     output_root.mkdir(parents=True, exist_ok=True)
@@ -238,6 +244,7 @@ def _lock_v2_runtime_config(
             config_hash = canonical_hash(config_payload)
             ordered_hashes = dict(sorted(source_hashes.items()))
             ordered_build_input_hashes = dict(sorted(build_input_hashes.items()))
+            ordered_build_parameters = dict(sorted(build_parameters.items()))
             run_id = (
                 "run:"
                 + canonical_hash(
@@ -245,6 +252,7 @@ def _lock_v2_runtime_config(
                         "config_hash": config_hash,
                         "sources": ordered_hashes,
                         "build_inputs": ordered_build_input_hashes,
+                        "build_parameters": ordered_build_parameters,
                     }
                 )[:20]
             )
@@ -253,10 +261,8 @@ def _lock_v2_runtime_config(
                 "config_hash": config_hash,
                 "source_hashes": ordered_hashes,
                 "build_input_hashes": ordered_build_input_hashes,
-                "git_revision": _git(["git", "rev-parse", "HEAD"]),
-                "git_status_hash": canonical_hash(
-                    _git(["git", "status", "--porcelain"])
-                ),
+                "build_parameters": ordered_build_parameters,
+                **git_provenance(repository_root),
             }
             prepared = (
                 (
@@ -448,6 +454,8 @@ def build_manifests(
                 output_root=output_root,
                 source_hashes=source_hashes,
                 build_input_hashes=build_input_hashes,
+                build_parameters={"candidate_pool": candidate_pool},
+                repository_root=root,
             )
             transport = resolve_annotation_transport(
                 annotation_config, seed=config.run.seed
@@ -515,6 +523,7 @@ def build_manifests(
                 "config_hash": locked.config_hash,
                 "source_hashes": dict(sorted(source_hashes.items())),
                 "build_input_hashes": dict(sorted(build_input_hashes.items())),
+                "build_parameters": {"candidate_pool": candidate_pool},
                 "encoder_revision": semantic_model.revision,
                 "sources": reports,
             }

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -32,27 +31,95 @@ class LockedRuntime:
     run_id: str
 
 
+_TOKENIZER_ASSET_NAMES = frozenset(
+    {
+        "added_tokens.json",
+        "merges.txt",
+        "sentencepiece.bpe.model",
+        "special_tokens_map.json",
+        "spiece.model",
+        "tokenizer.model",
+        "vocab.json",
+        "vocab.txt",
+    }
+)
+
+
 def validate_model_assets(path: str | Path) -> ResolvedModel:
     root = Path(path)
     config = root / "config.json"
-    tokenizer_files = [item for item in root.glob("tokenizer*") if item.is_file()]
-    weight_files = [item for item in root.glob("*.safetensors")] + [item for item in root.glob("pytorch_model*.bin")]
-    if not root.is_dir() or not config.is_file() or not tokenizer_files or not weight_files:
+    snapshot_files = sorted(
+        (
+            item
+            for item in root.rglob("*")
+            if item.is_file() and not item.is_symlink()
+        ),
+        key=lambda item: item.relative_to(root).as_posix(),
+    )
+    tokenizer_files = [
+        item
+        for item in snapshot_files
+        if item.name.startswith("tokenizer") or item.name in _TOKENIZER_ASSET_NAMES
+    ]
+    weight_files = [
+        item
+        for item in snapshot_files
+        if item.name.endswith(".safetensors")
+        or (item.name.startswith("pytorch_model") and item.name.endswith(".bin"))
+    ]
+    if (
+        not root.is_dir()
+        or config not in snapshot_files
+        or not tokenizer_files
+        or not weight_files
+    ):
         raise PreflightError(f"incomplete model snapshot: {root}")
-    identity_files = sorted({config, *tokenizer_files, *weight_files})
-    digest = hashlib.sha256("".join(f"{item.name}:{sha256_file(item)}\n" for item in identity_files).encode()).hexdigest()
-    template = root / "chat_template.jinja"
-    return ResolvedModel(root, f"local-sha256:{digest}", canonical_hash({item.name: sha256_file(item) for item in tokenizer_files}), sha256_file(template) if template.is_file() else None)
+    snapshot_hashes = {
+        item.relative_to(root).as_posix(): sha256_file(item)
+        for item in snapshot_files
+    }
+    digest = canonical_hash(snapshot_hashes)
+    return ResolvedModel(
+        root,
+        f"local-sha256:{digest}",
+        canonical_hash(snapshot_hashes),
+        snapshot_hashes.get("chat_template.jinja"),
+    )
 
 
-def _git(command: list[str]) -> str:
+def _git(command: list[str], *, repository_root: str | Path) -> str:
     try:
-        return subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL).strip()
+        return subprocess.check_output(
+            command,
+            cwd=Path(repository_root),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unavailable"
 
 
-def lock_runtime_config(config: ExperimentConfig, *, output_root: str | Path, source_hashes: Mapping[str, str]) -> LockedRuntime:
+def git_provenance(repository_root: str | Path) -> dict[str, str]:
+    return {
+        "git_revision": _git(
+            ["git", "rev-parse", "HEAD"], repository_root=repository_root
+        ),
+        "git_status_hash": canonical_hash(
+            _git(
+                ["git", "status", "--porcelain"],
+                repository_root=repository_root,
+            )
+        ),
+    }
+
+
+def lock_runtime_config(
+    config: ExperimentConfig,
+    *,
+    output_root: str | Path,
+    source_hashes: Mapping[str, str],
+    repository_root: str | Path | None = None,
+) -> LockedRuntime:
     root = Path(output_root)
     payload = config.model_dump(mode="json")
     config_hash = canonical_hash(payload)
@@ -61,5 +128,16 @@ def lock_runtime_config(config: ExperimentConfig, *, output_root: str | Path, so
     if locked_path.exists() and json.loads(locked_path.read_text(encoding="utf-8")) != payload:
         raise PreflightError("output root already has a different locked config")
     atomic_write_json(locked_path, payload)
-    atomic_write_json(root / "run_manifest.json", {"run_id": run_id, "config_hash": config_hash, "source_hashes": dict(sorted(source_hashes.items())), "git_revision": _git(["git", "rev-parse", "HEAD"]), "git_status_hash": canonical_hash(_git(["git", "status", "--porcelain"]))})
+    if repository_root is None:
+        repository_root = Path(__file__).resolve().parents[3]
+    provenance = git_provenance(repository_root)
+    atomic_write_json(
+        root / "run_manifest.json",
+        {
+            "run_id": run_id,
+            "config_hash": config_hash,
+            "source_hashes": dict(sorted(source_hashes.items())),
+            **provenance,
+        },
+    )
     return LockedRuntime(config, config_hash, run_id)

@@ -431,7 +431,7 @@ def _contains_v1_schema_version(value: object) -> bool:
     return False
 
 
-def _structured_artifact_contains_v1(path: Path) -> bool:
+def structured_artifact_contains_v1(path: Path) -> bool:
     try:
         if path.suffix.lower() == ".jsonl":
             with path.open("r", encoding="utf-8") as handle:
@@ -470,7 +470,7 @@ def _reject_structured_v1_artifacts(config: V2ExperimentConfig) -> None:
         )
 
     for artifact in sorted(artifacts):
-        if artifact.is_file() and _structured_artifact_contains_v1(artifact):
+        if artifact.is_file() and structured_artifact_contains_v1(artifact):
             raise ValueError(
                 f"v2 output root contains a structured reviewer_eval.v1 artifact: {artifact}"
             )

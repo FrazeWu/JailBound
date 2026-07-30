@@ -16,6 +16,7 @@ from benchmark.safety_eval.config import (
     V2ExperimentConfig,
     load_config,
     load_v2_config,
+    structured_artifact_contains_v1,
 )
 from benchmark.safety_eval.schema import ComputeCounters, OptimizationRecord, RecordStatus
 
@@ -169,6 +170,16 @@ def test_v2_loader_rejects_output_root_with_structured_v1_artifact(
 
     with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
         load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_structured_artifact_contains_v1_is_public(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text(
+        json.dumps({"record": {"schema_version": "reviewer_eval.v1"}}),
+        encoding="utf-8",
+    )
+
+    assert structured_artifact_contains_v1(artifact)
 
 
 def test_v2_loader_cannot_hide_standard_v1_lock_with_renamed_config_lock(
