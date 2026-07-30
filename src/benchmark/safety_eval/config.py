@@ -389,6 +389,27 @@ def _contains_v1_schema_version(value: object) -> bool:
     return False
 
 
+def _structured_artifact_contains_v1(path: Path) -> bool:
+    try:
+        if path.suffix == ".jsonl":
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if _contains_v1_schema_version(payload):
+                        return True
+            return False
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return _contains_v1_schema_version(payload)
+
+
 def _reject_structured_v1_artifacts(config: V2ExperimentConfig) -> None:
     artifact_names = {
         "locked_config.json",
@@ -396,15 +417,15 @@ def _reject_structured_v1_artifacts(config: V2ExperimentConfig) -> None:
         "run_manifest.json",
         "optimization_config.json",
     }
-    for artifact_name in sorted(artifact_names):
-        artifact = config.run.output_root / artifact_name
-        if not artifact.is_file():
-            continue
-        try:
-            payload = json.loads(artifact.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if _contains_v1_schema_version(payload):
+    artifacts = {
+        config.run.output_root / artifact_name for artifact_name in artifact_names
+    }
+    if config.run.output_root.is_dir():
+        artifacts.update(config.run.output_root.rglob("*.json"))
+        artifacts.update(config.run.output_root.rglob("*.jsonl"))
+
+    for artifact in sorted(artifacts):
+        if artifact.is_file() and _structured_artifact_contains_v1(artifact):
             raise ValueError(
                 f"v2 output root contains a structured reviewer_eval.v1 artifact: {artifact}"
             )

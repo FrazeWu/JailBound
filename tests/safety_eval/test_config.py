@@ -17,6 +17,7 @@ from benchmark.safety_eval.config import (
     load_config,
     load_v2_config,
 )
+from benchmark.safety_eval.schema import ComputeCounters, OptimizationRecord, RecordStatus
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -179,6 +180,42 @@ def test_v2_loader_cannot_hide_standard_v1_lock_with_renamed_config_lock(
     payload = _v2_payload()
     payload["run"]["output_root"] = str(output_root)
     payload["run"]["locked_config_name"] = "v2_locked_config.json"
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_rejects_nested_structured_v1_jsonl_ledger(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "candidate"
+    ledger = output_root / "optimization" / "advbench" / "pez" / "records.jsonl"
+    ledger.parent.mkdir(parents=True)
+    record = OptimizationRecord(
+        schema_version="reviewer_eval.v1",
+        run_id="run:legacy",
+        config_hash="a" * 64,
+        git_revision="1234567890abcdef",
+        cell_id="cell:legacy",
+        sample_id="advbench:000000:legacy",
+        source="advbench",
+        method="pez",
+        checkpoint=25,
+        random_seed=20260725,
+        status=RecordStatus.complete,
+        failure_kind=None,
+        failure_reason=None,
+        state_path=None,
+        representation="token_ids",
+        attack_loss=0.25,
+        fol=0.5,
+        internal_margin=0.1,
+        materialized_prompt=None,
+        counters=ComputeCounters(),
+    )
+    ledger.write_text(record.model_dump_json() + "\n", encoding="utf-8")
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
 
     with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
         load_v2_config(_write_v2_config(tmp_path, payload))
