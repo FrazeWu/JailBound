@@ -16,17 +16,22 @@ import sys
 import tempfile
 from typing import Any, NamedTuple
 
-from benchmark.safety_eval.config import AnnotationConfig, load_v2_config
+from benchmark.safety_eval.config import (
+    AnnotationConfig,
+    _structured_artifact_contains_v1,
+    load_v2_config,
+)
 from benchmark.safety_eval.datasets import RawExample, load_source_with_report
-from benchmark.safety_eval.io import atomic_write_json, canonical_hash
+from benchmark.safety_eval.io import canonical_hash, canonical_json
 from benchmark.safety_eval.manifest import (
     AnnotationFailure,
     annotate_raw_candidates,
     build_v2_controlled_manifests,
+    write_no_clobber,
     write_v2_annotation_failures,
     write_v2_build_report,
 )
-from benchmark.safety_eval.runtime import LockedRuntime, lock_runtime_config
+from benchmark.safety_eval.runtime import LockedRuntime, _git, validate_model_assets
 from benchmark.safety_eval.semantic import (
     MappingDecision,
     QwenHiddenMeanEncoder,
@@ -111,7 +116,7 @@ def _selected_sources(
     return tuple(source for source in configured if source in requested)
 
 
-def _reject_v1_manifests(output_root: Path) -> None:
+def _reject_v1_artifacts(output_root: Path) -> None:
     legacy_root = output_root / "manifests"
     legacy = sorted(
         path
@@ -121,6 +126,20 @@ def _reject_v1_manifests(output_root: Path) -> None:
     )
     if legacy:
         raise ValueError(f"v2 output root contains a v1 manifest: {legacy[0]}")
+    if not output_root.is_dir():
+        return
+    structured = sorted(
+        path
+        for path in output_root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in {".json", ".jsonl"}
+        and _structured_artifact_contains_v1(path)
+    )
+    if structured:
+        raise ValueError(
+            "v2 output root contains a structured reviewer_eval.v1 artifact: "
+            f"{structured[0]}"
+        )
 
 
 def _load_confidence_threshold(
@@ -229,46 +248,35 @@ def _lock_v2_runtime_config(
                     }
                 )[:20]
             )
-            config_lock = output_root / config.run.locked_config_name
-            run_manifest = output_root / "run_manifest.json"
-            if config_lock.exists() or run_manifest.exists():
-                if not config_lock.is_file() or not run_manifest.is_file():
-                    raise ValueError("incomplete immutable v2 runtime lock")
-                try:
-                    existing_config = json.loads(
-                        config_lock.read_text(encoding="utf-8")
-                    )
-                    existing_manifest = json.loads(
-                        run_manifest.read_text(encoding="utf-8")
-                    )
-                except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                    raise ValueError("immutable v2 runtime lock is unreadable") from error
-                expected_manifest_fields = {
-                    "run_id": run_id,
-                    "config_hash": config_hash,
-                    "source_hashes": ordered_hashes,
-                    "build_input_hashes": ordered_build_input_hashes,
-                }
-                if existing_config != config_payload or not isinstance(
-                    existing_manifest, dict
-                ) or any(
-                    existing_manifest.get(key) != value
-                    for key, value in expected_manifest_fields.items()
-                ):
-                    raise ValueError(
-                        "immutable v2 runtime lock differs from requested build"
-                    )
-                return LockedRuntime(config, config_hash, run_id)
-            locked = lock_runtime_config(
-                config,
-                output_root=output_root,
-                source_hashes=source_hashes,
+            run_manifest_payload = {
+                "run_id": run_id,
+                "config_hash": config_hash,
+                "source_hashes": ordered_hashes,
+                "build_input_hashes": ordered_build_input_hashes,
+                "git_revision": _git(["git", "rev-parse", "HEAD"]),
+                "git_status_hash": canonical_hash(
+                    _git(["git", "status", "--porcelain"])
+                ),
+            }
+            prepared = (
+                (
+                    output_root / config.run.locked_config_name,
+                    (canonical_json(config_payload) + "\n").encode("utf-8"),
+                ),
+                (
+                    output_root / "run_manifest.json",
+                    (canonical_json(run_manifest_payload) + "\n").encode("utf-8"),
+                ),
             )
-            manifest_payload = json.loads(run_manifest.read_text(encoding="utf-8"))
-            manifest_payload["run_id"] = run_id
-            manifest_payload["build_input_hashes"] = ordered_build_input_hashes
-            atomic_write_json(run_manifest, manifest_payload)
-            return LockedRuntime(locked.config, locked.config_hash, run_id)
+            mismatch = "immutable v2 runtime lock differs from requested build"
+            for path, payload in prepared:
+                if path.exists() and (
+                    not path.is_file() or path.read_bytes() != payload
+                ):
+                    raise ValueError(mismatch)
+            for path, payload in prepared:
+                write_no_clobber(path, payload, mismatch=mismatch)
+            return LockedRuntime(config, config_hash, run_id)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -347,7 +355,7 @@ def build_manifests(
         config = load_v2_config(config_snapshot.paths["config"])
         selected_sources = _selected_sources(config.data.sources, sources)
         output_root = _rooted(root, config.run.output_root)
-        _reject_v1_manifests(output_root)
+        _reject_v1_artifacts(output_root)
 
         taxonomy_mapping_path = (
             root / "configs/benchmark/safety_eval_taxonomy_map.yaml"
@@ -405,6 +413,36 @@ def build_manifests(
                 build_input_hashes["harmbench_targets"] = inputs.hashes[
                     "harmbench_targets"
                 ]
+            semantic_model = validate_model_assets(
+                _rooted(root, config.models.semantic_encoder.local_path)
+            )
+            semantic_prefix = "local-sha256:"
+            if not semantic_model.revision.startswith(semantic_prefix):
+                raise ValueError("semantic encoder snapshot identity is not content-based")
+            build_input_hashes["semantic_encoder"] = (
+                semantic_model.revision.removeprefix(semantic_prefix)
+            )
+
+            mapping = load_taxonomy_mapping(inputs.paths["taxonomy_mapping"])
+            labels = list(mapping["risk_categories"]) + list(
+                mapping["threat_domains"]
+            )
+            descriptions = [
+                mapping["risk_categories"].get(
+                    label, mapping["threat_domains"].get(label)
+                )["description"]
+                for label in labels
+            ]
+            encoder = QwenHiddenMeanEncoder(
+                semantic_model.path,
+                revision=semantic_model.revision,
+            )
+            vectors = encoder.encode(descriptions)
+            loaded_semantic_model = validate_model_assets(semantic_model.path)
+            if loaded_semantic_model.revision != semantic_model.revision:
+                raise ValueError("semantic encoder snapshot changed while loading")
+            embeddings = dict(zip(labels, vectors, strict=True))
+
             locked = _lock_v2_runtime_config(
                 config,
                 output_root=output_root,
@@ -419,22 +457,6 @@ def build_manifests(
                 transport,
                 confidence_threshold=threshold,
             )
-
-            mapping = load_taxonomy_mapping(inputs.paths["taxonomy_mapping"])
-            labels = list(mapping["risk_categories"]) + list(
-                mapping["threat_domains"]
-            )
-            descriptions = [
-                mapping["risk_categories"].get(
-                    label, mapping["threat_domains"].get(label)
-                )["description"]
-                for label in labels
-            ]
-            encoder = QwenHiddenMeanEncoder(
-                config.models.semantic_encoder.local_path
-            )
-            vectors = encoder.encode(descriptions)
-            embeddings = dict(zip(labels, vectors, strict=True))
 
             candidates: dict[str, tuple[Any, ...]] = {}
             all_failures: list[AnnotationFailure] = []
@@ -493,7 +515,7 @@ def build_manifests(
                 "config_hash": locked.config_hash,
                 "source_hashes": dict(sorted(source_hashes.items())),
                 "build_input_hashes": dict(sorted(build_input_hashes.items())),
-                "encoder_revision": encoder.resolved_revision,
+                "encoder_revision": semantic_model.revision,
                 "sources": reports,
             }
             audit_and_require_sufficient_candidates(

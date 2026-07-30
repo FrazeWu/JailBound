@@ -169,7 +169,7 @@ def _v2_payload_bytes(rows: Sequence[Mapping[str, object]]) -> bytes:
     return "".join(canonical_json(row) + "\n" for row in rows).encode("utf-8")
 
 
-def _write_no_clobber(path: Path, payload: bytes, *, mismatch: str) -> None:
+def write_no_clobber(path: Path, payload: bytes, *, mismatch: str) -> None:
     """Create one immutable file, accepting only an exact-byte rerun."""
     if path.exists():
         if path.read_bytes() != payload:
@@ -205,7 +205,7 @@ def _locked_immutable_write(
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            _write_no_clobber(path, payload, mismatch=mismatch)
+            write_no_clobber(path, payload, mismatch=mismatch)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -296,12 +296,12 @@ def _commit_prepared_v2_manifests(
             for prepared in prepared_manifests:
                 _validate_prepared_v2_manifest(prepared, mismatch=mismatch)
             for prepared in prepared_manifests:
-                _write_no_clobber(
+                write_no_clobber(
                     prepared.manifest_path,
                     prepared.manifest_bytes,
                     mismatch=mismatch,
                 )
-                _write_no_clobber(
+                write_no_clobber(
                     prepared.header_path,
                     prepared.header_bytes,
                     mismatch=mismatch,

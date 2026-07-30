@@ -11,6 +11,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from benchmark.safety_eval.manifest import AnnotationFailure
+from benchmark.safety_eval.runtime import validate_model_assets
 from benchmark.safety_eval.schema import FailureKind
 
 
@@ -75,6 +76,14 @@ def _confidence(path: Path) -> None:
     )
 
 
+def _model_snapshot(path: Path, *, weight_bytes: bytes) -> Path:
+    path.mkdir(parents=True)
+    (path / "config.json").write_text("{}\n", encoding="utf-8")
+    (path / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    (path / "model.safetensors").write_bytes(weight_bytes)
+    return path
+
+
 def test_builder_rejects_v1_config_before_resolving_transport(tmp_path) -> None:
     builder = _load_builder()
     config = _config(tmp_path, schema_version="reviewer_eval.v1")
@@ -105,6 +114,35 @@ def test_builder_rejects_output_root_containing_legacy_manifest(tmp_path) -> Non
     legacy.write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="v1 manifest"):
+        builder.build_manifests(config, candidate_pool=25, sources=("s_eval",))
+
+
+def test_builder_scans_repository_rooted_relative_output_for_structured_v1(
+    tmp_path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    repository = tmp_path / "repository"
+    config_dir = repository / "configs/benchmark"
+    config_dir.mkdir(parents=True)
+    config = _config(config_dir)
+    payload = OmegaConf.to_container(OmegaConf.load(config), resolve=True)
+    assert isinstance(payload, dict)
+    payload["run"]["output_root"] = "outputs/results/reviewer_eval_v2"
+    OmegaConf.save(config=OmegaConf.create(payload), f=config)
+    artifact = (
+        repository
+        / "outputs/results/reviewer_eval_v2/audit/custom_reviewer_records.jsonl"
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        json.dumps({"record": {"schema_version": "reviewer_eval.v1"}}) + "\n",
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
         builder.build_manifests(config, candidate_pool=25, sources=("s_eval",))
 
 
@@ -231,6 +269,13 @@ def test_builder_loads_s_eval_from_hashed_snapshot_after_source_replacement(
         },
     )
     monkeypatch.setattr(builder, "QwenHiddenMeanEncoder", FakeEncoder)
+    monkeypatch.setattr(
+        builder,
+        "validate_model_assets",
+        lambda path: SimpleNamespace(
+            path=Path(path), revision="local-sha256:" + "f" * 64
+        ),
+    )
     monkeypatch.setattr(builder, "SpanAnnotator", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         builder, "resolve_annotation_transport", lambda *args, **kwargs: object()
@@ -306,6 +351,204 @@ def test_runtime_lock_rejects_changed_build_input_bytes(
             source_hashes={"s_eval": "a" * 64},
             build_input_hashes=input_hashes(),
         )
+
+
+@pytest.mark.parametrize("missing_name", ("locked_config.json", "run_manifest.json"))
+def test_runtime_lock_completes_exact_matching_partial_pair(
+    tmp_path, missing_name: str
+) -> None:
+    builder = _load_builder()
+    config = builder.load_v2_config(_config(tmp_path))
+    output_root = tmp_path / "runtime"
+    arguments = {
+        "output_root": output_root,
+        "source_hashes": {"s_eval": "a" * 64},
+        "build_input_hashes": {"semantic_encoder": "b" * 64},
+    }
+    first = builder._lock_v2_runtime_config(config, **arguments)
+    expected = {
+        name: (output_root / name).read_bytes()
+        for name in ("locked_config.json", "run_manifest.json")
+    }
+    (output_root / missing_name).unlink()
+
+    repeated = builder._lock_v2_runtime_config(config, **arguments)
+
+    assert repeated == first
+    assert {
+        name: (output_root / name).read_bytes()
+        for name in expected
+    } == expected
+
+
+def test_runtime_lock_rejects_mismatched_partial_pair_without_completing_it(
+    tmp_path,
+) -> None:
+    builder = _load_builder()
+    config = builder.load_v2_config(_config(tmp_path))
+    output_root = tmp_path / "runtime"
+    output_root.mkdir()
+    config_lock = output_root / "locked_config.json"
+    config_lock.write_text('{"different":true}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime lock differs"):
+        builder._lock_v2_runtime_config(
+            config,
+            output_root=output_root,
+            source_hashes={"s_eval": "a" * 64},
+            build_input_hashes={"semantic_encoder": "b" * 64},
+        )
+
+    assert config_lock.read_text(encoding="utf-8") == '{"different":true}\n'
+    assert not (output_root / "run_manifest.json").exists()
+
+
+def test_runtime_lock_recovers_after_crash_between_pair_publications(
+    tmp_path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    config = builder.load_v2_config(_config(tmp_path))
+    output_root = tmp_path / "runtime"
+    original_write = builder.write_no_clobber
+    calls = 0
+
+    def crash_on_second_write(path, payload, *, mismatch):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected publication crash")
+        return original_write(path, payload, mismatch=mismatch)
+
+    monkeypatch.setattr(builder, "write_no_clobber", crash_on_second_write)
+    arguments = {
+        "output_root": output_root,
+        "source_hashes": {"s_eval": "a" * 64},
+        "build_input_hashes": {"semantic_encoder": "b" * 64},
+    }
+    with pytest.raises(RuntimeError, match="injected publication crash"):
+        builder._lock_v2_runtime_config(config, **arguments)
+
+    assert (output_root / "locked_config.json").is_file()
+    assert not (output_root / "run_manifest.json").exists()
+
+    monkeypatch.setattr(builder, "write_no_clobber", original_write)
+    locked = builder._lock_v2_runtime_config(config, **arguments)
+
+    assert (output_root / "run_manifest.json").is_file()
+    assert json.loads(
+        (output_root / "run_manifest.json").read_text(encoding="utf-8")
+    )["run_id"] == locked.run_id
+
+
+def test_builder_rejects_changed_semantic_snapshot_before_loading_model(
+    tmp_path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    model = _model_snapshot(tmp_path / "semantic-model", weight_bytes=b"version-a")
+    source = tmp_path / "S-Eval_attack_en_full.jsonl"
+    source.write_text('{"prompt":"fixture"}\n', encoding="utf-8")
+    config_path = _config(tmp_path)
+    payload = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
+    assert isinstance(payload, dict)
+    payload["models"]["semantic_encoder"]["local_path"] = str(model)
+    payload["data"]["paths"]["s_eval"] = str(source)
+    OmegaConf.save(config=OmegaConf.create(payload), f=config_path)
+    _confidence(tmp_path / "confidence.json")
+    original_lock = builder._lock_v2_runtime_config
+
+    class FakeEncoder:
+        resolved_revision = "fixture-encoder"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode(self, texts):
+            return [[0.0] for _ in texts]
+
+    class LockedBeforeModelLoad(RuntimeError):
+        pass
+
+    calls = 0
+    observed_hashes: list[str] = []
+
+    def lock_then_stop(config, **kwargs):
+        nonlocal calls
+        calls += 1
+        semantic_hash = kwargs["build_input_hashes"].get("semantic_encoder")
+        if semantic_hash is not None:
+            observed_hashes.append(semantic_hash)
+        original_lock(config, **kwargs)
+        if calls == 1:
+            raise LockedBeforeModelLoad
+        raise AssertionError("changed semantic model bytes reused the runtime lock")
+
+    monkeypatch.setattr(builder, "validate_model_assets", validate_model_assets)
+    monkeypatch.setattr(builder, "QwenHiddenMeanEncoder", FakeEncoder)
+    monkeypatch.setattr(builder, "_lock_v2_runtime_config", lock_then_stop)
+    with pytest.raises(LockedBeforeModelLoad):
+        builder.build_manifests(config_path, candidate_pool=1, sources=("s_eval",))
+
+    (model / "model.safetensors").write_bytes(b"version-b")
+    with pytest.raises(ValueError, match="runtime lock differs"):
+        builder.build_manifests(config_path, candidate_pool=1, sources=("s_eval",))
+
+    assert len(observed_hashes) == 2
+    assert observed_hashes[0] != observed_hashes[1]
+
+
+def test_builder_rejects_semantic_snapshot_changed_while_loading_before_lock(
+    tmp_path, monkeypatch
+) -> None:
+    builder = _load_builder()
+    model = _model_snapshot(tmp_path / "semantic-model", weight_bytes=b"version-a")
+    source = tmp_path / "S-Eval_attack_en_full.jsonl"
+    source.write_text('{"prompt":"fixture"}\n', encoding="utf-8")
+    config_path = _config(tmp_path)
+    payload = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
+    assert isinstance(payload, dict)
+    payload["models"]["semantic_encoder"]["local_path"] = str(model)
+    payload["data"]["paths"]["s_eval"] = str(source)
+    OmegaConf.save(config=OmegaConf.create(payload), f=config_path)
+    _confidence(tmp_path / "confidence.json")
+
+    class MutatingEncoder:
+        resolved_revision = "directory-name-only"
+
+        def __init__(self, *args, **kwargs):
+            (model / "model.safetensors").write_bytes(b"version-b")
+
+        def encode(self, texts):
+            return [[0.0] for _ in texts]
+
+    monkeypatch.setattr(builder, "validate_model_assets", validate_model_assets)
+    monkeypatch.setattr(builder, "QwenHiddenMeanEncoder", MutatingEncoder)
+    monkeypatch.setattr(
+        builder,
+        "load_taxonomy_mapping",
+        lambda path: {
+            "risk_categories": {"risk": {"description": "risk"}},
+            "threat_domains": {"domain": {"description": "domain"}},
+        },
+    )
+    monkeypatch.setattr(builder, "SpanAnnotator", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        builder, "resolve_annotation_transport", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        builder,
+        "load_source_with_report",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("semantic snapshot mutation was not rejected")
+        ),
+    )
+
+    with pytest.raises(
+        ValueError, match="semantic encoder snapshot changed while loading"
+    ):
+        builder.build_manifests(config_path, candidate_pool=1, sources=("s_eval",))
+
+    assert not (tmp_path / "output/locked_config.json").exists()
+    assert not (tmp_path / "output/run_manifest.json").exists()
 
 
 def test_insufficient_builder_run_freezes_failures_before_raising(tmp_path) -> None:
