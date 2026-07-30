@@ -70,6 +70,7 @@ def test_checked_in_v2_config_loads_strict_paper_contract() -> None:
     config = load_v2_config(V2_CONFIG)
 
     assert isinstance(config, V2ExperimentConfig)
+    assert not isinstance(config, ExperimentConfig)
     assert config.run.schema_version == "reviewer_eval.v2"
     assert config.run.output_root == Path("outputs/results/reviewer_eval_v2")
     assert config.annotation.model == "de-aligned-annotator"
@@ -92,6 +93,7 @@ def test_checked_in_v2_config_loads_strict_paper_contract() -> None:
     [
         (("optimization", "prefix_initialization", "strategy"), None, "strategy"),
         (("annotation", "temperature"), 0.1, "temperature"),
+        (("annotation", "temperature"), 0, "temperature"),
         (("annotation", "temperature"), False, "temperature"),
         (("annotation", "repair_attempts"), 2, "repair_attempts"),
         (("annotation", "repair_attempts"), True, "repair_attempts"),
@@ -102,6 +104,7 @@ def test_checked_in_v2_config_loads_strict_paper_contract() -> None:
     ids=[
         "missing-prefix-strategy",
         "nonzero-annotation-temperature",
+        "integer-annotation-temperature",
         "boolean-annotation-temperature",
         "wrong-repair-attempts",
         "boolean-repair-attempts",
@@ -214,6 +217,25 @@ def test_v2_loader_rejects_nested_structured_v1_jsonl_ledger(
         counters=ComputeCounters(),
     )
     ledger.write_text(record.model_dump_json() + "\n", encoding="utf-8")
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_rejects_nested_uppercase_v1_jsonl_ledger(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "candidate"
+    ledger = output_root / "optimization" / "records.JSONL"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        "{}\n"
+        + json.dumps({"record": {"schema_version": "reviewer_eval.v1"}})
+        + "\n",
+        encoding="utf-8",
+    )
     payload = _v2_payload()
     payload["run"]["output_root"] = str(output_root)
 

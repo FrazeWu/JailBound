@@ -167,6 +167,13 @@ class AnnotationConfig(StrictModel):
             raise ValueError("annotation model and revision must be non-empty")
         return value
 
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def validate_temperature_type(cls, value: object) -> object:
+        if type(value) is not float:
+            raise ValueError("annotation temperature must be a strict float")
+        return value
+
     @field_validator("temperature")
     @classmethod
     def validate_temperature(cls, value: float) -> float:
@@ -281,6 +288,89 @@ class FolConfig(StrictModel):
     permutation_replicates: int
 
 
+def _validate_approved_scope(
+    *,
+    data: DataConfig,
+    models: ModelsConfig,
+    optimization: OptimizationConfig | V2OptimizationConfig,
+    judging: JudgingConfig,
+    fol: FolConfig,
+) -> None:
+    expected_sources = [
+        "advbench",
+        "harmbench",
+        "safetybench",
+        "sg_bench",
+        "jailbreakbench",
+        "jailbound",
+        "s_eval",
+    ]
+    expected_methods = [
+        "init",
+        "random_mutation",
+        "zol",
+        "pez",
+        "gbda",
+        "gcg",
+        "jailbound_o_minus",
+        "jailbound_o_plus",
+        "dual_branch",
+    ]
+    expected_targets = ["qwen2_5_7b"]
+    if data.sources != expected_sources or data.samples_per_source != 17:
+        raise ValueError(
+            "controlled data must use seven approved sources with 17 samples each"
+        )
+    if optimization.methods != expected_methods:
+        raise ValueError("optimization method identities or order changed")
+    if optimization.update_budget != 100:
+        raise ValueError("single-branch update budget must be 100")
+    if optimization.dual_branch_updates != {"o_minus": 50, "o_plus": 50}:
+        raise ValueError("dual branch must consume exactly 100 updates as 50/50")
+    if optimization.checkpoints != [0, 25, 50, 100]:
+        raise ValueError("checkpoint policy must be 0/25/50/100")
+    if [model.key for model in models.targets] != expected_targets:
+        raise ValueError("target models must remain in the approved serial order")
+    if models.surrogate.key != "qwen2_5_7b":
+        raise ValueError("white-box surrogate must be the local Qwen2.5-7B-Instruct")
+    primary = judging.primary
+    if (
+        primary.key,
+        primary.model,
+        primary.endpoint,
+        primary.temperature,
+    ) != ("octopus_seval_14b", None, None, 0.0):
+        raise ValueError("primary judge must remain the approved local Octopus definition")
+    secondary = judging.secondary
+    if (
+        secondary.key,
+        secondary.model,
+        secondary.endpoint,
+        secondary.temperature,
+    ) != (
+        "qwen32_compat",
+        "qwen3-32b-awq",
+        "http://localhost:8001/v1",
+        0.0,
+    ):
+        raise ValueError(
+            "secondary judge must remain the approved local Qwen compatibility endpoint"
+        )
+    if (
+        fol.validation_per_source,
+        fol.low,
+        fol.middle,
+        fol.high,
+    ) != (17, 7, 3, 7):
+        raise ValueError(
+            "FOL validation must retain the approved 7/3/7 split within 17"
+        )
+    if fol.sources != ["jailbound", "s_eval"]:
+        raise ValueError(
+            "focused FOL validation is restricted to JailBound and S-Eval"
+        )
+
+
 class ExperimentConfig(StrictModel):
     run: RunConfig
     data: DataConfig
@@ -292,84 +382,36 @@ class ExperimentConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_approved_scope(self) -> "ExperimentConfig":
-        expected_sources = [
-            "advbench",
-            "harmbench",
-            "safetybench",
-            "sg_bench",
-            "jailbreakbench",
-            "jailbound",
-            "s_eval",
-        ]
-        expected_methods = [
-            "init",
-            "random_mutation",
-            "zol",
-            "pez",
-            "gbda",
-            "gcg",
-            "jailbound_o_minus",
-            "jailbound_o_plus",
-            "dual_branch",
-        ]
-        expected_targets = ["qwen2_5_7b"]
-        if self.data.sources != expected_sources or self.data.samples_per_source != 17:
-            raise ValueError(
-                "controlled data must use seven approved sources with 17 samples each"
-            )
-        if self.optimization.methods != expected_methods:
-            raise ValueError("optimization method identities or order changed")
-        if self.optimization.update_budget != 100:
-            raise ValueError("single-branch update budget must be 100")
-        if self.optimization.dual_branch_updates != {"o_minus": 50, "o_plus": 50}:
-            raise ValueError("dual branch must consume exactly 100 updates as 50/50")
-        if self.optimization.checkpoints != [0, 25, 50, 100]:
-            raise ValueError("checkpoint policy must be 0/25/50/100")
-        if [model.key for model in self.models.targets] != expected_targets:
-            raise ValueError("target models must remain in the approved serial order")
-        if self.models.surrogate.key != "qwen2_5_7b":
-            raise ValueError("white-box surrogate must be the local Qwen2.5-7B-Instruct")
-        primary = self.judging.primary
-        if (
-            primary.key,
-            primary.model,
-            primary.endpoint,
-            primary.temperature,
-        ) != ("octopus_seval_14b", None, None, 0.0):
-            raise ValueError("primary judge must remain the approved local Octopus definition")
-        secondary = self.judging.secondary
-        if (
-            secondary.key,
-            secondary.model,
-            secondary.endpoint,
-            secondary.temperature,
-        ) != (
-            "qwen32_compat",
-            "qwen3-32b-awq",
-            "http://localhost:8001/v1",
-            0.0,
-        ):
-            raise ValueError("secondary judge must remain the approved local Qwen compatibility endpoint")
-        if (
-            self.fol.validation_per_source,
-            self.fol.low,
-            self.fol.middle,
-            self.fol.high,
-        ) != (17, 7, 3, 7):
-            raise ValueError(
-                "FOL validation must retain the approved 7/3/7 split within 17"
-            )
-        if self.fol.sources != ["jailbound", "s_eval"]:
-            raise ValueError(
-                "focused FOL validation is restricted to JailBound and S-Eval"
-            )
+        _validate_approved_scope(
+            data=self.data,
+            models=self.models,
+            optimization=self.optimization,
+            judging=self.judging,
+            fol=self.fol,
+        )
         return self
 
 
-class V2ExperimentConfig(ExperimentConfig):
+class V2ExperimentConfig(StrictModel):
     run: V2RunConfig
+    data: DataConfig
+    models: ModelsConfig
     optimization: V2OptimizationConfig
+    semantic: SemanticConfig
+    judging: JudgingConfig
+    fol: FolConfig
     annotation: AnnotationConfig
+
+    @model_validator(mode="after")
+    def validate_approved_scope(self) -> "V2ExperimentConfig":
+        _validate_approved_scope(
+            data=self.data,
+            models=self.models,
+            optimization=self.optimization,
+            judging=self.judging,
+            fol=self.fol,
+        )
+        return self
 
 
 def load_config(path: str | Path) -> ExperimentConfig:
@@ -391,7 +433,7 @@ def _contains_v1_schema_version(value: object) -> bool:
 
 def _structured_artifact_contains_v1(path: Path) -> bool:
     try:
-        if path.suffix == ".jsonl":
+        if path.suffix.lower() == ".jsonl":
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     if not line.strip():
@@ -421,8 +463,11 @@ def _reject_structured_v1_artifacts(config: V2ExperimentConfig) -> None:
         config.run.output_root / artifact_name for artifact_name in artifact_names
     }
     if config.run.output_root.is_dir():
-        artifacts.update(config.run.output_root.rglob("*.json"))
-        artifacts.update(config.run.output_root.rglob("*.jsonl"))
+        artifacts.update(
+            path
+            for path in config.run.output_root.rglob("*")
+            if path.suffix.lower() in {".json", ".jsonl"}
+        )
 
     for artifact in sorted(artifacts):
         if artifact.is_file() and _structured_artifact_contains_v1(artifact):
