@@ -119,6 +119,34 @@ def test_build_inventory_rejects_same_size_rewrite_with_restored_mtime(
         module.build_inventory((root,))
 
 
+def test_build_inventory_rejects_atomic_file_replacement_while_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    root = tmp_path / "legacy"
+    root.mkdir()
+    artifact = root / "manifest.json"
+    artifact.write_text("original", encoding="utf-8")
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text("modified", encoding="utf-8")
+    original_hash_descriptor = module._hash_descriptor
+    replaced = False
+
+    def replace_after_hash(descriptor: int) -> str:
+        nonlocal replaced
+        digest = original_hash_descriptor(descriptor)
+        if not replaced:
+            os.replace(replacement, artifact)
+            replaced = True
+        return digest
+
+    monkeypatch.setattr(module, "_hash_descriptor", replace_after_hash)
+
+    with pytest.raises(ValueError, match="changed while hashing"):
+        module.build_inventory((root,))
+
+
 def test_build_inventory_rejects_symlink_substitution_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -130,15 +158,16 @@ def test_build_inventory_rejects_symlink_substitution_race(
     artifact.write_text("inside", encoding="utf-8")
     outside = tmp_path / "outside.json"
     outside.write_text("outside", encoding="utf-8")
-    original_iter_files = module._iter_files
+    original_iter_relative_files = module._iter_relative_files
 
-    def substitute_after_check(inventory_root: Path):
-        for path in original_iter_files(inventory_root):
+    def substitute_after_check(root_descriptor: int, prefix: Path = Path()):
+        for relative_path in original_iter_relative_files(root_descriptor, prefix):
             path.unlink()
             path.symlink_to(outside)
-            yield path
+            yield relative_path
 
-    monkeypatch.setattr(module, "_iter_files", substitute_after_check)
+    path = artifact
+    monkeypatch.setattr(module, "_iter_relative_files", substitute_after_check)
 
     with pytest.raises(ValueError, match="symlink|changed while hashing"):
         module.build_inventory((root,))
@@ -157,6 +186,19 @@ def test_build_inventory_rejects_broad_system_root() -> None:
 
     with pytest.raises(ValueError, match="unsafe inventory root"):
         module.build_inventory((Path("/tmp"),))
+
+
+@pytest.mark.parametrize(
+    "unsafe_root",
+    (Path("/usr/local/share"), Path("/etc/systemd/system"), Path("/var/lib/apt/lists")),
+)
+def test_build_inventory_rejects_nested_system_trees(unsafe_root: Path) -> None:
+    module = _module()
+    if not unsafe_root.is_dir():
+        pytest.skip(f"system fixture does not exist: {unsafe_root}")
+
+    with pytest.raises(ValueError, match="unsafe inventory root"):
+        module.build_inventory((unsafe_root,))
 
 
 def test_build_inventory_rejects_overlapping_roots(tmp_path: Path) -> None:
@@ -180,6 +222,84 @@ def test_verify_inventory_rejects_non_string_relative_path(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="invalid legacy inventory file entry"):
         module.verify_inventory(inventory)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda inventory: inventory.update({"extra": True}),
+        lambda inventory: inventory["roots"][0].update({"extra": True}),
+        lambda inventory: inventory.update({"version": True}),
+    ),
+    ids=("top-level-extra", "root-extra", "boolean-version"),
+)
+def test_verify_inventory_requires_exact_document_schema(tmp_path: Path, mutate) -> None:
+    module = _module()
+    root = tmp_path / "legacy"
+    root.mkdir()
+    inventory = module.build_inventory((root,))
+    mutate(inventory)
+
+    with pytest.raises(ValueError, match="invalid legacy inventory|unsupported legacy inventory version"):
+        module.verify_inventory(inventory)
+
+
+def test_verify_inventory_rejects_overlapping_root_set(tmp_path: Path) -> None:
+    module = _module()
+    parent = tmp_path / "legacy"
+    child = parent / "nested"
+    child.mkdir(parents=True)
+    inventory = {
+        "version": module.INVENTORY_VERSION,
+        "roots": [
+            {"root": str(parent.resolve()), "files": []},
+            {"root": str(child.resolve()), "files": []},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="overlap"):
+        module.verify_inventory(inventory)
+
+
+def test_validate_destination_rejects_lexical_path_inside_root_when_symlink_points_outside(tmp_path: Path) -> None:
+    module = _module()
+    root = tmp_path / "legacy"
+    root.mkdir()
+    outside = tmp_path / "outside.json"
+    destination = root / "inventory.json"
+    destination.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="inside an inventory root"):
+        module._validate_destination(destination, (root,))
+
+
+def test_build_inventory_rejects_root_replacement_during_descriptor_enumeration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    root = tmp_path / "legacy"
+    root.mkdir()
+    (root / "manifest.json").write_text("original", encoding="utf-8")
+    displaced = tmp_path / "displaced"
+    original_iter_relative_files = module._iter_relative_files
+    replaced = False
+
+    def replace_root_after_scan(root_descriptor: int):
+        nonlocal replaced
+        relative_paths = tuple(original_iter_relative_files(root_descriptor))
+        if not replaced:
+            root.rename(displaced)
+            root.mkdir()
+            (root / "manifest.json").write_text("original", encoding="utf-8")
+            (root / "unrecorded.json").write_text("new", encoding="utf-8")
+            replaced = True
+        yield from relative_paths
+
+    monkeypatch.setattr(module, "_iter_relative_files", replace_root_after_scan)
+
+    with pytest.raises(ValueError, match="changed while inventorying"):
+        module.build_inventory((root,))
 
 
 def test_cli_write_and_verify_roundtrip(tmp_path: Path) -> None:

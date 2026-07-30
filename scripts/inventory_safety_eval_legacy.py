@@ -4,10 +4,9 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+import secrets
 import stat
-import tempfile
 from typing import Any, Iterable
 
 
@@ -20,6 +19,27 @@ _DIRECTORY_OPEN_FLAGS = (
 )
 _FILE_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _SHA256_HEX_LENGTH = 64
+_PROTECTED_SYSTEM_TREES = tuple(
+    Path(path)
+    for path in (
+        "/boot",
+        "/dev",
+        "/etc",
+        "/lib",
+        "/lib64",
+        "/media",
+        "/mnt",
+        "/opt",
+        "/proc",
+        "/root",
+        "/run",
+        "/sbin",
+        "/srv",
+        "/sys",
+        "/usr",
+        "/var",
+    )
+)
 
 
 def _is_same_or_ancestor(candidate: Path, path: Path) -> bool:
@@ -36,6 +56,7 @@ def _resolve_root(root: Path) -> Path:
         len(resolved.parts) <= 3
         or _is_same_or_ancestor(resolved, repository_root)
         or _is_same_or_ancestor(resolved, working_directory)
+        or any(_is_same_or_ancestor(system_root, resolved) for system_root in _PROTECTED_SYSTEM_TREES)
     )
     if is_broad or resolved == Path.home().resolve() or (resolved / ".git").exists():
         raise ValueError(f"unsafe inventory root: {resolved}")
@@ -53,11 +74,25 @@ def _validate_roots(roots: Iterable[Path]) -> tuple[Path, ...]:
     return resolved_roots
 
 
-def _open_directory_no_follow(path: Path) -> int:
+def _absolute_lexical_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    return Path(os.path.abspath(expanded))
+
+
+def _open_directory_no_follow(path: Path, *, create: bool = False) -> int:
+    path = _absolute_lexical_path(path)
     descriptor = os.open("/", _DIRECTORY_OPEN_FLAGS)
     try:
         for component in path.parts[1:]:
-            child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            try:
+                child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -84,12 +119,44 @@ def _open_relative_file_no_follow(root_descriptor: int, relative_path: Path) -> 
         raise
 
 
-def _iter_files(root: Path) -> Iterable[Path]:
-    for path in sorted(root.rglob("*"), key=lambda candidate: candidate.relative_to(root).as_posix()):
-        if path.is_symlink():
-            raise ValueError(f"symlinked legacy artifact is not supported: {path}")
-        if path.is_file():
-            yield path
+def _iter_relative_files(directory_descriptor: int, prefix: Path = Path()) -> Iterable[Path]:
+    with os.scandir(os.dup(directory_descriptor)) as iterator:
+        entries = sorted(iterator, key=lambda entry: entry.name)
+        for entry in entries:
+            relative_path = prefix / entry.name
+            if entry.is_symlink():
+                raise ValueError(f"symlinked legacy artifact is not supported: {relative_path}")
+            if entry.is_file(follow_symlinks=False):
+                yield relative_path
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                raise ValueError(f"legacy artifact is not a regular file: {relative_path}")
+
+            child_descriptor: int | None = None
+            confirmation_descriptor: int | None = None
+            try:
+                child_descriptor = os.open(entry.name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_descriptor)
+                before = os.fstat(child_descriptor)
+                yield from _iter_relative_files(child_descriptor, relative_path)
+                after = os.fstat(child_descriptor)
+                confirmation_descriptor = os.open(
+                    entry.name,
+                    _DIRECTORY_OPEN_FLAGS,
+                    dir_fd=directory_descriptor,
+                )
+                current = os.fstat(confirmation_descriptor)
+            except OSError as error:
+                raise ValueError(f"legacy directory changed while inventorying: {relative_path}") from error
+            finally:
+                if confirmation_descriptor is not None:
+                    os.close(confirmation_descriptor)
+                if child_descriptor is not None:
+                    os.close(child_descriptor)
+            if _stable_stat_identity(before) != _stable_stat_identity(after) or (
+                before.st_dev,
+                before.st_ino,
+            ) != (current.st_dev, current.st_ino):
+                raise ValueError(f"legacy directory changed while inventorying: {relative_path}")
 
 
 def _hash_descriptor(descriptor: int) -> str:
@@ -106,22 +173,22 @@ def _stable_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, in
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
-def _file_entry(root: Path, root_descriptor: int, path: Path) -> dict[str, Any]:
-    relative_path = path.relative_to(root)
+def _file_entry(root: Path, root_descriptor: int, relative_path: Path) -> dict[str, Any]:
+    display_path = root / relative_path
     descriptor: int | None = None
     confirmation_descriptor: int | None = None
     try:
         descriptor = _open_relative_file_no_follow(root_descriptor, relative_path)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"legacy artifact is not a regular file: {path}")
+            raise ValueError(f"legacy artifact is not a regular file: {display_path}")
         digest = _hash_descriptor(descriptor)
         after = os.fstat(descriptor)
         confirmation_digest = _hash_descriptor(descriptor)
         confirmation_descriptor = _open_relative_file_no_follow(root_descriptor, relative_path)
         current = os.fstat(confirmation_descriptor)
     except OSError as error:
-        raise ValueError(f"symlinked or unstable legacy artifact is not supported: {path}") from error
+        raise ValueError(f"symlinked or unstable legacy artifact is not supported: {display_path}") from error
     finally:
         if confirmation_descriptor is not None:
             os.close(confirmation_descriptor)
@@ -141,7 +208,7 @@ def _file_entry(root: Path, root_descriptor: int, path: Path) -> dict[str, Any]:
         current.st_mtime_ns,
         current.st_ctime_ns,
     ):
-        raise ValueError(f"legacy artifact changed while hashing: {path}")
+        raise ValueError(f"legacy artifact changed while hashing: {display_path}")
     return {
         "path": relative_path.as_posix(),
         "size": before.st_size,
@@ -152,18 +219,37 @@ def _file_entry(root: Path, root_descriptor: int, path: Path) -> dict[str, Any]:
 
 def build_inventory(roots: Iterable[Path]) -> dict[str, Any]:
     resolved_roots = _validate_roots(roots)
-    root_entries: list[dict[str, Any]] = []
-    for root in resolved_roots:
-        descriptor = _open_directory_no_follow(root)
-        try:
-            files = [_file_entry(root, descriptor, path) for path in _iter_files(root)]
-        finally:
-            os.close(descriptor)
-        root_entries.append({"root": str(root), "files": files})
     return {
         "version": INVENTORY_VERSION,
-        "roots": root_entries,
+        "roots": [_inventory_root(root) for root in resolved_roots],
     }
+
+
+def _inventory_root(root: Path) -> dict[str, Any]:
+    descriptor = _open_directory_no_follow(root)
+    confirmation_descriptor: int | None = None
+    try:
+        before = os.fstat(descriptor)
+        relative_paths = tuple(_iter_relative_files(descriptor))
+        files = [_file_entry(root, descriptor, relative_path) for relative_path in relative_paths]
+        confirmed_paths = tuple(_iter_relative_files(descriptor))
+        after = os.fstat(descriptor)
+        confirmation_descriptor = _open_directory_no_follow(root)
+        current = os.fstat(confirmation_descriptor)
+    except OSError as error:
+        raise ValueError(f"legacy root changed while inventorying: {root}") from error
+    finally:
+        if confirmation_descriptor is not None:
+            os.close(confirmation_descriptor)
+        os.close(descriptor)
+
+    if (
+        relative_paths != confirmed_paths
+        or _stable_stat_identity(before) != _stable_stat_identity(after)
+        or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise ValueError(f"legacy root changed while inventorying: {root}")
+    return {"root": str(root), "files": files}
 
 
 def _validate_inventory_file_entry(entry: object) -> dict[str, Any]:
@@ -197,65 +283,92 @@ def _validate_inventory_file_entry(entry: object) -> dict[str, Any]:
 
 
 def verify_inventory(inventory: dict[str, Any]) -> None:
-    if inventory.get("version") != INVENTORY_VERSION:
+    if not isinstance(inventory, dict) or set(inventory) != {"version", "roots"}:
+        raise ValueError("invalid legacy inventory document")
+    if type(inventory["version"]) is not int or inventory["version"] != INVENTORY_VERSION:
         raise ValueError("unsupported legacy inventory version")
-    roots = inventory.get("roots")
+    roots = inventory["roots"]
     if not isinstance(roots, list) or not roots:
         raise ValueError("legacy inventory has no roots")
 
+    root_paths: list[Path] = []
     for root_entry in roots:
-        if not isinstance(root_entry, dict) or not isinstance(root_entry.get("root"), str):
+        if (
+            not isinstance(root_entry, dict)
+            or set(root_entry) != {"root", "files"}
+            or not isinstance(root_entry["root"], str)
+        ):
             raise ValueError("invalid legacy inventory root")
         root_path = Path(root_entry["root"])
-        if not root_path.is_absolute():
+        if not root_path.is_absolute() or str(root_path) != root_entry["root"] or root_path.resolve() != root_path:
             raise ValueError("invalid legacy inventory root")
-        root = _resolve_root(root_path)
-        expected_files = root_entry.get("files")
+        root_paths.append(root_path)
+        expected_files = root_entry["files"]
         if not isinstance(expected_files, list):
             raise ValueError("invalid legacy inventory files")
         validated_files = [_validate_inventory_file_entry(entry) for entry in expected_files]
-        expected_by_path = {entry["path"]: entry for entry in validated_files}
-        if len(expected_by_path) != len(expected_files):
+        if len({entry["path"] for entry in validated_files}) != len(expected_files):
             raise ValueError("invalid legacy inventory file entry")
 
-        current_paths = {path.relative_to(root).as_posix(): path for path in _iter_files(root)}
-        for relative_path in sorted(set(expected_by_path) - set(current_paths)):
-            raise ValueError(f"legacy artifact missing: {root / relative_path}")
-        for relative_path in sorted(set(current_paths) - set(expected_by_path)):
-            raise ValueError(f"new legacy artifact: {current_paths[relative_path]}")
-
-        descriptor = _open_directory_no_follow(root)
-        try:
-            for relative_path in sorted(expected_by_path):
-                expected = expected_by_path[relative_path]
-                current = _file_entry(root, descriptor, current_paths[relative_path])
-                if current != expected:
-                    raise ValueError(f"legacy artifact changed: {current_paths[relative_path]}")
-        finally:
-            os.close(descriptor)
+    resolved_roots = _validate_roots(root_paths)
+    if tuple(root_paths) != resolved_roots:
+        raise ValueError("legacy inventory roots must use stable ordering")
+    for root_entry, root in zip(roots, resolved_roots, strict=True):
+        current = _inventory_root(root)
+        expected_files = root_entry["files"]
+        if current["files"] != expected_files:
+            expected_paths = {entry["path"] for entry in expected_files}
+            current_paths = {entry["path"] for entry in current["files"]}
+            missing = sorted(expected_paths - current_paths)
+            if missing:
+                raise ValueError(f"legacy artifact missing: {root / missing[0]}")
+            added = sorted(current_paths - expected_paths)
+            if added:
+                raise ValueError(f"new legacy artifact: {root / added[0]}")
+            raise ValueError(f"legacy artifact changed: {root}")
 
 
 def _validate_destination(destination: Path, roots: Iterable[Path]) -> None:
+    lexical_destination = _absolute_lexical_path(destination)
     resolved_destination = destination.expanduser().resolve()
     for root in _validate_roots(roots):
-        if _is_same_or_ancestor(root, resolved_destination):
+        if _is_same_or_ancestor(root, lexical_destination) or _is_same_or_ancestor(root, resolved_destination):
             raise ValueError(f"inventory destination is inside an inventory root: {destination}")
 
 
 def write_inventory(destination: Path, inventory: dict[str, Any]) -> None:
-    destination = destination.expanduser()
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = _absolute_lexical_path(destination)
+    parent_descriptor = _open_directory_no_follow(destination.parent, create=True)
     payload = json.dumps(inventory, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    temporary_name = f".{destination.name}.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
     try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_name, destination)
+        os.replace(
+            temporary_name,
+            destination.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        os.fsync(parent_descriptor)
     finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        os.close(parent_descriptor)
 
 
 def _read_inventory(path: Path) -> dict[str, Any]:
