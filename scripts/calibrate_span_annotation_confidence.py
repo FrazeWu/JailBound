@@ -83,6 +83,20 @@ class CalibrationError(ValueError):
     """Raised when reviewed annotations cannot yield a frozen threshold."""
 
 
+class _DuplicateJsonField(ValueError):
+    def __init__(self, field: str) -> None:
+        self.field = field
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonField(key)
+        result[key] = value
+    return result
+
+
 @dataclass(frozen=True)
 class ReviewedAnnotation:
     confidence: float
@@ -187,6 +201,15 @@ def _sample_key(seed: int, row: RawExample) -> str:
     return hashlib.sha256(f"{seed}|{row.source_row_id}".encode("utf-8")).hexdigest()
 
 
+def _annotation_payload_sha256(row: Mapping[str, object]) -> str:
+    payload = {
+        key: value
+        for key, value in row.items()
+        if key not in {"accepted", "annotation_payload_sha256"}
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
 def prepare_review_rows(
     sources: Mapping[str, Sequence[RawExample]],
     *,
@@ -230,26 +253,24 @@ def prepare_review_rows(
                 seed_intent=raw.intent,
                 source_hints=source_hints,
             )
-            rows.append(
-                {
-                    "source": source,
-                    "source_row": raw.source_row,
-                    "source_row_id": raw.source_row_id,
-                    "prompt": raw.attack_text,
-                    "seed_intent": raw.intent,
-                    "source_hints": source_hints,
-                    "preprocessing": list(raw.preprocessing),
-                    "spans": [
-                        span.model_dump(mode="json") for span in annotation.spans
-                    ],
-                    "confidence": annotation.confidence,
-                    "annotation_model": annotation.model,
-                    "annotation_revision": annotation.revision,
-                    "annotation_template_sha256": annotation.template_sha256,
-                    "annotation_response_sha256": annotation.response_sha256,
-                    "accepted": None,
-                }
-            )
+            row: dict[str, object] = {
+                "source": source,
+                "source_row": raw.source_row,
+                "source_row_id": raw.source_row_id,
+                "prompt": raw.attack_text,
+                "seed_intent": raw.intent,
+                "source_hints": source_hints,
+                "preprocessing": list(raw.preprocessing),
+                "spans": [span.model_dump(mode="json") for span in annotation.spans],
+                "confidence": annotation.confidence,
+                "annotation_model": annotation.model,
+                "annotation_revision": annotation.revision,
+                "annotation_template_sha256": annotation.template_sha256,
+                "annotation_response_sha256": annotation.response_sha256,
+                "accepted": None,
+            }
+            row["annotation_payload_sha256"] = _annotation_payload_sha256(row)
+            rows.append(row)
     return rows
 
 
@@ -264,7 +285,12 @@ def _read_reviewed_rows(path: Path) -> tuple[bytes, list[dict[str, object]]]:
         if not line.strip():
             continue
         try:
-            row = json.loads(line)
+            row = json.loads(line, object_pairs_hook=_unique_object)
+        except _DuplicateJsonField as error:
+            raise CalibrationError(
+                f"reviewed JSONL line {line_number} contains duplicate JSON field: "
+                f"{error.field}"
+            ) from error
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise CalibrationError(
                 f"reviewed JSONL line {line_number} must be valid UTF-8 JSON"
@@ -296,6 +322,7 @@ def freeze_reviewed_annotations(
     reviews: list[ReviewedAnnotation] = []
     provenance: set[tuple[str, str, str, str]] = set()
     sources: set[str] = set()
+    annotation_identity: tuple[str, str, str] | None = None
     for index, row in enumerate(rows):
         if type(row.get("accepted")) is not bool:
             raise CalibrationError(f"review {index} accepted must be an exact boolean")
@@ -314,11 +341,24 @@ def freeze_reviewed_annotations(
         response_sha256 = _required_string(
             row, "annotation_response_sha256", index
         )
+        payload_sha256 = _required_string(row, "annotation_payload_sha256", index)
         if (
             _SHA256.fullmatch(template_sha256) is None
             or _SHA256.fullmatch(response_sha256) is None
+            or _SHA256.fullmatch(payload_sha256) is None
         ):
             raise CalibrationError(f"review {index} annotation hashes must be SHA-256")
+        if payload_sha256 != _annotation_payload_sha256(row):
+            raise CalibrationError(
+                f"review {index} changed the immutable annotation payload"
+            )
+        current_identity = (model, revision, template_sha256)
+        if annotation_identity is None:
+            annotation_identity = current_identity
+        elif current_identity != annotation_identity:
+            raise CalibrationError(
+                "all reviews must use the same model, revision, and template"
+            )
         sources.add(source)
         provenance.add((model, revision, template_sha256, response_sha256))
 
@@ -379,6 +419,8 @@ def write_frozen_artifact(path: Path, artifact: Mapping[str, object]) -> None:
 
 
 class OpenAIAnnotationTransport(AnnotationTransport):
+    """Call a revision-pinned OpenAI-compatible deployment."""
+
     def __init__(
         self,
         *,
@@ -411,6 +453,11 @@ class OpenAIAnnotationTransport(AnnotationTransport):
             seed=self._seed,
             response_format=_ANNOTATION_RESPONSE_FORMAT,
         )
+        if getattr(response, "model", None) != self.revision:
+            raise CalibrationError(
+                "annotation transport returned model identity different from the "
+                "locked revision"
+            )
         content = response.choices[0].message.content
         if not isinstance(content, str):
             raise CalibrationError("annotation transport returned no text")

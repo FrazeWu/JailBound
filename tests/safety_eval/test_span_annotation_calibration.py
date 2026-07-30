@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 import sys
 
@@ -174,6 +176,11 @@ def test_prepare_core_samples_fixed_count_per_source_deterministically() -> None
     assert all(row["accepted"] is None for row in first)
     assert all(row["confidence"] == 0.75 for row in first)
     assert all(row["annotation_model"] == "fixture-model" for row in first)
+    assert all(
+        row["annotation_payload_sha256"]
+        == _MODULE._annotation_payload_sha256(row)
+        for row in first
+    )
     assert all(row["seed_intent"].startswith("intent-") for row in first)
     assert all(row["source_hints"]["language"] == "en" for row in first)
     assert all(row["spans"][0]["quote"] == row["prompt"] for row in first)
@@ -203,26 +210,30 @@ def test_prepare_core_rejects_short_source_or_invalid_count() -> None:
         )
 
 
+def _signed_review_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "source": "a",
+        "confidence": 0.9,
+        "accepted": True,
+        "annotation_model": "model-a",
+        "annotation_revision": "rev-a",
+        "annotation_template_sha256": "1" * 64,
+        "annotation_response_sha256": "2" * 64,
+    }
+    row.update(overrides)
+    row["annotation_payload_sha256"] = _MODULE._annotation_payload_sha256(row)
+    return row
+
+
 def _reviewed_file(path: Path) -> bytes:
     rows = [
-        {
-            "source": "a",
-            "confidence": 0.9,
-            "accepted": True,
-            "annotation_model": "model-a",
-            "annotation_revision": "rev-a",
-            "annotation_template_sha256": "1" * 64,
-            "annotation_response_sha256": "2" * 64,
-        },
-        {
-            "source": "b",
-            "confidence": 0.8,
-            "accepted": False,
-            "annotation_model": "model-a",
-            "annotation_revision": "rev-a",
-            "annotation_template_sha256": "1" * 64,
-            "annotation_response_sha256": "3" * 64,
-        },
+        _signed_review_row(),
+        _signed_review_row(
+            source="b",
+            confidence=0.8,
+            accepted=False,
+            annotation_response_sha256="3" * 64,
+        ),
     ]
     payload = "".join(canonical_json(row) + "\n" for row in rows).encode("utf-8")
     path.write_bytes(payload)
@@ -309,6 +320,66 @@ def test_freeze_rejects_non_hex_annotation_hashes(
         )
 
 
+def test_freeze_rejects_changes_to_prepared_annotation_payload(tmp_path: Path) -> None:
+    reviewed = tmp_path / "reviewed.jsonl"
+    _reviewed_file(reviewed)
+    rows = read_jsonl(reviewed)
+    rows[0]["confidence"] = 0.1
+    reviewed.write_text(
+        "".join(canonical_json(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    with pytest.raises(CalibrationError, match="immutable annotation payload"):
+        freeze_reviewed_annotations(
+            reviewed, target_precision=1.0, minimum_selected=1
+        )
+
+
+def test_freeze_rejects_duplicate_json_fields(tmp_path: Path) -> None:
+    reviewed = tmp_path / "reviewed.jsonl"
+    row = canonical_json(_signed_review_row())
+    reviewed.write_text(
+        row.replace('"accepted":true', '"accepted":false,"accepted":true') + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CalibrationError, match="duplicate JSON field: accepted"):
+        freeze_reviewed_annotations(
+            reviewed, target_precision=1.0, minimum_selected=1
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("annotation_model", "model-b"),
+        ("annotation_revision", "rev-b"),
+        ("annotation_template_sha256", "4" * 64),
+    ],
+)
+def test_freeze_rejects_mixed_annotation_identity(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    reviewed = tmp_path / "reviewed.jsonl"
+    rows = [
+        _signed_review_row(),
+        _signed_review_row(
+            source="b",
+            accepted=False,
+            annotation_response_sha256="3" * 64,
+            **{field: value},
+        ),
+    ]
+    reviewed.write_text(
+        "".join(canonical_json(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    with pytest.raises(CalibrationError, match="same model, revision, and template"):
+        freeze_reviewed_annotations(
+            reviewed, target_precision=1.0, minimum_selected=1
+        )
+
+
 def test_frozen_artifact_write_is_atomic_and_refuses_overwrite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -353,14 +424,39 @@ def test_frozen_artifact_refuses_overwrite_even_if_precheck_is_stale(
     assert output.read_text(encoding="utf-8") == '{"threshold":0.7}\n'
 
 
+def test_concurrent_frozen_artifact_writers_have_exactly_one_winner(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "artifact.json"
+    barrier = Barrier(2)
+
+    def write(value: float) -> str:
+        barrier.wait()
+        try:
+            write_frozen_artifact(output, {"threshold": value})
+        except FileExistsError:
+            return "rejected"
+        return "written"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(write, (0.8, 0.9)))
+
+    assert sorted(outcomes) == ["rejected", "written"]
+    assert json.loads(output.read_text(encoding="utf-8"))["threshold"] in {0.8, 0.9}
+
+
 class _FakeCompletions:
-    def __init__(self) -> None:
+    def __init__(self, response_model: str = "annotator-revision-7") -> None:
         self.kwargs: dict[str, object] | None = None
+        self.response_model = response_model
 
     def create(self, **kwargs: object) -> object:
         self.kwargs = kwargs
         message = SimpleNamespace(content='{"spans":[]}')
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        return SimpleNamespace(
+            model=self.response_model,
+            choices=[SimpleNamespace(message=message)],
+        )
 
 
 def test_openai_transport_pins_revision_seed_and_json_schema() -> None:
@@ -387,6 +483,23 @@ def test_openai_transport_pins_revision_seed_and_json_schema() -> None:
     schema = response_format["json_schema"]["schema"]
     assert schema["required"] == ["spans"]
     assert schema["additionalProperties"] is False
+
+
+def test_openai_transport_rejects_mismatched_returned_model() -> None:
+    transport = OpenAIAnnotationTransport.__new__(OpenAIAnnotationTransport)
+    transport.model = "annotator-family"
+    transport.revision = "annotator-revision-7"
+    transport._seed = 20260725
+    transport._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=_FakeCompletions(response_model="mutable-latest")
+        )
+    )
+
+    with pytest.raises(CalibrationError, match="returned model identity"):
+        transport.complete(
+            ({"role": "user", "content": "payload"},), temperature=0.0
+        )
 
 
 def test_prepare_roots_relative_config_before_loading(
