@@ -34,6 +34,7 @@ class LockedRuntime:
 _TOKENIZER_ASSET_NAMES = frozenset(
     {
         "added_tokens.json",
+        "chat_template.jinja",
         "merges.txt",
         "sentencepiece.bpe.model",
         "special_tokens_map.json",
@@ -52,7 +53,7 @@ def validate_model_assets(path: str | Path) -> ResolvedModel:
         (
             item
             for item in root.rglob("*")
-            if item.is_file() and not item.is_symlink()
+            if item.is_file()
         ),
         key=lambda item: item.relative_to(root).as_posix(),
     )
@@ -78,11 +79,17 @@ def validate_model_assets(path: str | Path) -> ResolvedModel:
         item.relative_to(root).as_posix(): sha256_file(item)
         for item in snapshot_files
     }
+    tokenizer_hashes = {
+        item.relative_to(root).as_posix(): snapshot_hashes[
+            item.relative_to(root).as_posix()
+        ]
+        for item in {config, *tokenizer_files}
+    }
     digest = canonical_hash(snapshot_hashes)
     return ResolvedModel(
         root,
         f"local-sha256:{digest}",
-        canonical_hash(snapshot_hashes),
+        canonical_hash(tokenizer_hashes),
         snapshot_hashes.get("chat_template.jinja"),
     )
 

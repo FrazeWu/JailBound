@@ -129,19 +129,23 @@ def test_validate_model_assets_identity_is_independent_of_root_and_creation_orde
     assert first_resolved.tokenizer_hash == second_resolved.tokenizer_hash
 
 
-def test_validate_model_assets_identity_ignores_symlinks(tmp_path: Path) -> None:
-    names = ("config.json", "tokenizer.json", "model.safetensors")
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    _write_model_snapshot(first, names)
-    _write_model_snapshot(second, names)
-    (second / "tokenizer_alias.json").symlink_to(second / "tokenizer.json")
+def test_validate_model_assets_hashes_symlinked_loader_inputs(tmp_path: Path) -> None:
+    blobs = tmp_path / "blobs"
+    _write_model_snapshot(
+        blobs, ("config.json", "tokenizer.json", "model.safetensors")
+    )
+    model = tmp_path / "model"
+    model.mkdir()
+    for name in ("config.json", "tokenizer.json", "model.safetensors"):
+        (model / name).symlink_to(blobs / name)
 
-    first_resolved = validate_model_assets(first)
-    second_resolved = validate_model_assets(second)
+    original = validate_model_assets(model)
+    with (blobs / "model.safetensors").open("a", encoding="utf-8") as stream:
+        stream.write("changed\n")
+    changed = validate_model_assets(model)
 
-    assert first_resolved.revision == second_resolved.revision
-    assert first_resolved.tokenizer_hash == second_resolved.tokenizer_hash
+    assert changed.revision != original.revision
+    assert changed.tokenizer_hash == original.tokenizer_hash
 
 
 def test_validate_model_assets_rejects_incomplete_snapshot(tmp_path: Path) -> None:
@@ -171,15 +175,21 @@ def test_validate_model_assets_requires_each_snapshot_asset_class(
         validate_model_assets(model)
 
 
-def test_validate_model_assets_rejects_symlink_only_weight_shard(tmp_path: Path) -> None:
-    external_weight = tmp_path / "external.safetensors"
-    external_weight.write_bytes(b"weights")
+def test_validate_model_assets_tokenizer_hash_ignores_weight_changes(
+    tmp_path: Path,
+) -> None:
     model = tmp_path / "model"
-    _write_model_snapshot(model, ("config.json", "tokenizer.json"))
-    (model / "model.safetensors").symlink_to(external_weight)
+    _write_model_snapshot(
+        model, ("config.json", "tokenizer.json", "model.safetensors")
+    )
+    original = validate_model_assets(model)
 
-    with pytest.raises(PreflightError, match="incomplete model snapshot"):
-        validate_model_assets(model)
+    with (model / "model.safetensors").open("a", encoding="utf-8") as stream:
+        stream.write("changed\n")
+    changed = validate_model_assets(model)
+
+    assert changed.revision != original.revision
+    assert changed.tokenizer_hash == original.tokenizer_hash
 
 
 def test_lock_runtime_config_writes_content_addressed_identity(tmp_path: Path) -> None:
