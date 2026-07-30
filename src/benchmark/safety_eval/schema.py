@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Any, Mapping, Self
+from typing import Annotated, Any, Literal, Mapping, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -30,6 +30,10 @@ class FailureKind(StrEnum):
     judge = "judge"
     source_data = "source_data"
     compatibility = "compatibility"
+    annotation = "annotation"
+    token_mapping = "token_mapping"
+    objective = "objective"
+    transport = "transport"
 
 
 def stable_id(prefix: str, payload: object) -> str:
@@ -96,6 +100,62 @@ class BenchmarkExample(StrictRecord):
     selection_seed: int
     prompt_sha256: Sha256
     preprocessing: tuple[str, ...]
+
+
+class EditableSpanRole(StrEnum):
+    seed_intent = "seed_intent"
+    harmful_payload = "harmful_payload"
+    attack_instruction = "attack_instruction"
+
+
+class EditableSpan(StrictRecord):
+    start: int = Field(ge=0)
+    end: int
+    quote: str = Field(min_length=1)
+    role: EditableSpanRole
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "EditableSpan":
+        if self.end <= self.start:
+            raise ValueError("editable span end must be greater than start")
+        return self
+
+
+class TransportType(StrEnum):
+    text = "text"
+    embedding = "embedding"
+
+
+class V2BenchmarkExample(BenchmarkExample):
+    schema_version: Literal["reviewer_eval.v2"]
+    intent_sha256: Sha256
+    editable_spans: tuple[EditableSpan, ...] = Field(min_length=1)
+    annotator_model: str
+    annotator_revision: str
+    annotation_template_sha256: Sha256
+    annotation_response_sha256: Sha256
+    annotation_confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_editable_spans(self) -> "V2BenchmarkExample":
+        previous_end = 0
+        for index, span in enumerate(self.editable_spans):
+            if span.end > len(self.attack_text):
+                raise ValueError("editable span end must be within attack_text")
+            if self.attack_text[span.start : span.end] != span.quote:
+                raise ValueError("editable span quote must exactly match attack_text")
+            if index and span.start < previous_end:
+                raise ValueError("editable spans must be ordered and non-overlapping")
+            previous_end = span.end
+
+        minimum_confidence = min(span.confidence for span in self.editable_spans)
+        if self.annotation_confidence != minimum_confidence:
+            raise ValueError(
+                "annotation_confidence must equal the minimum span confidence"
+            )
+        return self
 
 
 class ManifestHeader(StrictRecord):

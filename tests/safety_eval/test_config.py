@@ -9,12 +9,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pytest
+from omegaconf import OmegaConf
 
-from benchmark.safety_eval.config import ExperimentConfig, load_config
+from benchmark.safety_eval.config import (
+    ExperimentConfig,
+    V2ExperimentConfig,
+    load_config,
+    load_v2_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs/benchmark/safety_eval_additions.yaml"
+V2_CONFIG = ROOT / "configs/benchmark/safety_eval_paper_v2.yaml"
 PYPROJECT = ROOT / "pyproject.toml"
 
 Mutation = Callable[[Any], Any]
@@ -44,6 +51,150 @@ DICT_MUTATIONS: list[tuple[str, Mutation]] = [
     ("setdefault", lambda value: value.setdefault("other", 1)),
     ("update", lambda value: value.update({"o_plus": 51})),
 ]
+
+
+def _v2_payload() -> dict[str, Any]:
+    payload = OmegaConf.to_container(OmegaConf.load(V2_CONFIG), resolve=True)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _write_v2_config(tmp_path: Path, payload: dict[str, Any]) -> Path:
+    path = tmp_path / "v2.yaml"
+    OmegaConf.save(config=OmegaConf.create(payload), f=path)
+    return path
+
+
+def test_checked_in_v2_config_loads_strict_paper_contract() -> None:
+    config = load_v2_config(V2_CONFIG)
+
+    assert isinstance(config, V2ExperimentConfig)
+    assert config.run.schema_version == "reviewer_eval.v2"
+    assert config.run.output_root == Path("outputs/results/reviewer_eval_v2")
+    assert config.annotation.model == "de-aligned-annotator"
+    assert config.annotation.revision == "immutable-revision"
+    assert config.annotation.temperature == 0.0
+    assert config.annotation.repair_attempts == 1
+    assert config.optimization.prefix_tokens == 20
+    assert config.optimization.prefix_initialization.strategy == "repeat_token"
+    assert config.optimization.prefix_initialization.token_text == "!"
+    assert config.optimization.final_states_per_branch == 1
+    assert config.optimization.anchor_set_version == "jailbound-paper-v1"
+    assert "editable_seed_tokens" not in type(config.optimization).model_fields
+
+    with pytest.raises(TypeError, match="frozen"):
+        config.optimization.checkpoints.append(101)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("optimization", "prefix_initialization", "strategy"), None, "strategy"),
+        (("annotation", "temperature"), 0.1, "temperature"),
+        (("annotation", "temperature"), False, "temperature"),
+        (("annotation", "repair_attempts"), 2, "repair_attempts"),
+        (("annotation", "repair_attempts"), True, "repair_attempts"),
+        (("optimization", "final_states_per_branch"), 0, "final_states_per_branch"),
+        (("optimization", "anchor_set_version"), "", "anchor_set_version"),
+        (("run", "schema_version"), "reviewer_eval.v1", "reviewer_eval.v2"),
+    ],
+    ids=[
+        "missing-prefix-strategy",
+        "nonzero-annotation-temperature",
+        "boolean-annotation-temperature",
+        "wrong-repair-attempts",
+        "boolean-repair-attempts",
+        "no-final-states",
+        "empty-anchor-set-version",
+        "v1-schema-version",
+    ],
+)
+def test_v2_loader_rejects_invalid_contract_fields(
+    tmp_path: Path,
+    path: tuple[str, ...],
+    value: object,
+    message: str,
+) -> None:
+    payload = _v2_payload()
+    target: dict[str, Any] = payload
+    for key in path[:-1]:
+        target = target[key]
+    if value is None:
+        del target[path[-1]]
+    else:
+        target[path[-1]] = value
+
+    with pytest.raises(ValueError, match=message):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("model", ""), ("revision", "")],
+    ids=["empty-model", "empty-revision"],
+)
+def test_v2_loader_rejects_empty_annotation_identity(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    payload = _v2_payload()
+    payload["annotation"][field] = value
+
+    with pytest.raises(ValueError, match=field):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_rejects_invalid_repeat_token_initialization(tmp_path: Path) -> None:
+    payload = _v2_payload()
+    payload["optimization"]["prefix_initialization"]["token_text"] = ""
+
+    with pytest.raises(ValueError, match="token_text"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_rejects_output_root_with_structured_v1_artifact(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "candidate"
+    output_root.mkdir()
+    (output_root / "locked_config.json").write_text(
+        json.dumps({"run": {"schema_version": "reviewer_eval.v1"}}),
+        encoding="utf-8",
+    )
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_cannot_hide_standard_v1_lock_with_renamed_config_lock(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "candidate"
+    output_root.mkdir()
+    (output_root / "locked_config.json").write_text(
+        json.dumps({"run": {"schema_version": "reviewer_eval.v1"}}),
+        encoding="utf-8",
+    )
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+    payload["run"]["locked_config_name"] = "v2_locked_config.json"
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_does_not_guess_artifact_version_from_directory_name(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "reviewer_eval_v1_but_empty"
+    output_root.mkdir()
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+
+    config = load_v2_config(_write_v2_config(tmp_path, payload))
+
+    assert config.run.output_root == output_root
 
 
 def test_checked_in_config_has_approved_scope() -> None:

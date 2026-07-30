@@ -17,8 +17,13 @@ from benchmark.safety_eval.schema import (
     BenchmarkExample,
     CellKey,
     ComputeCounters,
+    EditableSpan,
+    EditableSpanRole,
+    FailureKind,
     OptimizationRecord,
     RecordStatus,
+    TransportType,
+    V2BenchmarkExample,
 )
 
 
@@ -43,6 +48,173 @@ def example() -> BenchmarkExample:
         prompt_sha256="b" * 64,
         preprocessing=("normalized_newlines",),
     )
+
+
+def v2_example_payload() -> dict[str, object]:
+    return {
+        **example().model_dump(mode="json"),
+        "schema_version": "reviewer_eval.v2",
+        "intent_sha256": "c" * 64,
+        "editable_spans": [
+            {
+                "start": 0,
+                "end": 7,
+                "quote": "Example",
+                "role": "seed_intent",
+                "confidence": 0.9,
+                "rationale": "The seed intent is stated directly.",
+            },
+            {
+                "start": 8,
+                "end": 15,
+                "quote": "request",
+                "role": "harmful_payload",
+                "confidence": 0.75,
+                "rationale": "This is the payload-bearing phrase.",
+            },
+        ],
+        "annotator_model": "de-aligned-annotator",
+        "annotator_revision": "immutable-revision",
+        "annotation_template_sha256": "d" * 64,
+        "annotation_response_sha256": "e" * 64,
+        "annotation_confidence": 0.75,
+    }
+
+
+def test_v2_benchmark_example_round_trips_complete_record() -> None:
+    record = V2BenchmarkExample.model_validate(v2_example_payload())
+
+    assert record.schema_version == "reviewer_eval.v2"
+    assert record.editable_spans == (
+        EditableSpan(
+            start=0,
+            end=7,
+            quote="Example",
+            role=EditableSpanRole.seed_intent,
+            confidence=0.9,
+            rationale="The seed intent is stated directly.",
+        ),
+        EditableSpan(
+            start=8,
+            end=15,
+            quote="request",
+            role=EditableSpanRole.harmful_payload,
+            confidence=0.75,
+            rationale="This is the payload-bearing phrase.",
+        ),
+    )
+    serialized = record.model_dump_json()
+    assert V2BenchmarkExample.model_validate_json(serialized) == record
+    assert TransportType.text.value == "text"
+    assert TransportType.embedding.value == "embedding"
+    assert {
+        FailureKind.annotation.value,
+        FailureKind.token_mapping.value,
+        FailureKind.objective.value,
+        FailureKind.transport.value,
+    } == {"annotation", "token_mapping", "objective", "transport"}
+
+
+@pytest.mark.parametrize(
+    "span_update",
+    [
+        {"start": -1},
+        {"end": 0},
+        {"start": 7, "end": 7},
+        {"quote": ""},
+        {"confidence": -0.01},
+        {"confidence": 1.01},
+    ],
+    ids=[
+        "negative-start",
+        "end-before-start",
+        "empty-range",
+        "empty-quote",
+        "confidence-below-zero",
+        "confidence-above-one",
+    ],
+)
+def test_editable_span_rejects_malformed_fields(span_update: dict[str, object]) -> None:
+    payload = {
+        "start": 0,
+        "end": 7,
+        "quote": "Example",
+        "role": "seed_intent",
+        "confidence": 0.9,
+        "rationale": "The seed intent is stated directly.",
+        **span_update,
+    }
+
+    with pytest.raises(ValueError):
+        EditableSpan.model_validate(payload)
+
+
+def test_v2_benchmark_example_rejects_empty_spans() -> None:
+    payload = v2_example_payload()
+    payload["editable_spans"] = []
+
+    with pytest.raises(ValueError):
+        V2BenchmarkExample.model_validate(payload)
+
+
+def test_v2_benchmark_example_rejects_exact_quote_mismatch() -> None:
+    payload = v2_example_payload()
+    spans = list(payload["editable_spans"])
+    spans[0] = {**spans[0], "quote": "example"}
+    payload["editable_spans"] = spans
+
+    with pytest.raises(ValueError, match="quote"):
+        V2BenchmarkExample.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "second_span",
+    [
+        {
+            "start": 0,
+            "end": 7,
+            "quote": "Example",
+            "role": "attack_instruction",
+            "confidence": 0.75,
+            "rationale": "Duplicates an earlier span.",
+        },
+        {
+            "start": 6,
+            "end": 15,
+            "quote": "e request",
+            "role": "attack_instruction",
+            "confidence": 0.75,
+            "rationale": "Overlaps an earlier span.",
+        },
+    ],
+    ids=["unordered", "overlapping"],
+)
+def test_v2_benchmark_example_rejects_unordered_or_overlapping_spans(
+    second_span: dict[str, object],
+) -> None:
+    payload = v2_example_payload()
+    payload["editable_spans"] = [payload["editable_spans"][0], second_span]
+
+    with pytest.raises(ValueError, match="ordered and non-overlapping"):
+        V2BenchmarkExample.model_validate(payload)
+
+
+def test_v2_benchmark_example_rejects_span_end_past_attack_text() -> None:
+    payload = v2_example_payload()
+    spans = list(payload["editable_spans"])
+    spans[-1] = {**spans[-1], "end": len(str(payload["attack_text"])) + 1}
+    payload["editable_spans"] = spans
+
+    with pytest.raises(ValueError, match="within attack_text"):
+        V2BenchmarkExample.model_validate(payload)
+
+
+def test_v2_benchmark_example_rejects_record_confidence_above_span_minimum() -> None:
+    payload = v2_example_payload()
+    payload["annotation_confidence"] = 0.9
+
+    with pytest.raises(ValueError, match="minimum span confidence"):
+        V2BenchmarkExample.model_validate(payload)
 
 
 def test_records_forbid_unknown_fields() -> None:

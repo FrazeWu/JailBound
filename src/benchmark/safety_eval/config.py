@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Literal, Mapping, NoReturn, Self
 
 from omegaconf import OmegaConf
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 _MODEL_COPY_UPDATE_UNSET = object()
@@ -117,6 +118,14 @@ class RunConfig(StrictModel):
     attention_implementation: Literal["eager"]
 
 
+class V2RunConfig(StrictModel):
+    schema_version: Literal["reviewer_eval.v2"]
+    seed: Literal[20260725]
+    output_root: Path
+    locked_config_name: str
+    attention_implementation: Literal["eager"]
+
+
 class DataConfig(StrictModel):
     sources: list[str]
     samples_per_source: int
@@ -142,6 +151,37 @@ class ModelsConfig(StrictModel):
     octopus: ModelSpec
 
 
+class AnnotationConfig(StrictModel):
+    model: str
+    revision: str
+    endpoint: str
+    template_path: Path
+    confidence_artifact: Path
+    temperature: float = Field(strict=True)
+    repair_attempts: int = Field(strict=True)
+
+    @field_validator("model", "revision")
+    @classmethod
+    def validate_non_empty_identity(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("annotation model and revision must be non-empty")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: float) -> float:
+        if value != 0.0:
+            raise ValueError("annotation temperature must be exactly 0.0")
+        return value
+
+    @field_validator("repair_attempts")
+    @classmethod
+    def validate_repair_attempts(cls, value: int) -> int:
+        if value != 1:
+            raise ValueError("annotation repair_attempts must be exactly 1")
+        return value
+
+
 class OptimizationConfig(StrictModel):
     methods: list[str]
     update_budget: int
@@ -160,6 +200,40 @@ class OptimizationConfig(StrictModel):
     grad_clip: float
     answer_anchors: list[str]
     refusal_anchors: list[str]
+
+
+class PrefixInitializationConfig(StrictModel):
+    strategy: Literal["repeat_token"]
+    token_text: str = Field(min_length=1)
+
+
+class V2OptimizationConfig(StrictModel):
+    methods: list[str]
+    update_budget: int
+    dual_branch_updates: dict[str, int]
+    checkpoints: list[int]
+    prefix_tokens: int
+    prefix_initialization: PrefixInitializationConfig
+    final_states_per_branch: int = Field(ge=1)
+    anchor_set_version: str = Field(min_length=1)
+    candidate_cap: int
+    learning_rate: float
+    gbda_learning_rate: float
+    gcg_search_width: int
+    lambda_fol: float
+    epsilon: float
+    gamma_z: float
+    gamma_u: float
+    grad_clip: float
+    answer_anchors: list[str]
+    refusal_anchors: list[str]
+
+    @field_validator("anchor_set_version")
+    @classmethod
+    def validate_anchor_set_version(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("anchor_set_version must be non-empty")
+        return value
 
 
 class SemanticConfig(StrictModel):
@@ -292,8 +366,54 @@ class ExperimentConfig(StrictModel):
         return self
 
 
+class V2ExperimentConfig(ExperimentConfig):
+    run: V2RunConfig
+    optimization: V2OptimizationConfig
+    annotation: AnnotationConfig
+
+
 def load_config(path: str | Path) -> ExperimentConfig:
     payload: dict[str, Any] = OmegaConf.to_container(
         OmegaConf.load(path), resolve=True
     )
     return ExperimentConfig.model_validate(payload)
+
+
+def _contains_v1_schema_version(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("schema_version") == "reviewer_eval.v1":
+            return True
+        return any(_contains_v1_schema_version(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_v1_schema_version(item) for item in value)
+    return False
+
+
+def _reject_structured_v1_artifacts(config: V2ExperimentConfig) -> None:
+    artifact_names = {
+        "locked_config.json",
+        config.run.locked_config_name,
+        "run_manifest.json",
+        "optimization_config.json",
+    }
+    for artifact_name in sorted(artifact_names):
+        artifact = config.run.output_root / artifact_name
+        if not artifact.is_file():
+            continue
+        try:
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if _contains_v1_schema_version(payload):
+            raise ValueError(
+                f"v2 output root contains a structured reviewer_eval.v1 artifact: {artifact}"
+            )
+
+
+def load_v2_config(path: str | Path) -> V2ExperimentConfig:
+    payload: dict[str, Any] = OmegaConf.to_container(
+        OmegaConf.load(path), resolve=True
+    )
+    config = V2ExperimentConfig.model_validate(payload)
+    _reject_structured_v1_artifacts(config)
+    return config
