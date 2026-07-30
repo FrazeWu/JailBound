@@ -200,6 +200,15 @@ def _locked_immutable_write(
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _require_v2_records(records: Sequence[object]) -> None:
+    if any(
+        not isinstance(row, V2BenchmarkExample)
+        or row.schema_version != "reviewer_eval.v2"
+        for row in records
+    ):
+        raise ValueError("v2 manifests require V2BenchmarkExample records")
+
+
 def write_v2_controlled_manifest(
     output_root: str | Path,
     source: str,
@@ -211,6 +220,7 @@ def write_v2_controlled_manifest(
     """Freeze one schema-v2 manifest without overwriting concurrent output."""
     if not source or Path(source).name != source:
         raise ValueError("manifest source must be a non-empty path-safe name")
+    _require_v2_records(records)
     manifests = Path(output_root) / "manifests" / "v2"
     path = manifests / f"controlled_{source}.jsonl"
     header_path = manifests / f"controlled_{source}.header.json"
@@ -285,6 +295,9 @@ def build_v2_controlled_manifests(
     samples_per_source: int,
 ) -> dict[str, ManifestHeader]:
     """Select only successfully annotated, deduplicated v2 candidates."""
+    for records in records_by_source.values():
+        _require_v2_records(records)
+
     headers: dict[str, ManifestHeader] = {}
     for source, records in records_by_source.items():
         dimensions = (

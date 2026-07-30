@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -120,21 +121,87 @@ def test_builder_validates_frozen_annotation_provenance_before_transport(
         builder.build_manifests(config, candidate_pool=25, sources=("s_eval",))
 
 
+@pytest.mark.parametrize(
+    "changed_input", ("confidence_artifact", "harmbench_targets")
+)
+def test_runtime_lock_rejects_changed_build_input_bytes(
+    tmp_path, changed_input: str
+) -> None:
+    builder = _load_builder()
+    config_path = _config(tmp_path)
+    config = builder.load_v2_config(config_path)
+    confidence = tmp_path / "confidence.json"
+    targets = tmp_path / "harmbench_targets.json"
+    confidence.write_bytes(b'{"threshold":0.9}\n')
+    targets.write_bytes(b'{"target":"fixture"}\n')
+    input_paths = {
+        "confidence_artifact": confidence,
+        "harmbench_targets": targets,
+    }
+
+    def input_hashes() -> dict[str, str]:
+        return {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in input_paths.items()
+        }
+
+    output_root = tmp_path / "runtime"
+    locked = builder._lock_v2_runtime_config(
+        config,
+        output_root=output_root,
+        source_hashes={"s_eval": "a" * 64},
+        build_input_hashes=input_hashes(),
+    )
+    run_manifest = json.loads(
+        (output_root / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert run_manifest["build_input_hashes"] == input_hashes()
+    assert locked.run_id == run_manifest["run_id"]
+
+    input_paths[changed_input].write_bytes(
+        input_paths[changed_input].read_bytes() + b" "
+    )
+    with pytest.raises(ValueError, match="runtime lock differs"):
+        builder._lock_v2_runtime_config(
+            config,
+            output_root=output_root,
+            source_hashes={"s_eval": "a" * 64},
+            build_input_hashes=input_hashes(),
+        )
+
+
 def test_insufficient_builder_run_freezes_failures_before_raising(tmp_path) -> None:
     builder = _load_builder()
-    failure = AnnotationFailure(
-        schema_version="reviewer_eval.v2",
-        example_id="s_eval:000001:fixture",
-        source="s_eval",
-        source_file="s_eval.jsonl",
-        source_row=1,
-        source_sha256="a" * 64,
-        prompt_sha256="b" * 64,
-        intent_sha256="c" * 64,
-        failure_kind=FailureKind.annotation,
-        failure_reason="SpanAnnotationError: fixture",
+    failures = (
+        AnnotationFailure(
+            schema_version="reviewer_eval.v2",
+            example_id="s_eval:000001:fixture",
+            source="s_eval",
+            source_file="s_eval.jsonl",
+            source_row=1,
+            source_sha256="a" * 64,
+            prompt_sha256="b" * 64,
+            intent_sha256="c" * 64,
+            failure_kind=FailureKind.annotation,
+            failure_reason="SpanAnnotationError: fixture",
+        ),
+        AnnotationFailure(
+            schema_version="reviewer_eval.v2",
+            example_id="jailbound:000001:fixture",
+            source="jailbound",
+            source_file="jailbound.json",
+            source_row=1,
+            source_sha256="d" * 64,
+            prompt_sha256="e" * 64,
+            intent_sha256="f" * 64,
+            failure_kind=FailureKind.transport,
+            failure_reason="RuntimeError: fixture",
+        ),
     )
-    candidates = {"s_eval": (SimpleNamespace(prompt_sha256="d" * 64),)}
+    candidates = {
+        "s_eval": (SimpleNamespace(prompt_sha256="d" * 64),),
+        "jailbound": (SimpleNamespace(prompt_sha256="e" * 64),),
+    }
 
     with pytest.raises(
         ValueError,
@@ -143,13 +210,30 @@ def test_insufficient_builder_run_freezes_failures_before_raising(tmp_path) -> N
         builder.audit_and_require_sufficient_candidates(
             output_root=tmp_path,
             candidates=candidates,
-            failures=(failure,),
-            sources=("s_eval",),
+            failures=failures,
+            sources=("s_eval", "jailbound"),
             required=2,
+            report={"build_input_hashes": {"confidence_artifact": "9" * 64}},
         )
 
     ledger = tmp_path / "manifests/v2/annotation_failures.jsonl"
-    assert json.loads(ledger.read_text(encoding="utf-8"))["failure_kind"] == "annotation"
+    assert {
+        json.loads(line)["failure_kind"]
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+    } == {"annotation", "transport"}
+    report = json.loads(
+        (tmp_path / "manifests/v2/source_ingestion_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["status"] == "insufficient_candidates"
+    assert report["build_input_hashes"] == {"confidence_artifact": "9" * 64}
+    assert report["required_counts_by_source"] == {"jailbound": 2, "s_eval": 2}
+    assert report["eligible_counts_by_source"] == {"jailbound": 1, "s_eval": 1}
+    assert report["failure_counts_by_source_and_kind"] == {
+        "jailbound": {"transport": 1},
+        "s_eval": {"annotation": 1},
+    }
     assert not list((tmp_path / "manifests/v2").glob("controlled_*.jsonl"))
 
 

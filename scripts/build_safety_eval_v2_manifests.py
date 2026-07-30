@@ -16,7 +16,7 @@ from typing import Any
 
 from benchmark.safety_eval.config import AnnotationConfig, load_v2_config
 from benchmark.safety_eval.datasets import RawExample, load_source_with_report
-from benchmark.safety_eval.io import canonical_hash, sha256_file
+from benchmark.safety_eval.io import atomic_write_json, canonical_hash, sha256_file
 from benchmark.safety_eval.manifest import (
     AnnotationFailure,
     annotate_raw_candidates,
@@ -178,6 +178,7 @@ def _lock_v2_runtime_config(
     *,
     output_root: Path,
     source_hashes: dict[str, str],
+    build_input_hashes: dict[str, str],
 ) -> LockedRuntime:
     """Create the runtime lock once and validate exact reruns without clobbering."""
     output_root.mkdir(parents=True, exist_ok=True)
@@ -188,10 +189,15 @@ def _lock_v2_runtime_config(
             config_payload = config.model_dump(mode="json")
             config_hash = canonical_hash(config_payload)
             ordered_hashes = dict(sorted(source_hashes.items()))
+            ordered_build_input_hashes = dict(sorted(build_input_hashes.items()))
             run_id = (
                 "run:"
                 + canonical_hash(
-                    {"config_hash": config_hash, "sources": ordered_hashes}
+                    {
+                        "config_hash": config_hash,
+                        "sources": ordered_hashes,
+                        "build_inputs": ordered_build_input_hashes,
+                    }
                 )[:20]
             )
             config_lock = output_root / config.run.locked_config_name
@@ -212,6 +218,7 @@ def _lock_v2_runtime_config(
                     "run_id": run_id,
                     "config_hash": config_hash,
                     "source_hashes": ordered_hashes,
+                    "build_input_hashes": ordered_build_input_hashes,
                 }
                 if existing_config != config_payload or not isinstance(
                     existing_manifest, dict
@@ -223,11 +230,16 @@ def _lock_v2_runtime_config(
                         "immutable v2 runtime lock differs from requested build"
                     )
                 return LockedRuntime(config, config_hash, run_id)
-            return lock_runtime_config(
+            locked = lock_runtime_config(
                 config,
                 output_root=output_root,
                 source_hashes=source_hashes,
             )
+            manifest_payload = json.loads(run_manifest.read_text(encoding="utf-8"))
+            manifest_payload["run_id"] = run_id
+            manifest_payload["build_input_hashes"] = ordered_build_input_hashes
+            atomic_write_json(run_manifest, manifest_payload)
+            return LockedRuntime(locked.config, locked.config_hash, run_id)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -239,19 +251,47 @@ def audit_and_require_sufficient_candidates(
     failures: Sequence[AnnotationFailure],
     sources: Sequence[str],
     required: int,
+    report: dict[str, object] | None = None,
 ) -> None:
     """Persist all annotation failures before enforcing controlled-sample quotas."""
     write_v2_annotation_failures(output_root, failures)
+    eligible_counts = {
+        source: _unique_prompt_count(candidates[source]) for source in sources
+    }
     failures_by_source = Counter(failure.source for failure in failures)
-    insufficient = {
-        source: (
-            _unique_prompt_count(candidates[source]),
-            failures_by_source[source],
+    failure_counts_by_source_and_kind = {
+        source: dict(
+            sorted(
+                Counter(
+                    failure.failure_kind.value
+                    for failure in failures
+                    if failure.source == source
+                ).items()
+            )
         )
         for source in sources
-        if _unique_prompt_count(candidates[source]) < required
+    }
+    insufficient = {
+        source: (eligible_counts[source], failures_by_source[source])
+        for source in sources
+        if eligible_counts[source] < required
     }
     if insufficient:
+        failure_report = dict(report or {})
+        failure_report.update(
+            {
+                "schema_version": "reviewer_eval.v2",
+                "status": "insufficient_candidates",
+                "required_counts_by_source": {
+                    source: required for source in sorted(sources)
+                },
+                "eligible_counts_by_source": dict(sorted(eligible_counts.items())),
+                "failure_counts_by_source_and_kind": dict(
+                    sorted(failure_counts_by_source_and_kind.items())
+                ),
+            }
+        )
+        write_v2_build_report(output_root, failure_report)
         detail = "; ".join(
             f"{source}: eligible={eligible}, failures={failure_count}, required={required}"
             for source, (eligible, failure_count) in insufficient.items()
@@ -295,10 +335,25 @@ def build_manifests(
     source_hashes = {
         source: sha256_file(path) for source, path in source_paths.items()
     }
+    taxonomy_mapping_path = root / "configs/benchmark/safety_eval_taxonomy_map.yaml"
+    build_input_paths = {
+        "config": config_path,
+        "confidence_artifact": annotation_config.confidence_artifact,
+        "annotation_template": annotation_config.template_path,
+        "taxonomy_mapping": taxonomy_mapping_path,
+    }
+    if "harmbench" in selected_sources:
+        build_input_paths["harmbench_targets"] = _rooted(
+            root, config.data.harmbench_targets_path
+        )
+    build_input_hashes = {
+        name: sha256_file(path) for name, path in build_input_paths.items()
+    }
     locked = _lock_v2_runtime_config(
         config,
         output_root=output_root,
         source_hashes=source_hashes,
+        build_input_hashes=build_input_hashes,
     )
     transport = resolve_annotation_transport(annotation_config, seed=config.run.seed)
     annotator = SpanAnnotator(
@@ -307,9 +362,7 @@ def build_manifests(
         confidence_threshold=threshold,
     )
 
-    mapping = load_taxonomy_mapping(
-        root / "configs/benchmark/safety_eval_taxonomy_map.yaml"
-    )
+    mapping = load_taxonomy_mapping(taxonomy_mapping_path)
     labels = list(mapping["risk_categories"]) + list(mapping["threat_domains"])
     descriptions = [
         mapping["risk_categories"].get(
@@ -367,12 +420,22 @@ def build_manifests(
         candidates[source] = annotated
         all_failures.extend(failures)
 
+    report_identity = {
+        "schema_version": "reviewer_eval.v2",
+        "run_id": locked.run_id,
+        "config_hash": locked.config_hash,
+        "source_hashes": dict(sorted(source_hashes.items())),
+        "build_input_hashes": dict(sorted(build_input_hashes.items())),
+        "encoder_revision": encoder.resolved_revision,
+        "sources": reports,
+    }
     audit_and_require_sufficient_candidates(
         output_root=output_root,
         candidates=candidates,
         failures=all_failures,
         sources=selected_sources,
         required=config.data.samples_per_source,
+        report=report_identity,
     )
 
     headers = build_v2_controlled_manifests(
@@ -384,10 +447,16 @@ def build_manifests(
         samples_per_source=config.data.samples_per_source,
     )
     build_report = {
-        "schema_version": "reviewer_eval.v2",
-        "config_hash": locked.config_hash,
-        "encoder_revision": encoder.resolved_revision,
-        "sources": reports,
+        **report_identity,
+        "status": "complete",
+        "required_counts_by_source": {
+            source: config.data.samples_per_source
+            for source in sorted(selected_sources)
+        },
+        "eligible_counts_by_source": {
+            source: reports[source]["unique_eligible_count"]
+            for source in sorted(selected_sources)
+        },
         "failure_counts_by_source_and_kind": {
             source: reports[source]["failure_counts"] for source in selected_sources
         },

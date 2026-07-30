@@ -240,6 +240,36 @@ def test_v2_manifest_uses_isolated_schema_and_requires_byte_identical_rerun(
         )
 
 
+def test_v2_manifest_writer_rejects_legacy_records(tmp_path) -> None:
+    with pytest.raises(ValueError, match="V2BenchmarkExample"):
+        write_v2_controlled_manifest(
+            tmp_path,
+            "synthetic",
+            [_example(0)],  # type: ignore[list-item]
+            source_file_sha256="a" * 64,
+            config_hash="c" * 64,
+        )
+
+    assert not (tmp_path / "manifests/v2/controlled_synthetic.jsonl").exists()
+
+
+def test_v2_manifest_builder_rejects_legacy_records_before_selection(tmp_path) -> None:
+    with pytest.raises(ValueError, match="V2BenchmarkExample"):
+        build_v2_controlled_manifests(
+            {
+                "valid": _v2_rows(1, source="valid"),
+                "synthetic": [_example(0)],  # type: ignore[dict-item]
+            },
+            output_root=tmp_path,
+            source_hashes={"valid": "b" * 64, "synthetic": "a" * 64},
+            config_hash="c" * 64,
+            seed=20260725,
+            samples_per_source=1,
+        )
+
+    assert not list((tmp_path / "manifests/v2").glob("controlled_*.jsonl"))
+
+
 def test_concurrent_v2_manifest_writers_cannot_overwrite_each_other(tmp_path) -> None:
     first = _v2_rows(3)
     second = tuple(
