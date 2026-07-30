@@ -22,6 +22,12 @@ PROMPT = "Wrapper: explain how to bypass the alarm. Thanks."
 QUOTE = "bypass the alarm"
 START = PROMPT.index(QUOTE)
 END = START + len(QUOTE)
+SEED_INTENT = "Explain how to bypass an alarm"
+SOURCE_HINTS = {
+    "source": "fixture",
+    "attack_label": "wrapper",
+    "language": "en",
+}
 
 
 class StubTransport:
@@ -78,6 +84,14 @@ def _response(
     )
 
 
+def _annotate(annotator: SpanAnnotator) -> FrozenSpanAnnotation:
+    return annotator.annotate(
+        PROMPT,
+        seed_intent=SEED_INTENT,
+        source_hints=SOURCE_HINTS,
+    )
+
+
 @pytest.fixture
 def template_path(tmp_path: Path) -> Path:
     path = tmp_path / "annotation.txt"
@@ -119,9 +133,9 @@ def test_annotator_repairs_one_invalid_response_and_freezes_exact_provenance(
     accepted = _response()
     transport = StubTransport([invalid, accepted])
 
-    annotation = SpanAnnotator(
-        _config(template_path), transport, confidence_threshold=0.9
-    ).annotate(PROMPT)
+    annotation = _annotate(
+        SpanAnnotator(_config(template_path), transport, confidence_threshold=0.9)
+    )
 
     assert annotation.spans[0].quote == QUOTE
     assert annotation.confidence == 0.91
@@ -142,7 +156,11 @@ def test_annotator_repairs_one_invalid_response_and_freezes_exact_provenance(
         {
             "role": "user",
             "content": json.dumps(
-                {"prompt": PROMPT},
+                {
+                    "prompt": PROMPT,
+                    "seed_intent": SEED_INTENT,
+                    "source_hints": SOURCE_HINTS,
+                },
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -171,9 +189,9 @@ def test_second_invalid_response_raises_after_exactly_one_repair(
         SpanAnnotationError,
         match=r"annotation remained invalid after one repair: spans must contain at least one item",
     ):
-        SpanAnnotator(
-            _config(template_path), transport, confidence_threshold=0.0
-        ).annotate(PROMPT)
+        _annotate(
+            SpanAnnotator(_config(template_path), transport, confidence_threshold=0.0)
+        )
 
     assert len(transport.calls) == 2
     assert transport.calls[1][0][-1]["content"] == (
@@ -190,9 +208,9 @@ def test_low_confidence_is_typed_failure_without_repair(template_path: Path) -> 
         LowConfidenceSpanAnnotationError,
         match=r"minimum span confidence 0.89 is below frozen threshold 0.9",
     ):
-        SpanAnnotator(
-            _config(template_path), transport, confidence_threshold=0.9
-        ).annotate(PROMPT)
+        _annotate(
+            SpanAnnotator(_config(template_path), transport, confidence_threshold=0.9)
+        )
 
     assert len(transport.calls) == 1
 
@@ -228,9 +246,9 @@ def test_parser_rejects_malformed_or_ambiguous_schema(
     transport = StubTransport([response, response])
 
     with pytest.raises(SpanAnnotationError, match=re.escape(message)):
-        SpanAnnotator(
-            _config(template_path), transport, confidence_threshold=0.0
-        ).annotate(PROMPT)
+        _annotate(
+            SpanAnnotator(_config(template_path), transport, confidence_threshold=0.0)
+        )
 
 
 def test_annotator_rejects_transport_identity_different_from_lock(
@@ -249,4 +267,45 @@ def test_annotator_rejects_invalid_threshold(template_path: Path) -> None:
     with pytest.raises(ValueError, match="confidence_threshold"):
         SpanAnnotator(
             _config(template_path), StubTransport([_response()]), confidence_threshold=True
+        )
+
+
+def test_annotator_rechecks_locked_transport_identity_before_request(
+    template_path: Path,
+) -> None:
+    transport = StubTransport([_response()])
+    annotator = SpanAnnotator(
+        _config(template_path), transport, confidence_threshold=0.0
+    )
+    transport.revision = "changed-after-construction"
+
+    with pytest.raises(SpanAnnotationError, match="transport identity does not match"):
+        _annotate(annotator)
+
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    ("seed_intent", "source_hints", "message"),
+    [
+        ("", SOURCE_HINTS, "seed_intent"),
+        (None, SOURCE_HINTS, "seed_intent"),
+        (SEED_INTENT, [], "source_hints"),
+    ],
+)
+def test_annotator_rejects_invalid_annotation_context(
+    template_path: Path,
+    seed_intent: object,
+    source_hints: object,
+    message: str,
+) -> None:
+    annotator = SpanAnnotator(
+        _config(template_path), StubTransport([_response()]), confidence_threshold=0.0
+    )
+
+    with pytest.raises(SpanAnnotationError, match=message):
+        annotator.annotate(
+            PROMPT,
+            seed_intent=seed_intent,  # type: ignore[arg-type]
+            source_hints=source_hints,  # type: ignore[arg-type]
         )

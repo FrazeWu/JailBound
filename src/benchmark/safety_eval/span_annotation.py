@@ -191,6 +191,8 @@ class SpanAnnotator:
 
         self._config = config
         self._transport = transport
+        self._model = config.model
+        self._revision = config.revision
         self._confidence_threshold = float(confidence_threshold)
         template_bytes = Path(config.template_path).read_bytes()
         try:
@@ -199,17 +201,55 @@ class SpanAnnotator:
             raise SpanAnnotationError("annotation template must be UTF-8") from error
         self._template_sha256 = hashlib.sha256(template_bytes).hexdigest()
 
-    def annotate(self, prompt: str) -> FrozenSpanAnnotation:
-        if not isinstance(prompt, str) or not prompt:
-            raise SpanAnnotationError("prompt must be a non-empty string")
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": self._template},
-            {"role": "user", "content": canonical_json({"prompt": prompt})},
-        ]
-        first_response = self._transport.complete(
+    def _validate_transport_identity(self) -> None:
+        if (
+            self._transport.model != self._model
+            or self._transport.revision != self._revision
+        ):
+            raise SpanAnnotationError(
+                "transport identity does not match the locked annotation config"
+            )
+
+    def _complete(self, messages: Sequence[Mapping[str, str]]) -> str:
+        self._validate_transport_identity()
+        response = self._transport.complete(
             messages,
             temperature=self._config.temperature,
         )
+        self._validate_transport_identity()
+        if not isinstance(response, str):
+            raise SpanAnnotationError("annotation response must be text")
+        return response
+
+    def annotate(
+        self,
+        prompt: str,
+        *,
+        seed_intent: str,
+        source_hints: Mapping[str, object],
+    ) -> FrozenSpanAnnotation:
+        if not isinstance(prompt, str) or not prompt:
+            raise SpanAnnotationError("prompt must be a non-empty string")
+        if not isinstance(seed_intent, str) or not seed_intent:
+            raise SpanAnnotationError("seed_intent must be a non-empty string")
+        if not isinstance(source_hints, Mapping):
+            raise SpanAnnotationError("source_hints must be an object")
+        if not all(isinstance(key, str) for key in source_hints):
+            raise SpanAnnotationError("source_hints keys must be strings")
+        context = {
+            "prompt": prompt,
+            "seed_intent": seed_intent,
+            "source_hints": dict(source_hints),
+        }
+        try:
+            context_json = canonical_json(context)
+        except (TypeError, ValueError) as error:
+            raise SpanAnnotationError("annotation context must be canonical JSON") from error
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self._template},
+            {"role": "user", "content": context_json},
+        ]
+        first_response = self._complete(messages)
         try:
             spans = _schema_error(first_response, prompt)
             accepted_response = first_response
@@ -219,10 +259,7 @@ class SpanAnnotator:
                 {"role": "assistant", "content": first_response},
                 {"role": "user", "content": _repair_message(first_error)},
             ]
-            repaired_response = self._transport.complete(
-                repair_messages,
-                temperature=self._config.temperature,
-            )
+            repaired_response = self._complete(repair_messages)
             try:
                 spans = _schema_error(repaired_response, prompt)
             except SpanAnnotationError as second_error:
@@ -244,6 +281,6 @@ class SpanAnnotator:
             response_sha256=hashlib.sha256(
                 accepted_response.encode("utf-8")
             ).hexdigest(),
-            model=self._transport.model,
-            revision=self._transport.revision,
+            model=self._model,
+            revision=self._revision,
         )

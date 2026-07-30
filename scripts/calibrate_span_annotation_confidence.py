@@ -10,11 +10,13 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import tempfile
 from typing import Any, Protocol
 
 from benchmark.safety_eval.config import AnnotationConfig, load_v2_config
 from benchmark.safety_eval.datasets import RawExample, load_source
-from benchmark.safety_eval.io import atomic_write_json, atomic_write_jsonl
+from benchmark.safety_eval.io import atomic_write_jsonl, canonical_json
 from benchmark.safety_eval.span_annotation import (
     AnnotationTransport,
     FrozenSpanAnnotation,
@@ -25,6 +27,56 @@ from benchmark.safety_eval.span_annotation import (
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_VERSION = "span_annotation_confidence.v1"
 FREEZE_COMMAND = "calibrate_span_annotation_confidence.py freeze"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ANNOTATION_RESPONSE_FORMAT: dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "editable_span_annotation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "spans": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start": {"type": "integer", "minimum": 0},
+                            "end": {"type": "integer", "minimum": 1},
+                            "quote": {"type": "string", "minLength": 1},
+                            "role": {
+                                "type": "string",
+                                "enum": [
+                                    "seed_intent",
+                                    "harmful_payload",
+                                    "attack_instruction",
+                                ],
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                            "rationale": {"type": "string"},
+                        },
+                        "required": [
+                            "start",
+                            "end",
+                            "quote",
+                            "role",
+                            "confidence",
+                            "rationale",
+                        ],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["spans"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 class CalibrationError(ValueError):
@@ -50,7 +102,13 @@ class CalibrationResult:
 
 
 class Annotator(Protocol):
-    def annotate(self, prompt: str) -> FrozenSpanAnnotation: ...
+    def annotate(
+        self,
+        prompt: str,
+        *,
+        seed_intent: str,
+        source_hints: Mapping[str, object],
+    ) -> FrozenSpanAnnotation: ...
 
 
 def _validated_review(value: object, index: int) -> ReviewedAnnotation:
@@ -156,7 +214,22 @@ def prepare_review_rows(
                 raise CalibrationError(
                     f"source mapping {source!r} contains row from {raw.source!r}"
                 )
-            annotation = annotator.annotate(raw.attack_text)
+            source_hints: dict[str, object] = {
+                "source": source,
+                "source_row": raw.source_row,
+                "source_row_id": raw.source_row_id,
+                "attack_label": raw.source_attack_label,
+                "domain_label": raw.source_domain_label,
+                "language": raw.language,
+                "risk_label": raw.source_risk_label,
+                "target_text": raw.target_text,
+                "preprocessing": list(raw.preprocessing),
+            }
+            annotation = annotator.annotate(
+                raw.attack_text,
+                seed_intent=raw.intent,
+                source_hints=source_hints,
+            )
             rows.append(
                 {
                     "source": source,
@@ -164,13 +237,7 @@ def prepare_review_rows(
                     "source_row_id": raw.source_row_id,
                     "prompt": raw.attack_text,
                     "seed_intent": raw.intent,
-                    "source_hints": {
-                        "attack_label": raw.source_attack_label,
-                        "domain_label": raw.source_domain_label,
-                        "language": raw.language,
-                        "risk_label": raw.source_risk_label,
-                        "target_text": raw.target_text,
-                    },
+                    "source_hints": source_hints,
                     "preprocessing": list(raw.preprocessing),
                     "spans": [
                         span.model_dump(mode="json") for span in annotation.spans
@@ -227,7 +294,7 @@ def freeze_reviewed_annotations(
 ) -> dict[str, object]:
     exact_bytes, rows = _read_reviewed_rows(reviewed_path)
     reviews: list[ReviewedAnnotation] = []
-    provenance: set[tuple[str, str, str]] = set()
+    provenance: set[tuple[str, str, str, str]] = set()
     sources: set[str] = set()
     for index, row in enumerate(rows):
         if type(row.get("accepted")) is not bool:
@@ -247,10 +314,13 @@ def freeze_reviewed_annotations(
         response_sha256 = _required_string(
             row, "annotation_response_sha256", index
         )
-        if len(template_sha256) != 64 or len(response_sha256) != 64:
+        if (
+            _SHA256.fullmatch(template_sha256) is None
+            or _SHA256.fullmatch(response_sha256) is None
+        ):
             raise CalibrationError(f"review {index} annotation hashes must be SHA-256")
         sources.add(source)
-        provenance.add((model, revision, template_sha256))
+        provenance.add((model, revision, template_sha256, response_sha256))
 
     result = calibrate_confidence(
         reviews,
@@ -260,8 +330,13 @@ def freeze_reviewed_annotations(
     return {
         "accepted_count": result.accepted_count,
         "annotation_provenance": [
-            {"model": model, "revision": revision, "template_sha256": template}
-            for model, revision, template in sorted(provenance)
+            {
+                "model": model,
+                "revision": revision,
+                "response_sha256": response,
+                "template_sha256": template,
+            }
+            for model, revision, template, response in sorted(provenance)
         ],
         "artifact_version": ARTIFACT_VERSION,
         "command": FREEZE_COMMAND,
@@ -278,9 +353,29 @@ def freeze_reviewed_annotations(
 
 
 def write_frozen_artifact(path: Path, artifact: Mapping[str, object]) -> None:
-    if path.exists():
-        raise FileExistsError(f"refusing to overwrite frozen artifact: {path}")
-    atomic_write_json(path, artifact)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (canonical_json(artifact) + "\n").encode("utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"refusing to overwrite frozen artifact: {path}"
+            ) from error
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class OpenAIAnnotationTransport(AnnotationTransport):
@@ -291,11 +386,15 @@ class OpenAIAnnotationTransport(AnnotationTransport):
         revision: str,
         endpoint: str,
         api_key: str,
+        seed: int,
     ) -> None:
         from openai import OpenAI
 
         self.model = model
         self.revision = revision
+        if type(seed) is not int:
+            raise ValueError("annotation seed must be an integer")
+        self._seed = seed
         self._client = OpenAI(api_key=api_key, base_url=endpoint)
 
     def complete(
@@ -305,10 +404,12 @@ class OpenAIAnnotationTransport(AnnotationTransport):
         temperature: float,
     ) -> str:
         response = self._client.chat.completions.create(
-            model=self.model,
+            model=self.revision,
             messages=[dict(message) for message in messages],
             temperature=temperature,
             max_tokens=2048,
+            seed=self._seed,
+            response_format=_ANNOTATION_RESPONSE_FORMAT,
         )
         content = response.choices[0].message.content
         if not isinstance(content, str):
@@ -338,7 +439,7 @@ def _rooted(path: Path) -> Path:
 
 
 def _prepare(args: argparse.Namespace) -> None:
-    config = load_v2_config(args.config)
+    config = load_v2_config(_rooted(args.config))
     annotation_payload = config.annotation.model_dump()
     annotation_payload["template_path"] = _rooted(config.annotation.template_path)
     annotation_config = AnnotationConfig.model_validate(annotation_payload)
@@ -347,6 +448,7 @@ def _prepare(args: argparse.Namespace) -> None:
         revision=annotation_config.revision,
         endpoint=annotation_config.endpoint,
         api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+        seed=config.run.seed,
     )
     # Calibration must retain all valid scores before a threshold is frozen.
     annotator = SpanAnnotator(annotation_config, transport, confidence_threshold=0.0)

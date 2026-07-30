@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import pytest
@@ -28,6 +30,7 @@ sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 CalibrationError = _MODULE.CalibrationError
+OpenAIAnnotationTransport = _MODULE.OpenAIAnnotationTransport
 ReviewedAnnotation = _MODULE.ReviewedAnnotation
 calibrate_confidence = _MODULE.calibrate_confidence
 freeze_reviewed_annotations = _MODULE.freeze_reviewed_annotations
@@ -100,10 +103,16 @@ def test_calibration_rejects_invalid_or_unusable_inputs(
 
 class FixtureAnnotator:
     def __init__(self) -> None:
-        self.prompts: list[str] = []
+        self.calls: list[tuple[str, str, dict[str, object]]] = []
 
-    def annotate(self, prompt: str) -> FrozenSpanAnnotation:
-        self.prompts.append(prompt)
+    def annotate(
+        self,
+        prompt: str,
+        *,
+        seed_intent: str,
+        source_hints: dict[str, object],
+    ) -> FrozenSpanAnnotation:
+        self.calls.append((prompt, seed_intent, source_hints))
         return FrozenSpanAnnotation(
             spans=(
                 EditableSpan(
@@ -161,13 +170,20 @@ def test_prepare_core_samples_fixed_count_per_source_deterministically() -> None
         "source_b",
         "source_b",
     ]
-    assert first_annotator.prompts == second_annotator.prompts
+    assert first_annotator.calls == second_annotator.calls
     assert all(row["accepted"] is None for row in first)
     assert all(row["confidence"] == 0.75 for row in first)
     assert all(row["annotation_model"] == "fixture-model" for row in first)
     assert all(row["seed_intent"].startswith("intent-") for row in first)
     assert all(row["source_hints"]["language"] == "en" for row in first)
     assert all(row["spans"][0]["quote"] == row["prompt"] for row in first)
+    for prompt, seed_intent, source_hints in first_annotator.calls:
+        assert seed_intent.startswith("intent-")
+        assert source_hints["source"] in {"source_a", "source_b"}
+        assert source_hints["source_row_id"].startswith(source_hints["source"] + ":")
+        assert source_hints["attack_label"].startswith("attack-")
+        assert source_hints["preprocessing"] == ["fixture"]
+        assert prompt.startswith("prompt-")
 
 
 def test_prepare_core_rejects_short_source_or_invalid_count() -> None:
@@ -229,8 +245,15 @@ def test_freeze_uses_exact_input_hash_and_deterministic_provenance(
             {
                 "model": "model-a",
                 "revision": "rev-a",
+                "response_sha256": "2" * 64,
                 "template_sha256": "1" * 64,
-            }
+            },
+            {
+                "model": "model-a",
+                "revision": "rev-a",
+                "response_sha256": "3" * 64,
+                "template_sha256": "1" * 64,
+            },
         ],
         "artifact_version": "span_annotation_confidence.v1",
         "command": "calibrate_span_annotation_confidence.py freeze",
@@ -262,20 +285,45 @@ def test_freeze_rejects_incomplete_or_non_boolean_reviews(
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("annotation_template_sha256", "g" * 64),
+        ("annotation_response_sha256", "Z" * 64),
+    ],
+)
+def test_freeze_rejects_non_hex_annotation_hashes(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    reviewed = tmp_path / "reviewed.jsonl"
+    _reviewed_file(reviewed)
+    rows = read_jsonl(reviewed)
+    rows[0][field] = value
+    reviewed.write_text(
+        "".join(canonical_json(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    with pytest.raises(CalibrationError, match="must be SHA-256"):
+        freeze_reviewed_annotations(
+            reviewed, target_precision=1.0, minimum_selected=1
+        )
+
+
 def test_frozen_artifact_write_is_atomic_and_refuses_overwrite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output = tmp_path / "nested" / "artifact.json"
     artifact = {"threshold": 0.9}
     observed: list[Path] = []
-    original_replace = Path.replace
+    original_link = os.link
 
-    def observe_replace(source: Path, target: Path) -> Path:
-        observed.append(source)
-        assert source.parent == output.parent
-        return original_replace(source, target)
+    def observe_link(source: str | Path, target: str | Path) -> None:
+        source_path = Path(source)
+        observed.append(source_path)
+        assert source_path.parent == output.parent
+        original_link(source, target)
 
-    monkeypatch.setattr(Path, "replace", observe_replace)
+    monkeypatch.setattr(os, "link", observe_link)
     write_frozen_artifact(output, artifact)
 
     assert observed
@@ -283,6 +331,79 @@ def test_frozen_artifact_write_is_atomic_and_refuses_overwrite(
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         write_frozen_artifact(output, {"threshold": 0.8})
     assert json.loads(output.read_text(encoding="utf-8")) == artifact
+
+
+def test_frozen_artifact_refuses_overwrite_even_if_precheck_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "artifact.json"
+    output.write_text('{"threshold":0.7}\n', encoding="utf-8")
+    original_exists = Path.exists
+
+    def stale_exists(path: Path) -> bool:
+        if path == output:
+            return False
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", stale_exists)
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        write_frozen_artifact(output, {"threshold": 0.9})
+
+    assert output.read_text(encoding="utf-8") == '{"threshold":0.7}\n'
+
+
+class _FakeCompletions:
+    def __init__(self) -> None:
+        self.kwargs: dict[str, object] | None = None
+
+    def create(self, **kwargs: object) -> object:
+        self.kwargs = kwargs
+        message = SimpleNamespace(content='{"spans":[]}')
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def test_openai_transport_pins_revision_seed_and_json_schema() -> None:
+    completions = _FakeCompletions()
+    transport = OpenAIAnnotationTransport.__new__(OpenAIAnnotationTransport)
+    transport.model = "annotator-family"
+    transport.revision = "annotator-revision-7"
+    transport._seed = 20260725
+    transport._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions)
+    )
+
+    content = transport.complete(
+        ({"role": "user", "content": "payload"},), temperature=0.0
+    )
+
+    assert content == '{"spans":[]}'
+    assert completions.kwargs is not None
+    assert completions.kwargs["model"] == "annotator-revision-7"
+    assert completions.kwargs["seed"] == 20260725
+    response_format = completions.kwargs["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["required"] == ["spans"]
+    assert schema["additionalProperties"] is False
+
+
+def test_prepare_roots_relative_config_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[Path] = []
+
+    def stop_after_load(path: Path) -> object:
+        observed.append(path)
+        raise RuntimeError("stop after path assertion")
+
+    monkeypatch.setattr(_MODULE, "load_v2_config", stop_after_load)
+
+    with pytest.raises(RuntimeError, match="stop after path assertion"):
+        _MODULE._prepare(SimpleNamespace(config=Path("config.yaml")))
+
+    assert observed == [_MODULE.ROOT / "config.yaml"]
 
 
 def test_cli_mode_boundaries_match_documented_commands() -> None:
