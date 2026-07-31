@@ -124,6 +124,7 @@ class V2RunConfig(StrictModel):
     output_root: Path
     locked_config_name: str
     attention_implementation: Literal["eager"]
+    smoke_mode: bool = False
 
 
 class DataConfig(StrictModel):
@@ -404,6 +405,18 @@ class V2ExperimentConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_approved_scope(self) -> "V2ExperimentConfig":
+        if self.run.smoke_mode:
+            if "smoke" not in self.run.output_root.parts:
+                raise ValueError("smoke output root must contain a smoke path component")
+            if (
+                len(self.data.sources) != 1
+                or self.data.samples_per_source != 1
+                or len(self.optimization.methods) != 1
+            ):
+                raise ValueError(
+                    "smoke mode requires exactly one source, sample, and method"
+                )
+            return self
         _validate_approved_scope(
             data=self.data,
             models=self.models,

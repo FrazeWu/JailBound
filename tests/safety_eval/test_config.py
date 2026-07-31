@@ -89,6 +89,22 @@ def test_checked_in_v2_config_loads_strict_paper_contract() -> None:
         config.optimization.checkpoints.append(101)
 
 
+def test_v2_smoke_mode_requires_an_isolated_one_sample_output(tmp_path: Path) -> None:
+    payload = _v2_payload()
+    payload["run"]["smoke_mode"] = True
+    payload["run"]["output_root"] = "outputs/results/smoke/one-sample"
+    payload["data"]["sources"] = ["advbench"]
+    payload["data"]["samples_per_source"] = 1
+    payload["optimization"]["methods"] = ["random_mutation"]
+
+    config = load_v2_config(_write_v2_config(tmp_path, payload))
+    assert config.run.smoke_mode is True
+
+    payload["run"]["output_root"] = "outputs/results/reviewer_eval_v2"
+    with pytest.raises(ValueError, match="smoke output root"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     [
