@@ -27,6 +27,17 @@ def test_judgment_summary_retains_failed_rows_in_itt_denominator() -> None:
     assert row.failed_count == 1
 
 
+def test_v2_judgment_summary_separates_text_and_embedding_transport() -> None:
+    rows = [
+        {"schema_version": "reviewer_eval.v2", "branch": "o_plus", "transport": "text", "judge_key": "primary", "target_key": "qwen", "source": "source", "method": "method", "threshold": 0.5, "status": "complete", "unsafe_label": True},
+        {"schema_version": "reviewer_eval.v2", "branch": "o_plus", "transport": "embedding", "judge_key": "primary", "target_key": "qwen", "source": "source", "method": "method", "threshold": 0.5, "status": "complete", "unsafe_label": False},
+    ]
+
+    summaries = summarize_judgments(rows)
+
+    assert {(row.transport, row.itt_asr.value) for row in summaries} == {("text", 1.0), ("embedding", 0.0)}
+
+
 def test_paired_judgment_differences_uses_shared_sample_ids_and_itt_labels() -> None:
     rows = [
         {"judge_key": "primary", "target_key": "qwen", "source": "source", "method": "init", "sample_id": "a", "threshold": 0.5, "status": "complete", "unsafe_label": False},

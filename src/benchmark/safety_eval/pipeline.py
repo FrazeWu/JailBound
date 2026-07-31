@@ -13,7 +13,18 @@ import torch
 from .io import JsonlLedger, read_jsonl
 from .materialization import materialize_checkpoint
 from .generation import generate_response_record
-from .schema import BenchmarkExample, FailureKind, JudgmentRecord, MaterializationRecord, OptimizationRecord, RecordStatus, ResponseRecord
+from .schema import (
+    BenchmarkExample,
+    FailureKind,
+    JudgmentRecord,
+    MaterializationRecord,
+    OptimizationRecord,
+    RecordStatus,
+    ResponseRecord,
+    V2JudgmentRecord,
+    V2MaterializationRecord,
+    V2ResponseRecord,
+)
 
 
 @dataclass(frozen=True)
@@ -240,7 +251,11 @@ def generate_materialized_records(
     ledgers: dict[tuple[str, str], JsonlLedger] = {}
     for row in rows:
         selected += 1
-        materialization = MaterializationRecord.model_validate(row)
+        materialization = (
+            V2MaterializationRecord.model_validate(row)
+            if row.get("schema_version") == "reviewer_eval.v2"
+            else MaterializationRecord.model_validate(row)
+        )
         key = (materialization.source, materialization.method)
         ledger = ledgers.setdefault(
             key,
@@ -251,13 +266,17 @@ def generate_materialized_records(
                 / materialization.source
                 / materialization.method
                 / "records.jsonl",
-                key_fields=("sample_id", "checkpoint"),
+                key_fields=("sample_id", "checkpoint", "branch", "transport")
+                if isinstance(materialization, V2MaterializationRecord)
+                else ("sample_id", "checkpoint"),
             ),
         )
         if ledger.contains_key(
             {
                 "sample_id": materialization.sample_id,
-                "checkpoint": materialization.checkpoint,
+                "checkpoint": materialization.step if isinstance(materialization, V2MaterializationRecord) else materialization.checkpoint,
+                **({"branch": materialization.branch, "transport": materialization.transport.value}
+                   if isinstance(materialization, V2MaterializationRecord) else {}),
             }
         ):
             continue
@@ -286,7 +305,11 @@ def judge_response_records(
     ledgers: dict[tuple[str, str, str], JsonlLedger] = {}
     for row in rows:
         selected += 1
-        response = ResponseRecord.model_validate(row)
+        response = (
+            V2ResponseRecord.model_validate(row)
+            if row.get("schema_version") == "reviewer_eval.v2"
+            else ResponseRecord.model_validate(row)
+        )
         key = (response.target_key, response.source, response.method)
         ledger = ledgers.setdefault(
             key,
@@ -298,7 +321,9 @@ def judge_response_records(
                 / response.source
                 / response.method
                 / "records.jsonl",
-                key_fields=("sample_id", "checkpoint", "threshold"),
+                key_fields=("sample_id", "checkpoint", "threshold", "branch", "transport")
+                if isinstance(response, V2ResponseRecord)
+                else ("sample_id", "checkpoint", "threshold"),
             ),
         )
         if ledger.contains_key(
@@ -306,18 +331,24 @@ def judge_response_records(
                 "sample_id": response.sample_id,
                 "checkpoint": response.checkpoint,
                 "threshold": threshold,
+                **({"branch": response.branch, "transport": response.transport.value}
+                   if isinstance(response, V2ResponseRecord) else {}),
             }
         ):
             continue
         if response.status is RecordStatus.failed:
-            record = JudgmentRecord(
-                schema_version=response.schema_version, run_id=response.run_id, config_hash=response.config_hash,
-                sample_id=response.sample_id, source=response.source, method=response.method, checkpoint=response.checkpoint,
-                target_key=response.target_key, judge_key=str(getattr(judge, "key")),
-                judge_revision=str(getattr(judge, "revision")), unsafe_score=0.0, unsafe_label=False,
-                refusal_label=None, threshold=threshold, raw_output="", status=RecordStatus.failed,
-                failure_kind=FailureKind.judge, failure_reason="response generation was not executable",
-            )
+            record_type = V2JudgmentRecord if isinstance(response, V2ResponseRecord) else JudgmentRecord
+            payload = {
+                **({"branch": response.branch, "state_step": response.state_step, "transport": response.transport}
+                   if isinstance(response, V2ResponseRecord) else {}),
+                "schema_version": response.schema_version, "run_id": response.run_id, "config_hash": response.config_hash,
+                "sample_id": response.sample_id, "source": response.source, "method": response.method, "checkpoint": response.checkpoint,
+                "target_key": response.target_key, "judge_key": str(getattr(judge, "key")),
+                "judge_revision": str(getattr(judge, "revision")), "unsafe_score": 0.0, "unsafe_label": False,
+                "refusal_label": None, "threshold": threshold, "raw_output": "", "status": RecordStatus.failed,
+                "failure_kind": FailureKind.judge, "failure_reason": "response generation was not executable",
+            }
+            record = record_type(**payload)
         else:
             result = judge.judge_response(
                 run_id=response.run_id, config_hash=response.config_hash, sample_id=response.sample_id,
@@ -325,7 +356,16 @@ def judge_response_records(
                 target_key=response.target_key, target_revision=response.target_revision,
                 response_text=response.response, threshold=threshold,
             )
-            record = JudgmentRecord.model_validate(result)
+            if isinstance(response, V2ResponseRecord):
+                record = V2JudgmentRecord.model_validate({
+                    **result.model_dump(mode="json"),
+                    "schema_version": "reviewer_eval.v2",
+                    "branch": response.branch,
+                    "state_step": response.state_step,
+                    "transport": response.transport,
+                })
+            else:
+                record = JudgmentRecord.model_validate(result)
         if record.status is RecordStatus.failed:
             failed += 1
         if ledger.append_once(record.model_dump(mode="json")):

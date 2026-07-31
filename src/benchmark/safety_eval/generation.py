@@ -9,7 +9,14 @@ from typing import Any
 
 import torch
 
-from .schema import FailureKind, MaterializationRecord, RecordStatus, ResponseRecord
+from .schema import (
+    FailureKind,
+    MaterializationRecord,
+    RecordStatus,
+    ResponseRecord,
+    V2MaterializationRecord,
+    V2ResponseRecord,
+)
 
 
 @dataclass(frozen=True)
@@ -240,7 +247,7 @@ def generate_response_record(
     *,
     model: Any,
     tokenizer: Any,
-    materialization: MaterializationRecord,
+    materialization: MaterializationRecord | V2MaterializationRecord,
     target_key: str,
     target_revision: str,
     max_new_tokens: int,
@@ -251,6 +258,7 @@ def generate_response_record(
     being silently omitted, preserving matrix denominators for later analysis.
     """
     prompt_hash = hashlib.sha256(materialization.flat_prompt.encode("utf-8")).hexdigest()
+    is_v2 = isinstance(materialization, V2MaterializationRecord)
     common = {
         "schema_version": materialization.schema_version,
         "run_id": materialization.run_id,
@@ -258,13 +266,20 @@ def generate_response_record(
         "sample_id": materialization.sample_id,
         "source": materialization.source,
         "method": materialization.method,
-        "checkpoint": materialization.checkpoint,
+        "checkpoint": materialization.step if is_v2 else materialization.checkpoint,
         "target_key": target_key,
         "target_revision": target_revision,
         "prompt_hash": prompt_hash,
     }
+    if is_v2:
+        common.update(
+            branch=materialization.branch,
+            state_step=materialization.step,
+            transport=materialization.transport,
+        )
+    response_type = V2ResponseRecord if is_v2 else ResponseRecord
     if materialization.status is not RecordStatus.complete:
-        return ResponseRecord(
+        return response_type(
             **common,
             response="",
             input_tokens=0,
@@ -277,11 +292,11 @@ def generate_response_record(
         result = generate_one(
             model,
             tokenizer,
-            system_prompt=materialization.system_prompt,
-            user_prompt=materialization.user_prompt,
+            system_prompt="" if is_v2 else materialization.system_prompt,
+            user_prompt=materialization.flat_prompt if is_v2 else materialization.user_prompt,
             max_new_tokens=max_new_tokens,
         )
-        return ResponseRecord(
+        return response_type(
             **common,
             response=result.response,
             input_tokens=result.input_tokens,
@@ -291,7 +306,7 @@ def generate_response_record(
             failure_reason=None,
         )
     except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as error:
-        return ResponseRecord(
+        return response_type(
             **common,
             response="",
             input_tokens=0,

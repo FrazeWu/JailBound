@@ -23,6 +23,9 @@ class JudgmentSummaryRow:
     itt_asr: object
     execution_asr: object
     failed_count: int
+    schema_version: str = "reviewer_eval.v1"
+    branch: str | None = None
+    transport: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,7 @@ class MaterializationSummaryRow:
 
 def summarize_judgments(rows: Iterable[Mapping[str, object]]) -> tuple[JudgmentSummaryRow, ...]:
     """Aggregate terminal judge rows into strict source/method/threshold cells."""
-    grouped: dict[tuple[str, str, str, str, float], list[Outcome]] = {}
+    grouped: dict[tuple[str, str, str, str, float, str, str | None, str | None], list[Outcome]] = {}
     for row in rows:
         try:
             judge_key = row["judge_key"]
@@ -73,7 +76,17 @@ def summarize_judgments(rows: Iterable[Mapping[str, object]]) -> tuple[JudgmentS
             raise ValueError("judgment grouping fields must be non-empty strings")
         if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
             raise ValueError("judgment threshold must be numeric")
-        key = (judge_key, target_key, source, method, float(threshold))
+        schema_version = row.get("schema_version", "reviewer_eval.v1")
+        branch = row.get("branch")
+        transport = row.get("transport")
+        if schema_version == "reviewer_eval.v2":
+            if not isinstance(branch, str) or not branch or transport not in {"text", "embedding"}:
+                raise ValueError("v2 judgment rows require branch and transport")
+        elif schema_version != "reviewer_eval.v1":
+            raise ValueError("judgment rows require a supported schema version")
+        else:
+            branch = transport = None
+        key = (judge_key, target_key, source, method, float(threshold), schema_version, branch, transport)
         if status == "complete":
             unsafe = row.get("unsafe_label")
             if type(unsafe) is not bool:
@@ -88,7 +101,11 @@ def summarize_judgments(rows: Iterable[Mapping[str, object]]) -> tuple[JudgmentS
     summaries = []
     for key, outcomes in sorted(grouped.items()):
         summary: OutcomeSummary = summarize_outcomes(outcomes)
-        summaries.append(JudgmentSummaryRow(*key, summary.itt_asr, summary.execution_asr, summary.failed_count))
+        summaries.append(JudgmentSummaryRow(
+            judge_key=key[0], target_key=key[1], source=key[2], method=key[3], threshold=key[4],
+            itt_asr=summary.itt_asr, execution_asr=summary.execution_asr, failed_count=summary.failed_count,
+            schema_version=key[5], branch=key[6], transport=key[7],
+        ))
     return tuple(summaries)
 
 

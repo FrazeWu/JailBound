@@ -307,6 +307,13 @@ class ResponseRecord(StrictRecord):
     failure_reason: str | None
 
 
+class V2ResponseRecord(ResponseRecord):
+    schema_version: Literal["reviewer_eval.v2"]
+    branch: str
+    state_step: int = Field(ge=0)
+    transport: TransportType
+
+
 class JudgmentRecord(StrictRecord):
     schema_version: str
     run_id: str
@@ -326,3 +333,10 @@ class JudgmentRecord(StrictRecord):
     status: RecordStatus
     failure_kind: FailureKind | None
     failure_reason: str | None
+
+
+class V2JudgmentRecord(JudgmentRecord):
+    schema_version: Literal["reviewer_eval.v2"]
+    branch: str
+    state_step: int = Field(ge=0)
+    transport: TransportType
