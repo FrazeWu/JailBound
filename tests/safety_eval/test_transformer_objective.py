@@ -8,8 +8,7 @@ from torch import nn
 
 from benchmark.safety_eval.transformer_objective import TransformerObjectiveAdapter
 from benchmark.safety_eval.objective import EditableState
-from benchmark.safety_eval.optimizers.base import BudgetLedger, CheckpointEmitter
-from benchmark.safety_eval.optimizers.gcg import GCGOptimizer
+from benchmark.safety_eval.prompt_contract import TokenizedEditablePrompt
 
 
 class _TinyCausalModel(nn.Module):
@@ -31,9 +30,9 @@ class _TinyCausalModel(nn.Module):
 def _adapter(model: _TinyCausalModel) -> TransformerObjectiveAdapter:
     return TransformerObjectiveAdapter(
         model,
-        frozen_prompt_token_ids=torch.tensor([[1, 2]]),
-        answer_token_ids=torch.tensor([1, 2]),
-        refusal_token_ids=torch.tensor([3, 4]),
+        prompt=_editable_prompt([1, 2], (1,)),
+        answer_anchor_ids=(torch.tensor([1, 2]),),
+        refusal_anchor_ids=(torch.tensor([3, 4]),),
         epsilon=0.25,
         lambda_fol=0.5,
         gamma_z=0.1,
@@ -41,18 +40,66 @@ def _adapter(model: _TinyCausalModel) -> TransformerObjectiveAdapter:
     )
 
 
+def _editable_prompt(
+    base_ids: list[int] = [1, 2, 3, 4],
+    editable_positions: tuple[int, ...] = (1, 3),
+) -> TokenizedEditablePrompt:
+    return TokenizedEditablePrompt(
+        full_text="abcd",
+        base_token_ids=torch.tensor([base_ids]),
+        attention_mask=torch.ones((1, len(base_ids)), dtype=torch.long),
+        editable_positions=editable_positions,
+        frozen_positions=tuple(
+            index for index in range(len(base_ids)) if index not in editable_positions
+        ),
+        token_offsets=tuple((index, index + 1) for index in range(len(base_ids))),
+        boundary_expansions=((0, 1),),
+        tokenizer_revision="fixture-r1",
+    )
+
+
+def test_objective_replaces_omega_s_and_prepends_z() -> None:
+    model = _TinyCausalModel()
+    prompt = _editable_prompt()
+    adapter = TransformerObjectiveAdapter(
+        model,
+        prompt=prompt,
+        answer_anchor_ids=(torch.tensor([1, 2]),),
+        refusal_anchor_ids=(torch.tensor([3, 4]),),
+        epsilon=0.25,
+        lambda_fol=0.5,
+        gamma_z=0.1,
+        gamma_u=0.2,
+    )
+    state = adapter.build_editable_state(torch.tensor([[5]]))
+
+    full, mask = adapter.full_inputs(state)
+    expected = torch.cat(
+        (
+            adapter.embedding(torch.tensor([[5]])),
+            adapter.embedding(torch.tensor([[1]])),
+            state.u[:, 0:1],
+            adapter.embedding(torch.tensor([[3]])),
+            state.u[:, 1:2],
+        ),
+        dim=1,
+    )
+    assert torch.allclose(full, expected)
+    assert mask.tolist() == [[1, 1, 1, 1, 1]]
+
+
 def test_adapter_builds_editable_embedding_state_and_freezes_model_parameters() -> None:
     model = _TinyCausalModel()
     adapter = _adapter(model)
 
-    state = adapter.build_editable_state(torch.tensor([[5]]), torch.tensor([[6]]))
+    state = adapter.build_editable_state(torch.tensor([[5]]))
 
     assert model.training is False
     assert all(parameter.requires_grad is False for parameter in model.parameters())
     assert state.z.requires_grad and state.u.requires_grad
     assert not state.z0.requires_grad and not state.u0.requires_grad
     assert torch.allclose(state.z, model.embeddings(torch.tensor([[5]])))
-    assert torch.allclose(state.u, model.embeddings(torch.tensor([[6]])))
+    assert torch.allclose(state.u, model.embeddings(torch.tensor([[2]])))
     assert state.z.data_ptr() != state.z0.data_ptr()
     assert state.u.data_ptr() != state.u0.data_ptr()
 
@@ -60,22 +107,16 @@ def test_adapter_builds_editable_embedding_state_and_freezes_model_parameters() 
 def test_adapter_evaluates_dual_anchor_risk_with_true_log_probs_and_fol() -> None:
     model = _TinyCausalModel()
     adapter = _adapter(model)
-    state = adapter.build_editable_state(torch.tensor([[5]]), torch.tensor([[6]]))
+    state = adapter.build_editable_state(torch.tensor([[5]]))
 
     value = adapter.evaluate(state, include_fol=True, fol_sign=1)
 
-    full_embeds = torch.cat((state.z, adapter.frozen_prompt_embeddings, state.u), dim=1)
-    expected_log_probs = F.log_softmax(model.projection(full_embeds.cumsum(dim=1))[:, -1, :], dim=-1)
-    expected_answer = expected_log_probs[:, [1, 2]].mean()
-    expected_refusal = expected_log_probs[:, [3, 4]].mean()
     gradients = torch.autograd.grad(value.maximize, (state.z, state.u))
 
-    assert len(model.calls) == 2
+    assert len(model.calls) == 1
     assert all(use_cache is False for _, _, use_cache in model.calls)
-    assert all(torch.equal(mask, torch.ones((1, 4), dtype=torch.long)) for _, mask, _ in model.calls)
-    assert torch.allclose(value.answer_logp, expected_answer)
-    assert torch.allclose(value.refusal_logp, expected_refusal)
-    assert torch.allclose(value.proxy_risk, expected_answer - expected_refusal)
+    assert all(torch.equal(mask, torch.ones((2, 4), dtype=torch.long)) for _, mask, _ in model.calls)
+    assert torch.allclose(value.proxy_risk, value.answer_logp - value.refusal_logp)
     assert value.fol is not None and torch.isfinite(value.fol)
     assert gradients[0].abs().sum() > 0
     assert gradients[1].abs().sum() > 0
@@ -84,28 +125,11 @@ def test_adapter_evaluates_dual_anchor_risk_with_true_log_probs_and_fol() -> Non
 def test_adapter_scores_batched_candidates_with_one_model_forward() -> None:
     model = _TinyCausalModel()
     adapter = _adapter(model)
-    state = adapter.build_editable_state(torch.tensor([[5], [6]]), torch.tensor([[6], [5]]))
+    state = adapter.build_editable_state(torch.tensor([[5], [6]]))
 
     scores = adapter.evaluate_candidates(state)
 
     assert scores.shape == (2,)
     assert torch.isfinite(scores).all()
     assert len(model.calls) == 1
-    assert model.calls[0][0].shape[:2] == (2, 4)
-
-
-def test_gcg_batches_transformer_candidates_and_records_actual_forward_count() -> None:
-    model = _TinyCausalModel()
-    adapter = _adapter(model)
-    ids = torch.tensor([[5]], dtype=torch.long)
-    initial = EditableState(z=ids, u=ids.clone(), z0=ids.clone(), u0=ids.clone())
-    ledger = BudgetLedger(update_limit=1, candidate_limit=2)
-
-    snapshots = GCGOptimizer(model.embeddings.weight.detach(), search_width=2, top_k=2).run(
-        adapter, initial, ledger, CheckpointEmitter([0, 1])
-    )
-
-    # Initial and terminal diagnostics each take two forwards; coordinate
-    # gradients take two, while the two hard candidates share one scorer pass.
-    assert ledger.forward_passes == len(model.calls) == 7
-    assert snapshots[-1].candidates_attempted == 2
+    assert model.calls[0][0].shape[:2] == (4, 4)

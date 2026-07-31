@@ -1,193 +1,128 @@
-"""Transformer-backed dual-anchor objective for editable embedding states."""
+"""Transformer objective over a prompt with editable positions replaced in place."""
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
 import torch
-import torch.nn.functional as F
 
-from objectives.safety_risk import compute_dual_anchor_risk
-
+from .anchor_scorer import score_continuation_sets
 from .objective import EditableState, ObjectiveValue
+from .prompt_contract import TokenizedEditablePrompt, scatter_editable
 
 
 class TransformerAttackObjective:
-    """Evaluate editable ``z``/``u`` embedding blocks with a frozen causal LM.
+    """Optimize a prefix ``z`` and in-place replacements ``u`` for one prompt."""
 
-    The input layout is ``[z | frozen prompt scaffold | u]``.  The scaffold is
-    looked up once during construction, while ``build_state`` creates detached
-    leaf embeddings that optimizers may update without changing model weights.
-    """
-
-    forward_passes_per_evaluation = 2
+    forward_passes_per_evaluation = 1
 
     def __init__(
         self,
         model: Any,
         *,
-        frozen_prompt_token_ids: torch.Tensor,
-        answer_token_ids: torch.Tensor,
-        refusal_token_ids: torch.Tensor,
+        prompt: TokenizedEditablePrompt,
+        answer_anchor_ids: tuple[torch.Tensor, ...],
+        refusal_anchor_ids: tuple[torch.Tensor, ...],
         epsilon: float,
         lambda_fol: float,
         gamma_z: float,
         gamma_u: float,
     ) -> None:
         self.model = model
-        for parameter in self.model.parameters():
+        for parameter in model.parameters():
             parameter.requires_grad_(False)
-        self.model.eval()
-
-        self.answer_token_ids = self._anchor_ids(answer_token_ids, "answer")
-        self.refusal_token_ids = self._anchor_ids(refusal_token_ids, "refusal")
-        self.epsilon = epsilon
-        self.lambda_fol = lambda_fol
-        self.gamma_z = gamma_z
-        self.gamma_u = gamma_u
-
-        self._embedding_layer = self.model.get_input_embeddings()
-        prompt_ids = self._token_ids(frozen_prompt_token_ids, "frozen prompt")
+        model.eval()
+        self.prompt = prompt
+        self.answer_anchor_ids = self._anchor_ids(answer_anchor_ids, "answer")
+        self.refusal_anchor_ids = self._anchor_ids(refusal_anchor_ids, "refusal")
+        self.epsilon, self.lambda_fol = epsilon, lambda_fol
+        self.gamma_z, self.gamma_u = gamma_z, gamma_u
+        self._embedding_layer = model.get_input_embeddings()
         with torch.no_grad():
-            prompt_embeddings = self._embedding_layer(self._on_embedding_device(prompt_ids))
-        self.frozen_prompt_embeddings = prompt_embeddings.detach().clone()
+            embedded = self._embedding_layer(self._on_embedding_device(prompt.base_token_ids))
+        self.base_prompt_embeddings = embedded.detach().clone()
+
+    @property
+    def embedding(self) -> Any:
+        return self._embedding_layer
 
     @staticmethod
-    def _token_ids(token_ids: torch.Tensor, label: str) -> torch.Tensor:
-        if token_ids.ndim == 1:
-            token_ids = token_ids.unsqueeze(0)
-        if token_ids.ndim != 2 or token_ids.shape[0] < 1 or token_ids.shape[1] < 1:
-            raise ValueError(f"{label} token IDs must have shape [batch, tokens]")
-        if token_ids.dtype.is_floating_point or token_ids.dtype.is_complex:
-            raise ValueError(f"{label} token IDs must be integral")
-        return token_ids.to(dtype=torch.long)
+    def _anchor_ids(values: tuple[torch.Tensor, ...], label: str) -> tuple[torch.Tensor, ...]:
+        result = tuple(values)
+        if not result or any(ids.ndim != 1 or ids.numel() == 0 for ids in result):
+            raise ValueError(f"{label} anchors require non-empty rank-1 token sequences")
+        return tuple(ids.detach().clone().to(dtype=torch.long) for ids in result)
 
-    @staticmethod
-    def _anchor_ids(token_ids: torch.Tensor, label: str) -> torch.Tensor:
-        if token_ids.ndim != 1 or token_ids.numel() == 0:
-            raise ValueError(f"{label} anchor token IDs must be a non-empty rank-1 tensor")
-        if token_ids.dtype.is_floating_point or token_ids.dtype.is_complex:
-            raise ValueError(f"{label} anchor token IDs must be integral")
-        return token_ids.detach().clone().to(dtype=torch.long)
-
-    def _on_embedding_device(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def _on_embedding_device(self, ids: torch.Tensor) -> torch.Tensor:
         weight = getattr(self._embedding_layer, "weight", None)
-        device = getattr(weight, "device", None)
-        return token_ids.to(device=device) if device is not None else token_ids
+        return ids.to(weight.device) if weight is not None else ids
 
-    def _embed_editable(self, token_ids: torch.Tensor, label: str) -> torch.Tensor:
+    def _embed_editable(self, ids: torch.Tensor, label: str) -> torch.Tensor:
+        if ids.ndim == 1:
+            ids = ids.unsqueeze(0)
+        if ids.ndim != 2 or ids.shape[1] < 1:
+            raise ValueError(f"{label} token IDs must have shape [batch, tokens]")
         with torch.no_grad():
-            embeddings = self._embedding_layer(self._on_embedding_device(self._token_ids(token_ids, label)))
-        return embeddings.detach().clone().requires_grad_(True)
+            embedded = self._embedding_layer(self._on_embedding_device(ids.to(dtype=torch.long)))
+        return embedded.detach().clone().requires_grad_(True)
 
-    def build_editable_state(self, z_token_ids: torch.Tensor, u_token_ids: torch.Tensor) -> EditableState:
-        """Create the initial editable state from the model's frozen token embeddings."""
+    def build_editable_state(self, z_token_ids: torch.Tensor) -> EditableState:
         z = self._embed_editable(z_token_ids, "z")
-        u = self._embed_editable(u_token_ids, "u")
-        frozen_batch = self.frozen_prompt_embeddings.shape[0]
-        if u.shape[0] != z.shape[0] or (frozen_batch != 1 and z.shape[0] != frozen_batch):
-            raise ValueError("z/u batches must match the frozen prompt batch, unless the prompt has batch size 1")
-        return EditableState(z=z, u=u, z0=z.detach().clone(), u0=u.detach().clone())
+        base = self.base_prompt_embeddings.to(device=z.device, dtype=z.dtype)
+        if z.shape[0] > 1:
+            base = base.expand(z.shape[0], -1, -1)
+        positions = torch.tensor(self.prompt.editable_positions, device=base.device)
+        u0 = base.index_select(1, positions)
+        u = u0.detach().clone().requires_grad_(True)
+        return EditableState(z=z, u=u, z0=z.detach().clone(), u0=u0.detach().clone())
 
-    def build_state(self, z_token_ids: torch.Tensor, u_token_ids: torch.Tensor) -> EditableState:
-        """Compatibility alias for :meth:`build_editable_state`."""
-        return self.build_editable_state(z_token_ids, u_token_ids)
+    def build_state(self, z_token_ids: torch.Tensor) -> EditableState:
+        return self.build_editable_state(z_token_ids)
 
-    def _full_inputs(self, state: EditableState) -> tuple[torch.Tensor, torch.Tensor]:
-        if state.z.ndim != 3 or state.u.ndim != 3:
-            raise ValueError("editable z and u tensors must have shape [batch, tokens, hidden]")
-        frozen = self.frozen_prompt_embeddings.to(device=state.z.device, dtype=state.z.dtype)
-        if frozen.shape[0] == 1 and state.z.shape[0] > 1:
-            frozen = frozen.expand(state.z.shape[0], -1, -1)
-        if state.z.shape[0] != frozen.shape[0] or state.u.shape[0] != frozen.shape[0]:
-            raise ValueError("editable state batch does not match the frozen prompt")
-        if state.z.shape[-1] != frozen.shape[-1] or state.u.shape[-1] != frozen.shape[-1]:
-            raise ValueError("editable state hidden size does not match the frozen prompt")
-        full_embeds = torch.cat((state.z, frozen, state.u), dim=1)
-        attention_mask = torch.ones(full_embeds.shape[:2], dtype=torch.long, device=full_embeds.device)
-        return full_embeds, attention_mask
+    def full_inputs(self, state: EditableState) -> tuple[torch.Tensor, torch.Tensor]:
+        base = self.base_prompt_embeddings.to(device=state.z.device, dtype=state.z.dtype)
+        if base.shape[0] == 1 and state.z.shape[0] > 1:
+            base = base.expand(state.z.shape[0], -1, -1)
+        if state.z.shape[0] != base.shape[0] or state.u.shape[:2] != (base.shape[0], len(self.prompt.editable_positions)):
+            raise ValueError("editable state does not match the tokenized prompt")
+        replaced = scatter_editable(state.u, base, self.prompt.editable_positions)
+        full = torch.cat((state.z, replaced), dim=1)
+        return full, torch.ones(full.shape[:2], dtype=torch.long, device=full.device)
 
-    @staticmethod
-    def _last_log_probs(logits: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        positions = (attention_mask.sum(dim=1).long() - 1).clamp(min=0, max=logits.shape[1] - 1)
-        last_logits = logits[torch.arange(logits.shape[0], device=logits.device), positions, :]
-        return F.log_softmax(last_logits, dim=-1)
-
-    def _true_anchor_log_probs(self, full_embeds: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        with torch.no_grad():
-            outputs = self.model(
-                inputs_embeds=full_embeds.detach(),
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
-            log_probs = self._last_log_probs(outputs.logits, attention_mask)
-            answer = log_probs[:, self.answer_token_ids.to(log_probs.device)].mean()
-            refusal = log_probs[:, self.refusal_token_ids.to(log_probs.device)].mean()
-        return answer, refusal
+    def _scores(self, state: EditableState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        full, mask = self.full_inputs(state)
+        scores = score_continuation_sets(
+            model=self.model,
+            embedding_layer=self._embedding_layer,
+            prompt_embeds=full,
+            prompt_attention_mask=mask,
+            answer_anchors=self.answer_anchor_ids,
+            refusal_anchors=self.refusal_anchor_ids,
+        )
+        return scores.proxy_risk.mean(), scores.answer_logp.mean(), scores.refusal_logp.mean()
 
     def evaluate_candidates(self, state: EditableState) -> torch.Tensor:
-        """Score independent discrete candidates with one no-grad model forward.
-
-        Each batch item represents a complete candidate.  This deliberately
-        omits the diagnostic true-anchor pass and FOL, which GCG does not use
-        while ranking its local coordinate proposals.
-        """
-        full_embeds, attention_mask = self._full_inputs(state)
         with torch.no_grad():
-            outputs = self.model(
-                inputs_embeds=full_embeds.detach(),
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
-            log_probs = self._last_log_probs(outputs.logits, attention_mask)
-            answer = log_probs[:, self.answer_token_ids.to(log_probs.device)].mean(dim=-1)
-            refusal = log_probs[:, self.refusal_token_ids.to(log_probs.device)].mean(dim=-1)
-        z_penalty = (state.z - state.z0).square().sum(dim=(1, 2))
-        u_penalty = (state.u - state.u0).square().sum(dim=(1, 2))
-        return answer - refusal - self.gamma_z * z_penalty - self.gamma_u * u_penalty
+            proxy, _, _ = self._scores(EditableState(state.z.detach(), state.u.detach(), state.z0, state.u0))
+        penalties = self.gamma_z * (state.z - state.z0).square().sum(dim=(1, 2)) + self.gamma_u * (state.u - state.u0).square().sum(dim=(1, 2))
+        return proxy.expand_as(penalties) - penalties
 
-    def evaluate(
-        self,
-        state: EditableState,
-        *,
-        fol_sign: Literal[-1, 0, 1] = 0,
-        include_fol: bool = False,
-    ) -> ObjectiveValue:
-        """Return the dual-anchor objective, true anchor log-probabilities, and optional FOL."""
+    def evaluate(self, state: EditableState, *, fol_sign: Literal[-1, 0, 1] = 0, include_fol: bool = False) -> ObjectiveValue:
         if fol_sign not in {-1, 0, 1}:
             raise ValueError("fol_sign must be -1, 0, or 1")
-        full_embeds, attention_mask = self._full_inputs(state)
-        answer_ids = self.answer_token_ids.to(full_embeds.device)
-        refusal_ids = self.refusal_token_ids.to(full_embeds.device)
-        proxy_risk = compute_dual_anchor_risk(
-            model=self.model,
-            perturbed_embeds=full_embeds,
-            attention_mask=attention_mask,
-            answer_token_ids=answer_ids,
-            refusal_token_ids=refusal_ids,
-        )
-        answer_logp, refusal_logp = self._true_anchor_log_probs(full_embeds, attention_mask)
-        attack_loss = (
-            proxy_risk
-            - self.gamma_z * (state.z - state.z0).square().sum()
-            - self.gamma_u * (state.u - state.u0).square().sum()
-        )
-        fol: torch.Tensor | None = None
-        maximize = attack_loss
+        proxy, answer, refusal = self._scores(state)
+        attack = proxy - self.gamma_z * (state.z - state.z0).square().sum() - self.gamma_u * (state.u - state.u0).square().sum()
+        fol = None
+        maximize = attack
         if include_fol:
-            if not state.z.requires_grad or not state.u.requires_grad:
-                raise ValueError("FOL requires editable z and u tensors with gradients enabled")
-            gradients = torch.autograd.grad(attack_loss, (state.z, state.u), create_graph=True, retain_graph=True)
+            gradients = torch.autograd.grad(attack, (state.z, state.u), create_graph=True, retain_graph=True)
             fol = self.epsilon * torch.sqrt(sum(gradient.square().sum() for gradient in gradients))
-            maximize = attack_loss + fol_sign * self.lambda_fol * fol
-        return ObjectiveValue(maximize, attack_loss, proxy_risk, fol, answer_logp, refusal_logp, proxy_risk)
+            maximize = attack + fol_sign * self.lambda_fol * fol
+        return ObjectiveValue(maximize, attack, proxy, fol, answer, refusal, proxy)
 
     def hvp(self, state: EditableState, direction: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the attack-loss Hessian-vector product for ``z`` and ``u``."""
-        attack_loss = self.evaluate(state).attack_loss
-        gradient = torch.autograd.grad(attack_loss, (state.z, state.u), create_graph=True)
-        directional = sum((left * right).sum() for left, right in zip(gradient, direction))
-        return torch.autograd.grad(directional, (state.z, state.u))
+        gradients = torch.autograd.grad(self.evaluate(state).attack_loss, (state.z, state.u), create_graph=True)
+        return torch.autograd.grad(sum((left * right).sum() for left, right in zip(gradients, direction)), (state.z, state.u))
 
 
 TransformerObjectiveAdapter = TransformerAttackObjective
