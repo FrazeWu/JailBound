@@ -209,7 +209,7 @@ def _annotation_payload_sha256(row: Mapping[str, object]) -> str:
     payload = {
         key: value
         for key, value in row.items()
-        if key not in {"accepted", "annotation_payload_sha256"}
+        if key != "annotation_payload_sha256"
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
@@ -271,7 +271,7 @@ def prepare_review_rows(
                 "annotation_revision": annotation.revision,
                 "annotation_template_sha256": annotation.template_sha256,
                 "annotation_response_sha256": annotation.response_sha256,
-                "accepted": None,
+                "accepted": True,
             }
             row["annotation_payload_sha256"] = _annotation_payload_sha256(row)
             rows.append(row)

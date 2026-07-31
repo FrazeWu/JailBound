@@ -194,7 +194,7 @@ def test_prepare_core_samples_fixed_count_per_source_deterministically() -> None
         "source_b",
     ]
     assert first_annotator.calls == second_annotator.calls
-    assert all(row["accepted"] is None for row in first)
+    assert all(row["accepted"] is True for row in first)
     assert all(row["confidence"] == 0.75 for row in first)
     assert all(row["annotation_model"] == "fixture-model" for row in first)
     assert all(
@@ -202,6 +202,11 @@ def test_prepare_core_samples_fixed_count_per_source_deterministically() -> None
         == _MODULE._annotation_payload_sha256(row)
         for row in first
     )
+    tampered = dict(first[0])
+    tampered["accepted"] = False
+    assert _MODULE._annotation_payload_sha256(tampered) != first[0][
+        "annotation_payload_sha256"
+    ]
     assert all(row["seed_intent"].startswith("intent-") for row in first)
     assert all(row["source_hints"]["language"] == "en" for row in first)
     assert all(row["spans"][0]["quote"] == row["prompt"] for row in first)
