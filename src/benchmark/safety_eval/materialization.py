@@ -8,7 +8,8 @@ from typing import Any, Iterable, Mapping
 import torch
 
 from .objective import EditableState
-from .schema import FailureKind, MaterializationRecord, RecordStatus
+from .prompt_contract import TokenizedEditablePrompt
+from .schema import FailureKind, MaterializationRecord, RecordStatus, TransportType, V2MaterializationRecord
 
 
 @dataclass(frozen=True)
@@ -38,11 +39,110 @@ class ContinuousCandidate:
     forbidden_token_ids: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True)
+class V2CandidateMaterialization:
+    """One-pass reconstruction evidence for an annotated prompt contract."""
+
+    projected_z_token_ids: tuple[int, ...]
+    projected_u_token_ids: tuple[int, ...]
+    reconstructed_base_token_ids: tuple[int, ...]
+    complete_token_ids: tuple[int, ...]
+    flat_prompt: str
+    frozen_positions_unchanged: bool
+
+
 def meets_semantic_threshold(similarity: float, *, threshold: float) -> bool:
     """Return whether a semantic similarity meets its frozen acceptance threshold."""
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("semantic threshold must be in [0, 1]")
     return float(similarity) >= threshold
+
+
+def materialize_v2_candidate(
+    *,
+    candidate: ContinuousCandidate | DiscreteCandidate,
+    prompt: TokenizedEditablePrompt,
+    tokenizer: Any,
+    special_token_ids: Iterable[int] = (),
+) -> V2CandidateMaterialization:
+    """Project both editable blocks and reconstruct ``[z; Phi(p; U)]`` once."""
+    if isinstance(candidate, ContinuousCandidate):
+        evidence = materialize_continuous_state(
+            candidate.state,
+            candidate.vocabulary_embeddings,
+            forbidden_token_ids=tuple(special_token_ids) + candidate.forbidden_token_ids,
+        )
+        z_ids, u_ids = evidence.prefix_token_ids, evidence.seed_token_ids
+    else:
+        z_ids = tuple(int(token_id) for token_id in candidate.prefix_token_ids)
+        u_ids = tuple(int(token_id) for token_id in candidate.seed_token_ids)
+    if len(u_ids) != len(prompt.editable_positions):
+        raise ValueError("projected U token count must match editable prompt positions")
+    forbidden = {int(token_id) for token_id in special_token_ids}
+    if forbidden.intersection(z_ids + u_ids):
+        raise ValueError("projected editable tokens must not include forbidden IDs")
+    base = tuple(int(token_id) for token_id in prompt.base_token_ids[0].detach().cpu().tolist())
+    reconstructed = list(base)
+    for position, token_id in zip(prompt.editable_positions, u_ids):
+        reconstructed[position] = token_id
+    frozen_unchanged = all(reconstructed[position] == base[position] for position in prompt.frozen_positions)
+    if not frozen_unchanged:
+        raise AssertionError("v2 materialization changed a frozen prompt token")
+    complete = z_ids + tuple(reconstructed)
+    decoded = str(tokenizer.decode(list(complete), skip_special_tokens=True)).strip()
+    if not decoded:
+        raise ValueError("decoded v2 candidate must be non-empty")
+    return V2CandidateMaterialization(
+        projected_z_token_ids=z_ids,
+        projected_u_token_ids=u_ids,
+        reconstructed_base_token_ids=tuple(reconstructed),
+        complete_token_ids=complete,
+        flat_prompt=decoded,
+        frozen_positions_unchanged=True,
+    )
+
+
+def build_v2_materialization_record(
+    *,
+    result: V2CandidateMaterialization,
+    prompt: TokenizedEditablePrompt,
+    run_id: str,
+    config_hash: str,
+    sample_id: str,
+    source: str,
+    method: str,
+    branch: str,
+    step: int,
+    transport: TransportType = TransportType.text,
+    full_prompt_similarity: float = 1.0,
+    editable_span_similarity: float = 1.0,
+) -> V2MaterializationRecord:
+    """Turn one v2 reconstruction into a strict materialization ledger row."""
+    return V2MaterializationRecord(
+        schema_version="reviewer_eval.v2",
+        run_id=run_id,
+        config_hash=config_hash,
+        sample_id=sample_id,
+        source=source,
+        method=method,
+        branch=branch,
+        step=step,
+        transport=transport,
+        editable_positions=prompt.editable_positions,
+        original_token_ids=tuple(int(value) for value in prompt.base_token_ids[0].tolist()),
+        projected_z_token_ids=result.projected_z_token_ids,
+        projected_u_token_ids=result.projected_u_token_ids,
+        reconstructed_base_token_ids=result.reconstructed_base_token_ids,
+        complete_token_ids=result.complete_token_ids,
+        frozen_positions_unchanged=result.frozen_positions_unchanged,
+        span_boundary_expansions=prompt.boundary_expansions,
+        full_prompt_similarity=full_prompt_similarity,
+        editable_span_similarity=editable_span_similarity,
+        flat_prompt=result.flat_prompt,
+        status=RecordStatus.complete,
+        failure_kind=None,
+        failure_reason=None,
+    )
 
 
 def build_materialization_record(

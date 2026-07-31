@@ -14,6 +14,7 @@ from benchmark.safety_eval.materialization import (
     materialize_continuous_state,
 )
 from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.prompt_contract import TokenizedEditablePrompt
 from benchmark.safety_eval.schema import FailureKind, MaterializationRecord, RecordStatus
 
 
@@ -165,6 +166,42 @@ class _Tokenizer:
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
         assert skip_special_tokens is True
         return " ".join(f"token-{token_id}" for token_id in token_ids if token_id != 0)
+
+
+def test_v2_materialization_scatters_u_and_decodes_complete_sequence_once() -> None:
+    class RecordingTokenizer:
+        all_special_ids: list[int] = []
+
+        def __init__(self) -> None:
+            self.decode_calls: list[tuple[int, ...]] = []
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+            assert skip_special_tokens is True
+            self.decode_calls.append(tuple(token_ids))
+            return "decoded"
+
+    prompt = TokenizedEditablePrompt(
+        full_text="abcd",
+        base_token_ids=torch.tensor([[10, 11, 12, 13]]),
+        attention_mask=torch.ones((1, 4), dtype=torch.long),
+        editable_positions=(1, 3),
+        frozen_positions=(0, 2),
+        token_offsets=((0, 1), (1, 2), (2, 3), (3, 4)),
+        boundary_expansions=((1, 2),),
+        tokenizer_revision="fixture-r1",
+    )
+    tokenizer = RecordingTokenizer()
+
+    result = materialization_module.materialize_v2_candidate(
+        candidate=DiscreteCandidate(prefix_token_ids=(20, 21), seed_token_ids=(30, 31)),
+        prompt=prompt,
+        tokenizer=tokenizer,
+    )
+
+    assert result.reconstructed_base_token_ids == (10, 30, 12, 31)
+    assert result.complete_token_ids == (20, 21, 10, 30, 12, 31)
+    assert tokenizer.decode_calls == [(20, 21, 10, 30, 12, 31)]
+    assert result.frozen_positions_unchanged is True
 
 
 def test_materialize_checkpoint_prefers_discrete_token_ids_and_retains_checkpoint_identity() -> None:

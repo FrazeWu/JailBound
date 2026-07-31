@@ -248,6 +248,46 @@ class MaterializationRecord(StrictRecord):
     failure_reason: str | None
 
 
+class V2MaterializationRecord(StrictRecord):
+    """Auditable in-place reconstruction for one v2 optimization state."""
+
+    schema_version: Literal["reviewer_eval.v2"]
+    run_id: str
+    config_hash: Sha256
+    sample_id: str
+    source: str
+    method: str
+    branch: str
+    step: int = Field(ge=0)
+    transport: TransportType
+    editable_positions: tuple[int, ...] = Field(min_length=1)
+    original_token_ids: tuple[int, ...] = Field(min_length=1)
+    projected_z_token_ids: tuple[int, ...] = Field(min_length=1)
+    projected_u_token_ids: tuple[int, ...] = Field(min_length=1)
+    reconstructed_base_token_ids: tuple[int, ...] = Field(min_length=1)
+    complete_token_ids: tuple[int, ...] = Field(min_length=1)
+    frozen_positions_unchanged: bool
+    span_boundary_expansions: tuple[tuple[int, int], ...] = Field(min_length=1)
+    full_prompt_similarity: float = Field(ge=0.0, le=1.0)
+    editable_span_similarity: float = Field(ge=0.0, le=1.0)
+    flat_prompt: str
+    status: RecordStatus
+    failure_kind: FailureKind | None
+    failure_reason: str | None
+
+    @model_validator(mode="after")
+    def validate_reconstruction(self) -> "V2MaterializationRecord":
+        if len(self.projected_u_token_ids) != len(self.editable_positions):
+            raise ValueError("projected U token count must match editable positions")
+        if len(self.reconstructed_base_token_ids) != len(self.original_token_ids):
+            raise ValueError("reconstructed base token count must match original tokens")
+        if self.complete_token_ids != self.projected_z_token_ids + self.reconstructed_base_token_ids:
+            raise ValueError("complete token IDs must prepend projected z to reconstructed base")
+        if self.status is RecordStatus.complete and not self.frozen_positions_unchanged:
+            raise ValueError("complete v2 materializations must preserve frozen positions")
+        return self
+
+
 class ResponseRecord(StrictRecord):
     schema_version: str
     run_id: str
