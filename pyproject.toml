@@ -1,7 +1,7 @@
 [project]
-name = "comprehensive-bench"
+name = "jailbound"
 version = "0.1.0"
-description = "Implementation code and offline review tests for a modular benchmark workflow."
+description = "Implementation and evaluation workflows for JailBound."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
