@@ -89,7 +89,7 @@ class TransformerAttackObjective:
         full = torch.cat((state.z, replaced), dim=1)
         return full, torch.ones(full.shape[:2], dtype=torch.long, device=full.device)
 
-    def _scores(self, state: EditableState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _score_vectors(self, state: EditableState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         full, mask = self.full_inputs(state)
         scores = score_continuation_sets(
             model=self.model,
@@ -99,13 +99,16 @@ class TransformerAttackObjective:
             answer_anchors=self.answer_anchor_ids,
             refusal_anchors=self.refusal_anchor_ids,
         )
-        return scores.proxy_risk.mean(), scores.answer_logp.mean(), scores.refusal_logp.mean()
+        return scores.proxy_risk, scores.answer_logp, scores.refusal_logp
+
+    def _scores(self, state: EditableState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return tuple(score.mean() for score in self._score_vectors(state))  # type: ignore[return-value]
 
     def evaluate_candidates(self, state: EditableState) -> torch.Tensor:
         with torch.no_grad():
-            proxy, _, _ = self._scores(EditableState(state.z.detach(), state.u.detach(), state.z0, state.u0))
+            proxy, _, _ = self._score_vectors(EditableState(state.z.detach(), state.u.detach(), state.z0, state.u0))
         penalties = self.gamma_z * (state.z - state.z0).square().sum(dim=(1, 2)) + self.gamma_u * (state.u - state.u0).square().sum(dim=(1, 2))
-        return proxy.expand_as(penalties) - penalties
+        return proxy - penalties
 
     def evaluate(self, state: EditableState, *, fol_sign: Literal[-1, 0, 1] = 0, include_fol: bool = False) -> ObjectiveValue:
         if fol_sign not in {-1, 0, 1}:

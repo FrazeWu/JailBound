@@ -84,6 +84,8 @@ class GCGOptimizer:
     search_width: int = 32
     top_k: int = 256
     candidate_batch_size: int = 8
+    initial_z_token_ids: torch.Tensor | None = None
+    initial_u_token_ids: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.embedding.ndim != 2 or not self.embedding.is_floating_point():
@@ -103,10 +105,13 @@ class GCGOptimizer:
         ledger: BudgetLedger,
         emitter: CheckpointEmitter,
     ) -> list[GCGSnapshot]:
-        z_ids, u_ids = self._validated_ids(initial_state)
-        initial_z = self._embedding_from_ids(z_ids)
-        initial_u = self._embedding_from_ids(u_ids)
-        baseline = EditableState(initial_z, initial_u, initial_z.clone(), initial_u.clone())
+        z_ids, u_ids = self._initial_ids(initial_state)
+        baseline = EditableState(
+            initial_state.z.detach().clone(),
+            initial_state.u.detach().clone(),
+            initial_state.z0.detach().clone(),
+            initial_state.u0.detach().clone(),
+        )
         snapshots: list[GCGSnapshot] = []
 
         if emitter.due(0):
@@ -166,8 +171,15 @@ class GCGOptimizer:
                 scored.append((candidate, candidate_z, candidate_u, candidate_loss))
         return scored
 
-    def _validated_ids(self, initial_state: EditableState) -> tuple[torch.Tensor, torch.Tensor]:
-        z_ids, u_ids = _clone_ids(initial_state.z), _clone_ids(initial_state.u)
+    def _initial_ids(self, initial_state: EditableState) -> tuple[torch.Tensor, torch.Tensor]:
+        if (self.initial_z_token_ids is None) != (self.initial_u_token_ids is None):
+            raise ValueError("GCG requires both initial z and u token ID tensors")
+        if self.initial_z_token_ids is None:
+            return self._validate_token_ids(initial_state.z, initial_state.u)
+        return self._validate_token_ids(self.initial_z_token_ids, self.initial_u_token_ids)
+
+    def _validate_token_ids(self, z_ids: torch.Tensor, u_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z_ids, u_ids = _clone_ids(z_ids), _clone_ids(u_ids)
         vocabulary_size = self.embedding.shape[0]
         for ids, name in ((z_ids, "z"), (u_ids, "u")):
             if ids.ndim != 2 or ids.dtype == torch.bool or ids.is_floating_point() or ids.is_complex():

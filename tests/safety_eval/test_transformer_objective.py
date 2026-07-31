@@ -4,8 +4,10 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
+import pytest
 from torch import nn
 
+import benchmark.safety_eval.transformer_objective as transformer_objective
 from benchmark.safety_eval.transformer_objective import TransformerObjectiveAdapter
 from benchmark.safety_eval.objective import EditableState
 from benchmark.safety_eval.prompt_contract import TokenizedEditablePrompt
@@ -133,3 +135,23 @@ def test_adapter_scores_batched_candidates_with_one_model_forward() -> None:
     assert torch.isfinite(scores).all()
     assert len(model.calls) == 1
     assert model.calls[0][0].shape[:2] == (4, 4)
+
+
+def test_adapter_keeps_a_proxy_score_for_each_batched_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyCausalModel()
+    adapter = _adapter(model)
+    state = adapter.build_editable_state(torch.tensor([[5], [6]]))
+
+    monkeypatch.setattr(
+        transformer_objective,
+        "score_continuation_sets",
+        lambda **_kwargs: SimpleNamespace(
+            proxy_risk=torch.tensor([2.0, 5.0]),
+            answer_logp=torch.tensor([0.0, 0.0]),
+            refusal_logp=torch.tensor([0.0, 0.0]),
+        ),
+    )
+
+    assert adapter.evaluate_candidates(state).tolist() == [2.0, 5.0]

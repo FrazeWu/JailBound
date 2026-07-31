@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from .io import JsonlLedger, canonical_hash, read_jsonl
+from .anchor_scorer import tokenize_anchor_set
 from .optimizers.base import BudgetLedger, CheckpointEmitter
 from .optimizers.gbda import GBDAOptimizer
 from .optimizers.gcg import GCGOptimizer
@@ -22,6 +23,7 @@ from .optimizers.random_mutation import RandomMutationOptimizer
 from .objective import EditableState
 from .runtime import ResolvedModel, validate_model_assets
 from .runner import OptimizationJob, OptimizationRunner, OptimizationSnapshot
+from .prompt_contract import tokenize_editable_prompt
 from .schema import (
     BenchmarkExample,
     ComputeCounters,
@@ -29,6 +31,7 @@ from .schema import (
     ManifestHeader,
     OptimizationRecord,
     RecordStatus,
+    V2BenchmarkExample,
     stable_id,
 )
 from .transformer_objective import TransformerAttackObjective
@@ -98,7 +101,6 @@ class TensorOptimizationSettings:
     dual_branch_updates: dict[str, int]
     candidate_cap: int
     prefix_tokens: int
-    editable_seed_tokens: int
     learning_rate: float
     lambda_fol: float
     epsilon: float
@@ -111,13 +113,15 @@ class TensorOptimizationSettings:
     gcg_search_width: int = 32
     finite_difference_fol: bool = False
     finite_difference_radius: float = 1e-3
+    prefix_token_text: str = "!"
+    tokenizer_revision: str = "local-tokenizer"
 
     def __post_init__(self) -> None:
         if self.checkpoints != tuple(sorted(set(self.checkpoints))) or not self.checkpoints or self.checkpoints[0] != 0:
             raise ValueError("tensor checkpoints must be unique, ordered, and start at zero")
         if self.update_budget < 1 or self.candidate_cap < 1:
             raise ValueError("tensor optimization budgets must be positive")
-        if self.prefix_tokens < 1 or self.editable_seed_tokens < 1 or self.gcg_search_width < 1:
+        if self.prefix_tokens < 1 or self.gcg_search_width < 1:
             raise ValueError("editable token counts must be positive")
         if self.gbda_learning_rate is not None and self.gbda_learning_rate <= 0:
             raise ValueError("GBDA learning rate must be positive")
@@ -125,6 +129,8 @@ class TensorOptimizationSettings:
             raise ValueError("finite-difference FOL radius must be positive")
         if not self.answer_anchors or not self.refusal_anchors:
             raise ValueError("tensor optimization requires both anchor sets")
+        if not self.prefix_token_text or not self.tokenizer_revision:
+            raise ValueError("prefix token text and tokenizer revision must be non-empty")
 
 
 @dataclass
@@ -248,17 +254,6 @@ def local_qwen_init_executor(
     ]
 
 
-def _anchor_token_ids(tokenizer: Any, anchors: tuple[str, ...], device: torch.device) -> torch.Tensor:
-    token_ids: set[int] = set()
-    for anchor in anchors:
-        encoded = tokenizer.encode(anchor, add_special_tokens=False)
-        if encoded:
-            token_ids.add(int(encoded[0]))
-    if not token_ids:
-        raise ExecutionError("local tensor executor could not encode anchor tokens")
-    return torch.tensor(sorted(token_ids), dtype=torch.long, device=device)
-
-
 def _embedding_device(model: Any) -> torch.device:
     embedding_layer = model.get_input_embeddings()
     weight = getattr(embedding_layer, "weight", None)
@@ -266,12 +261,15 @@ def _embedding_device(model: Any) -> torch.device:
     return device if isinstance(device, torch.device) else torch.device("cpu")
 
 
-def _initial_editable_token_ids(token_ids: torch.Tensor, settings: TensorOptimizationSettings) -> tuple[torch.Tensor, torch.Tensor]:
-    if token_ids.ndim != 2 or token_ids.shape[0] != 1 or token_ids.shape[1] < 1:
-        raise ExecutionError("local tensor executor requires one non-empty tokenized input")
-    z_ids = token_ids[:, :1].expand(-1, settings.prefix_tokens).clone()
-    u_count = min(settings.editable_seed_tokens, token_ids.shape[1])
-    return z_ids, token_ids[:, -u_count:].clone()
+def _initial_prefix_token_ids(
+    tokenizer: Any, settings: TensorOptimizationSettings, device: torch.device
+) -> torch.Tensor:
+    token_ids = tokenizer.encode(settings.prefix_token_text, add_special_tokens=False)
+    if len(token_ids) != 1:
+        raise ExecutionError("repeat-token prefix initialization requires exactly one token")
+    return torch.full(
+        (1, settings.prefix_tokens), int(token_ids[0]), dtype=torch.long, device=device
+    )
 
 
 def _tensor_optimizer(method: str, settings: TensorOptimizationSettings) -> Any:
@@ -312,14 +310,16 @@ def _initial_state_for_method(
         from .objective import EditableState
 
         return EditableState(z_logits, u_logits, z_logits.detach().clone(), u_logits.detach().clone())
-    if method == "gcg":
-        from .objective import EditableState
-
-        return EditableState(z_ids, u_ids, z_ids.detach().clone(), u_ids.detach().clone())
-    return objective.build_editable_state(z_ids, u_ids)
+    return objective.build_editable_state(z_ids)
 
 
-def _baseline_optimizer(method: str, settings: TensorOptimizationSettings, embedding: torch.Tensor) -> Any:
+def _baseline_optimizer(
+    method: str,
+    settings: TensorOptimizationSettings,
+    embedding: torch.Tensor,
+    z_ids: torch.Tensor,
+    u_ids: torch.Tensor,
+) -> Any:
     if method == "pez":
         return PEZOptimizer(embedding, learning_rate=settings.learning_rate, max_grad_norm=settings.grad_clip)
     if method == "gbda":
@@ -329,11 +329,32 @@ def _baseline_optimizer(method: str, settings: TensorOptimizationSettings, embed
             max_grad_norm=settings.grad_clip,
         )
     if method == "gcg":
-        return GCGOptimizer(embedding, search_width=settings.gcg_search_width, top_k=settings.gcg_search_width)
+        return GCGOptimizer(
+            embedding,
+            search_width=settings.gcg_search_width,
+            top_k=settings.gcg_search_width,
+            initial_z_token_ids=z_ids,
+            initial_u_token_ids=u_ids,
+        )
     return build_jailbound_optimizer(method, learning_rate=settings.learning_rate, max_grad_norm=settings.grad_clip)
 
 
-def _checkpoint_state(snapshot: Any) -> dict[str, torch.Tensor]:
+def _prompt_state_contract(
+    prompt: Any, record: V2BenchmarkExample
+) -> dict[str, Any]:
+    return {
+        "base_token_ids": prompt.base_token_ids.detach().to(device="cpu", dtype=torch.long),
+        "editable_positions": torch.tensor(prompt.editable_positions, dtype=torch.long),
+        "tokenizer_revision": prompt.tokenizer_revision,
+        "editable_span_hashes": tuple(
+            canonical_hash(span.model_dump(mode="json")) for span in record.editable_spans
+        ),
+    }
+
+
+def _checkpoint_state(
+    snapshot: Any, prompt: Any, record: V2BenchmarkExample
+) -> dict[str, Any]:
     state = getattr(snapshot, "state", None)
     if state is None:
         raise ExecutionError("optimizer checkpoint did not include an editable state")
@@ -344,6 +365,7 @@ def _checkpoint_state(snapshot: Any) -> dict[str, torch.Tensor]:
         "u": state.u.detach().to(device="cpu"),
         "z_token_ids": z_token_ids.detach().to(device="cpu", dtype=torch.long),
         "u_token_ids": u_token_ids.detach().to(device="cpu", dtype=torch.long),
+        **_prompt_state_contract(prompt, record),
     }
 
 
@@ -372,6 +394,8 @@ def _random_mutation_snapshots(
     settings: TensorOptimizationSettings,
     seed: int,
     prompt_tokens: int,
+    prompt: Any,
+    record: V2BenchmarkExample,
 ) -> list[OptimizationSnapshot]:
     """Run a deterministic, semantic-proxy constrained vector mutation baseline."""
     generator = torch.Generator()
@@ -420,6 +444,7 @@ def _random_mutation_snapshots(
                 "u": snapshot.candidate.u.detach().to(device="cpu"),
                 "z_token_ids": torch.empty((0, 0), dtype=torch.long),
                 "u_token_ids": torch.empty((0, 0), dtype=torch.long),
+                **_prompt_state_contract(prompt, record),
             },
         )
         for snapshot in snapshots
@@ -428,7 +453,7 @@ def _random_mutation_snapshots(
 
 def _run_local_qwen_tensor(
     loaded: LocalQwenHandle,
-    record: BenchmarkExample,
+    record: V2BenchmarkExample,
     job: OptimizationJob,
     checkpoints: tuple[int, ...],
     settings: TensorOptimizationSettings,
@@ -452,36 +477,46 @@ def _run_local_qwen_tensor(
         raise ExecutionError("local tensor executor requires the configured checkpoint policy")
     if loaded.tokenizer is None or loaded.model is None:
         raise ExecutionError("local Qwen handle is closed")
-
-    encoded = loaded.tokenizer(record.attack_text, return_tensors="pt", add_special_tokens=True)
-    token_ids = _input_ids(encoded)
-    if not isinstance(token_ids, torch.Tensor):
-        raise ExecutionError("local tensor executor tokenizer returned invalid token IDs")
+    if not isinstance(record, V2BenchmarkExample):
+        raise ExecutionError("local tensor executor requires annotated v2 manifest records")
     device = _embedding_device(loaded.model)
-    token_ids = token_ids.to(device=device, dtype=torch.long)
-    z_ids, u_ids = _initial_editable_token_ids(token_ids, settings)
+    try:
+        prompt = tokenize_editable_prompt(
+            record.attack_text,
+            record.editable_spans,
+            loaded.tokenizer,
+            settings.tokenizer_revision,
+        )
+        answer_anchor_ids = tokenize_anchor_set(loaded.tokenizer, settings.answer_anchors)
+        refusal_anchor_ids = tokenize_anchor_set(loaded.tokenizer, settings.refusal_anchors)
+    except ValueError as error:
+        raise ExecutionError("local tensor executor could not build the annotated prompt contract") from error
+    z_ids = _initial_prefix_token_ids(loaded.tokenizer, settings, device)
+    u_ids = prompt.gather_editable_ids().to(device=device, dtype=torch.long)
     objective = TransformerAttackObjective(
         loaded.model,
-        frozen_prompt_token_ids=token_ids,
-        answer_token_ids=_anchor_token_ids(loaded.tokenizer, settings.answer_anchors, device),
-        refusal_token_ids=_anchor_token_ids(loaded.tokenizer, settings.refusal_anchors, device),
+        prompt=prompt,
+        answer_anchor_ids=answer_anchor_ids,
+        refusal_anchor_ids=refusal_anchor_ids,
         epsilon=settings.epsilon,
         lambda_fol=settings.lambda_fol,
         gamma_z=settings.gamma_z,
         gamma_u=settings.gamma_u,
     )
     embedding = _vocabulary_embeddings(loaded.model)
-    prompt_tokens = _token_count(token_ids)
+    prompt_tokens = _token_count(prompt.base_token_ids)
     if method == "random_mutation":
         return _random_mutation_snapshots(
             objective=objective,
-            initial_state=objective.build_editable_state(z_ids, u_ids),
+            initial_state=objective.build_editable_state(z_ids),
             settings=settings,
             seed=job.random_seed,
             prompt_tokens=prompt_tokens,
+            prompt=prompt,
+            record=record,
         )
     optimizer = (
-        _baseline_optimizer(method, settings, embedding)
+        _baseline_optimizer(method, settings, embedding, z_ids, u_ids)
         if method in {"pez", "gbda", "gcg"}
         else _tensor_optimizer(method, settings)
     )
@@ -517,7 +552,7 @@ def _run_local_qwen_tensor(
                 candidates_accepted=getattr(snapshot, "candidates_accepted", 0),
                 prompt_tokens=prompt_tokens,
             ),
-            state=_checkpoint_state(snapshot),
+            state=_checkpoint_state(snapshot, prompt, record),
         )
         for snapshot in snapshots
     ]
@@ -584,14 +619,16 @@ def _prepare_execution(request: ExecutionRequest) -> _PreparedExecution:
     if not all(isinstance(value, str) and value for value in (config_hash, run_id, git_revision)):
         raise ExecutionError("run manifest has incomplete identity")
 
-    manifest_root = request.output_root / "manifests"
+    is_v2 = request.schema_version == "reviewer_eval.v2"
+    manifest_root = request.output_root / "manifests" / "v2" if is_v2 else request.output_root / "manifests"
     header = ManifestHeader.model_validate(
         _load_json_object(manifest_root / f"controlled_{request.source}.header.json", label="manifest header")
     )
     if header.schema_version != request.schema_version or header.config_hash != config_hash:
         raise ExecutionError("locked manifest identity does not match the run")
     try:
-        rows = tuple(BenchmarkExample.model_validate(row) for row in read_jsonl(manifest_root / f"controlled_{request.source}.jsonl"))
+        record_type = V2BenchmarkExample if is_v2 else BenchmarkExample
+        rows = tuple(record_type.model_validate(row) for row in read_jsonl(manifest_root / f"controlled_{request.source}.jsonl"))
     except (TypeError, ValueError) as error:
         raise ExecutionError("manifest records are invalid") from error
     payloads = [row.model_dump(mode="json") for row in rows]
