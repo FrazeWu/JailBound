@@ -552,6 +552,7 @@ def test_openai_transport_pins_revision_seed_and_json_schema() -> None:
     assert completions.kwargs is not None
     assert completions.kwargs["model"] == "annotator-revision-7"
     assert completions.kwargs["seed"] == 20260725
+    assert completions.kwargs["max_tokens"] == 512
     response_format = completions.kwargs["response_format"]
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["strict"] is True
@@ -573,6 +574,25 @@ def test_openai_transport_rejects_mismatched_returned_model() -> None:
     )
 
     with pytest.raises(CalibrationError, match="returned model identity"):
+        transport.complete(
+            ({"role": "user", "content": "payload"},), temperature=0.0
+        )
+
+
+def test_openai_transport_converts_request_errors_to_annotation_errors() -> None:
+    class FailingCompletions:
+        def create(self, **kwargs: object) -> object:
+            raise RuntimeError("context length exceeded")
+
+    transport = OpenAIAnnotationTransport.__new__(OpenAIAnnotationTransport)
+    transport.model = "annotator-family"
+    transport.revision = "annotator-revision-7"
+    transport._seed = 20260725
+    transport._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FailingCompletions())
+    )
+
+    with pytest.raises(SpanAnnotationError, match="transport request failed"):
         transport.complete(
             ({"role": "user", "content": "payload"},), temperature=0.0
         )

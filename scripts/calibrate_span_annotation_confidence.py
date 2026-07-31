@@ -465,14 +465,19 @@ class OpenAIAnnotationTransport(AnnotationTransport):
         *,
         temperature: float,
     ) -> str:
-        response = self._client.chat.completions.create(
-            model=self.revision,
-            messages=[dict(message) for message in messages],
-            temperature=temperature,
-            max_tokens=2048,
-            seed=self._seed,
-            response_format=_ANNOTATION_RESPONSE_FORMAT,
-        )
+        try:
+            response = self._client.chat.completions.create(
+                model=self.revision,
+                messages=[dict(message) for message in messages],
+                temperature=temperature,
+                max_tokens=512,
+                seed=self._seed,
+                response_format=_ANNOTATION_RESPONSE_FORMAT,
+            )
+        except Exception as error:
+            raise SpanAnnotationError(
+                f"annotation transport request failed: {error}"
+            ) from error
         if getattr(response, "model", None) != self.revision:
             raise CalibrationError(
                 "annotation transport returned model identity different from the "
