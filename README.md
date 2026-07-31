@@ -1,90 +1,151 @@
 # JailBound
 
-## Overview
+JailBound is an implementation of FOL-guided adversarial prompt optimization
+and language-model safety evaluation. It combines continuous prompt search,
+semantic-preserving materialization, target-model generation, safety judging,
+and aggregate analysis in one reproducible workflow.
 
-This repository contains the implementation of a modular evaluation and
-optimization workflow for studying language-model safety behavior. It includes
-dataset adapters, prompt construction, optimization routines, model and judge
-interfaces, benchmark runners, and unit tests. The public tree is an
-implementation review artifact: it contains code and configuration templates,
-but no datasets, trained weights, experimental outputs, figures, or paper
-materials.
+## Method
 
-## Architecture
+JailBound starts from a structured prompt and optimizes a continuous prompt
+state against a differentiable surrogate objective. The workflow records both
+the zero-order loss (ZOL) and first-order loss (FOL), then follows two
+complementary search directions:
 
-The code is organized around a small set of independently usable modules:
+- `jailbound_o_minus` is the high-value branch, which searches toward stronger
+  objective values.
+- `jailbound_o_plus` is the safety-sensitivity branch, which searches regions
+  near the model's local safety boundary.
 
-- `src/generator/` builds structured prompts and prepares data records.
-- `src/optimizer/` implements search, candidate selection, and optimization
-  utilities.
-- `src/models/` and `src/materialization/` provide model-loading adapters.
-- `src/judge/` and `src/metrics/` evaluate generated responses and aggregate
-  metrics.
-- `src/benchmark/` contains baseline, ablation, transfer, and reviewer-facing
-  benchmark orchestration.
-- `src/defense/`, `src/embedding/`, and `src/objectives/` hold supporting
-  training and representation-level components.
-- `scripts/` exposes command-line entrypoints for the corresponding workflows.
+The optimized state is projected back to discrete text under a calibrated
+semantic-preservation constraint. The materialized prompt is then evaluated on
+the target model and scored by the configured safety judge. The implementation
+also supports same-state continuous-versus-materialized ablations for measuring
+intent preservation and materialization fidelity.
+
+## Evaluation Coverage
+
+The focused evaluation uses three complementary sources:
+
+| Source | Role |
+| --- | --- |
+| HarmBench | Established behavior-level safety benchmark |
+| JailBound | Structured prompts organized by risk, domain, and attack type |
+| S-Eval | Additional safety-evaluation prompts |
+
+The current comparison workflow includes the initial prompt, random mutation,
+ZOL-only optimization, PEZ, GCG, GBDA (including the official-adapter path),
+and the JailBound O- and O+ branches. Additional dataset adapters remain in the
+repository for compatibility with earlier experiments.
 
 ## Repository Layout
 
 ```text
 .
-├── configs/       # Sanitized configuration templates
-├── docs/release/  # Publication scope and configuration notes
-├── scripts/       # Workflow entrypoints and data-preparation utilities
-├── src/           # Python implementation packages
-├── tests/         # Unit and integration test sources
-└── pyproject.toml # Package and test metadata
+|-- configs/                         # Experiment configuration files
+|-- scripts/                         # Workflow and analysis entrypoints
+|-- src/benchmark/safety_eval/       # Evaluation pipeline and optimizers
+|-- src/generator/                   # Structured prompt construction
+|-- src/materialization/             # Continuous-to-discrete projection
+|-- src/judge/ and src/metrics/      # Safety judging and aggregation
+|-- tests/                           # Unit and integration tests
+`-- additional_experimental_results.md
 ```
+
+Supporting and legacy packages remain under `src/` for compatibility. The
+defense modules are not part of the current JailBound evaluation scope.
 
 ## Installation
 
-Use Python 3.11. Create an isolated environment and install the project with
-its test dependencies:
+JailBound requires Python 3.11 and uses `uv` for dependency management:
 
 ```bash
 uv sync --extra test
 ```
 
-Many optional modules require machine-learning libraries and locally available
-model weights. Install those dependencies in the environment used for the
-specific workflow; they are intentionally not bundled with this artifact.
+The Python environment includes the declared machine-learning dependencies.
+Model weights, datasets, GPU drivers, and inference services are not bundled
+with the repository and must be provided locally.
 
 ## Configuration
 
-The templates in `configs/benchmark/` use relative data and output paths.
-Code that contacts an OpenAI-compatible service reads these variables when an
-endpoint is required:
+Experiment configuration files are under `configs/benchmark/`. Before running
+an experiment, review the selected file and replace dataset paths, model paths,
+output locations, and judge endpoints with values valid for the local system.
+OpenAI-compatible services use the following environment variables where
+required:
 
 ```bash
 export BENCHMARK_API_BASE_URL="http://localhost:8000/v1"
 export BENCHMARK_API_KEY="replace-with-local-credential"
 ```
 
-No endpoint, credential, model directory, or dataset path is supplied by this
-repository. See `docs/release/CONFIGURATION.md` for the conventions used by
-the retained code.
+See [Configuration Conventions](docs/release/CONFIGURATION.md) for the retained
+configuration rules.
 
-## Running Checks
+## Quick Start
 
-The self-contained review-artifact tests do not require model weights or a
-network service:
+Run the self-contained checks without model weights or a network service:
 
 ```bash
 uv run pytest tests/review_artifact -q
 ```
 
-Other test modules exercise optional integrations. Run them only after
-providing the relevant dependencies, local input files, and configuration.
+Validate a configured evaluation and inspect one bounded cell without executing
+model inference:
+
+```bash
+CONFIG=configs/benchmark/safety_eval_gbda_official.yaml
+
+uv run python scripts/run_safety_eval.py validate --config "$CONFIG"
+uv run python scripts/run_safety_eval.py run-smoke \
+  --config "$CONFIG" \
+  --source harmbench \
+  --method jailbound_o_plus \
+  --limit 1 \
+  --dry-run
+```
+
+After local data, models, and judges are configured, a single source-method cell
+can be run through optimization, materialization, target evaluation, and
+analysis:
+
+```bash
+uv run python scripts/run_safety_eval.py optimize \
+  --config "$CONFIG" --source harmbench --method jailbound_o_plus
+
+uv run python scripts/run_safety_eval.py materialize \
+  --config "$CONFIG" --final-only
+
+uv run python scripts/run_safety_eval.py run-target \
+  --config "$CONFIG" --target qwen2_5_7b \
+  --source harmbench --method jailbound_o_plus
+
+uv run python scripts/run_safety_eval.py analyze --config "$CONFIG"
+```
+
+Use `scripts/run_safety_eval_matrix.py` for resumable source-method matrix
+execution. Run each command with `--help` for its complete argument list.
+
+## Results
+
+Aggregate baseline, human-evaluation, behavioral flip-rate, and controlled
+evaluation tables are available in
+[Additional Experimental Results](additional_experimental_results.md). Raw
+model responses and prompt records are intentionally not published.
 
 ## Publication Scope
 
-The public repository excludes all local datasets, generated samples,
-checkpoints, cached downloads, experiment outputs, logs, figures, plotting
-sources, paper files, and archive files. These items may remain in a local
-working directory but are ignored by Git. The code therefore documents the
-workflow and interfaces without making claims about unavailable experimental
-material.
+The repository contains implementation code, experiment configurations, tests,
+and content-free aggregate result tables. It excludes source datasets, model
+weights, generated prompt and response records, checkpoints, runtime logs,
+figures, and paper source files. Reproducing the full workflow therefore
+requires independently obtained data, models, compute resources, and local
+services.
 
-See `docs/release/PUBLICATION_SCOPE.md` for the exact release boundary.
+See [Publication Scope](docs/release/PUBLICATION_SCOPE.md) for the detailed
+release boundary.
+
+## License
+
+JailBound is released under the [Apache License 2.0](LICENSE).
