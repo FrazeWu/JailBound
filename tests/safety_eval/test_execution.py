@@ -108,6 +108,8 @@ def _request(tmp_path: Path) -> ExecutionRequest:
 
 def _v2_request(tmp_path: Path) -> ExecutionRequest:
     request = _request(tmp_path)
+    for path in (request.output_root / "manifests").glob("controlled_fixture.*"):
+        path.unlink()
     write_v2_controlled_manifest(
         request.output_root,
         "fixture",

@@ -47,6 +47,25 @@ _TOKENIZER_ASSET_NAMES = frozenset(
 _SNAPSHOT_METADATA_DIRECTORIES = frozenset({".cache", ".git", "__pycache__"})
 
 
+def validate_v2_output_root(output_root: str | Path) -> None:
+    """Reject legacy artifacts before a reviewer-v2 stage touches an output root."""
+    root = Path(output_root)
+    manifests = root / "manifests"
+    legacy = tuple(manifests.glob("controlled_*.jsonl")) + tuple(
+        manifests.glob("controlled_*.header.json")
+    )
+    if legacy:
+        raise PreflightError("schema-v1 artifact exists in reviewer-v2 output root")
+    for path in (root / "optimization").glob("*/*/records.jsonl") if (root / "optimization").exists() else ():
+        try:
+            first = next(iter(path.open(encoding="utf-8"))).strip()
+            payload = json.loads(first) if first else {}
+        except (OSError, StopIteration, json.JSONDecodeError):
+            raise PreflightError("invalid optimization artifact in reviewer-v2 output root")
+        if payload.get("schema_version") != "reviewer_eval.v2":
+            raise PreflightError("schema-v1 artifact exists in reviewer-v2 output root")
+
+
 def validate_model_assets(path: str | Path) -> ResolvedModel:
     root = Path(path)
     config = root / "config.json"

@@ -21,7 +21,7 @@ from .optimizers.jailbound import DualBranchOptimizer, InitOptimizer, build_jail
 from .optimizers.pez import PEZOptimizer
 from .optimizers.random_mutation import RandomMutationOptimizer
 from .objective import EditableState
-from .runtime import ResolvedModel, validate_model_assets
+from .runtime import ResolvedModel, validate_model_assets, validate_v2_output_root
 from .runner import OptimizationJob, OptimizationRunner, OptimizationSnapshot
 from .prompt_contract import tokenize_editable_prompt
 from .schema import (
@@ -604,6 +604,8 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
 
 
 def _prepare_execution(request: ExecutionRequest) -> _PreparedExecution:
+    if request.schema_version == "reviewer_eval.v2":
+        validate_v2_output_root(request.output_root)
     if request.requested_limit < 1:
         raise ExecutionError("requested limit must be positive")
     if request.shard_count < 1:

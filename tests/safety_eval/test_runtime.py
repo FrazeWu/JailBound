@@ -258,3 +258,14 @@ def test_lock_runtime_config_is_byte_identical_across_process_cwds(
 
     for name in ("locked_config.json", "run_manifest.json"):
         assert (first_root / name).read_bytes() == (second_root / name).read_bytes()
+
+
+def test_v2_runtime_rejects_legacy_manifest_artifacts(tmp_path: Path) -> None:
+    from benchmark.safety_eval.runtime import validate_v2_output_root
+
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    (manifests / "controlled_fixture.jsonl").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(PreflightError, match="schema-v1 artifact"):
+        validate_v2_output_root(tmp_path)
