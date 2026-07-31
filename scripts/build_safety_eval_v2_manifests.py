@@ -16,6 +16,11 @@ import sys
 import tempfile
 from typing import Any, NamedTuple
 
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
 from benchmark.safety_eval.config import (
     AnnotationConfig,
     load_v2_config,
@@ -51,7 +56,6 @@ if str(SCRIPTS_DIR) not in sys.path:
 from calibrate_span_annotation_confidence import OpenAIAnnotationTransport  # noqa: E402
 
 
-ROOT = Path(__file__).resolve().parents[1]
 APPROVED_ARTIFACT_VERSION = "span_annotation_confidence.v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
