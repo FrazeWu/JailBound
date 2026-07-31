@@ -104,6 +104,11 @@ def test_v2_smoke_mode_requires_an_isolated_one_sample_output(tmp_path: Path) ->
     with pytest.raises(ValueError, match="smoke output root"):
         load_v2_config(_write_v2_config(tmp_path, payload))
 
+    payload["run"]["output_root"] = "outputs/results/smoke/one-sample"
+    payload["optimization"]["methods"] = ["dual_branch"]
+    with pytest.raises(ValueError, match="does not support dual_branch"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
 
 @pytest.mark.parametrize(
     ("path", "value", "message"),

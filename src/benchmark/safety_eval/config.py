@@ -416,6 +416,8 @@ class V2ExperimentConfig(StrictModel):
                 raise ValueError(
                     "smoke mode requires exactly one source, sample, and method"
                 )
+            if self.optimization.methods[0] == "dual_branch":
+                raise ValueError("smoke mode does not support dual_branch")
             return self
         _validate_approved_scope(
             data=self.data,
