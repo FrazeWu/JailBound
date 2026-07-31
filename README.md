@@ -88,3 +88,27 @@ workflow and interfaces without making claims about unavailable experimental
 material.
 
 See `docs/release/PUBLICATION_SCOPE.md` for the exact release boundary.
+
+## Reviewer Eval V2
+
+The paper-aligned safety-evaluation path is isolated under
+`src/benchmark/safety_eval/`. It consumes only immutable
+`reviewer_eval.v2` manifests with offline-annotated editable spans. The
+optimized input contract is:
+
+```text
+e = [z; U]
+H(e) = [z; Phi_tilde(p; U)]
+FOL(e) = epsilon * ||grad_(z,U) L_atk(e)||_2
+```
+
+`U` replaces only manifest-annotated prompt token positions; all frozen
+positions are checked during materialization. Answer and refusal anchors are
+scored as complete teacher-forced continuations. Dual JailBound optimization
+keeps per-step O-minus/O-plus candidate pools, then deterministically selects
+the best final state per branch.
+
+Materialization projects both `z` and `U`, rebuilds the prompt in place, and
+decodes the complete token sequence once. Text and embedding transport are
+recorded and aggregated separately. Legacy `reviewer_eval.v1` artifacts are
+not auto-upgraded and are rejected by v2 execution roots.
