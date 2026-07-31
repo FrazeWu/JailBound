@@ -33,6 +33,9 @@ def test_tensor_recovery_sdpa_method_resolves_to_o_plus() -> None:
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_eager_retry") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_checkpointed") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_rebalanced") == "jailbound_o_plus"
+    assert tensor_method_for_recovery("jailbound_o_plus_recovery_cpu_offload") == "jailbound_o_plus"
+    assert tensor_method_for_recovery("jailbound_o_plus_recovery_two_gpu") == "jailbound_o_plus"
+    assert tensor_method_for_recovery("jailbound_o_plus_recovery_two_gpu_checkpointed") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_fd") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_fd_sdpa") == "jailbound_o_plus"
 from benchmark.safety_eval.io import read_jsonl
@@ -524,6 +527,46 @@ def test_two_gpu_recovery_map_splits_transformer_layers_evenly(tmp_path: Path) -
     assert mapping["model.layers.27"] == "cpu"
 
 
+def test_h1_v2_cpu_offload_recovery_map_keeps_edge_layers_on_visible_gpu(monkeypatch, tmp_path: Path) -> None:
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run_h1_v2_candidate_optimization.py"
+    monkeypatch.syspath_prepend(str(script_path.parent))
+    spec = importlib.util.spec_from_file_location("h1_v2_candidate_optimization", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 28}), encoding="utf-8")
+
+    mapping = module._cpu_offload_recovery_device_map(tmp_path)
+
+    assert sum(key.startswith("model.layers.") and value == 0 for key, value in mapping.items()) == 14
+    assert sum(key.startswith("model.layers.") and value == "cpu" for key, value in mapping.items()) == 14
+    assert mapping["model.embed_tokens"] == 0
+    assert mapping["model.layers.6"] == 0
+    assert mapping["model.layers.7"] == "cpu"
+    assert mapping["model.layers.20"] == "cpu"
+    assert mapping["model.layers.21"] == 0
+    assert mapping["model.norm"] == 0
+    assert mapping["lm_head"] == 0
+
+
+def test_h1_v2_baseline_shards_are_disjoint_and_cover_sorted_ids(monkeypatch) -> None:
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run_h1_v2_baseline_generation.py"
+    monkeypatch.syspath_prepend(str(script_path.parent))
+    spec = importlib.util.spec_from_file_location("h1_v2_baseline_generation", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    ids = ("source:c", "source:a", "source:b", "source:d", "source:e")
+    first = module._select_shard_ids(ids, shard_index=0, shard_count=2)
+    second = module._select_shard_ids(ids, shard_index=1, shard_count=2)
+
+    assert first == ("source:a", "source:c", "source:e")
+    assert second == ("source:b", "source:d")
+    assert set(first).isdisjoint(second)
+
+
 def test_smoke_closes_loaded_local_qwen_handle_after_runner_writes_records(tmp_path: Path) -> None:
     request = _request(tmp_path)
     model = _FakeModel()
@@ -553,9 +596,19 @@ def test_smoke_closes_loaded_local_qwen_handle_after_runner_writes_records(tmp_p
 
 
 class _TensorTokenizer:
-    def __call__(self, _: str, *, return_tensors: str, add_special_tokens: bool) -> dict[str, torch.Tensor]:
+    def __call__(
+        self,
+        _: str,
+        *,
+        return_tensors: str,
+        add_special_tokens: bool,
+        max_length: int | None = None,
+        truncation: bool = False,
+    ) -> dict[str, torch.Tensor]:
         assert return_tensors == "pt"
         assert add_special_tokens is True
+        assert max_length in {None, 256}
+        assert truncation is (max_length == 256)
         return {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
 
     def encode(self, value: str, *, add_special_tokens: bool) -> list[int]:
@@ -680,9 +733,10 @@ def test_tensor_smoke_supports_budgeted_random_mutation_without_text_output() ->
     assert all(snapshot.representation == "tensor_embeddings:random_mutation" for snapshot in snapshots)
 
 
-@pytest.mark.parametrize("method", ["pez", "gbda", "gcg"])
+@pytest.mark.parametrize("method", ["pez", "gbda", "gbda_official", "gcg"])
 def test_tensor_smoke_dispatches_discrete_and_continuous_baselines(method: str) -> None:
-    executor = build_local_qwen_tensor_executor(_tensor_settings())
+    settings = replace(_tensor_settings(), candidate_cap=120)
+    executor = build_local_qwen_tensor_executor(settings)
     handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
 
     snapshots = list(executor(handle, _example(1), OptimizationJob("fixture", method, "cell:fixture", "fixture:001", 1), (0, 1, 2)))
@@ -691,6 +745,37 @@ def test_tensor_smoke_dispatches_discrete_and_continuous_baselines(method: str) 
     assert {snapshot.representation for snapshot in snapshots} == {f"tensor_embeddings:{method}"}
     assert all(snapshot.attack_loss is not None for snapshot in snapshots)
     assert all(snapshot.fol is None for snapshot in snapshots)
+
+
+def test_official_gbda_uses_the_upstream_256_token_input_limit() -> None:
+    calls: list[dict[str, object]] = []
+
+    class RecordingTokenizer(_TensorTokenizer):
+        def __call__(self, value: str, **kwargs: object) -> dict[str, torch.Tensor]:
+            calls.append(dict(kwargs))
+            return {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
+
+    settings = replace(_tensor_settings(), candidate_cap=120)
+    executor = build_local_qwen_tensor_executor(settings)
+    handle = LocalQwenHandle(tokenizer=RecordingTokenizer(), model=_TinyTensorCausalModel())
+
+    list(
+        executor(
+            handle,
+            _example(1),
+            OptimizationJob("fixture", "gbda_official", "cell:fixture", "fixture:001", 1),
+            (0, 1, 2),
+        )
+    )
+
+    assert calls == [
+        {
+            "return_tensors": "pt",
+            "add_special_tokens": True,
+            "max_length": 256,
+            "truncation": True,
+        }
+    ]
 
 
 def test_tensor_smoke_dispatches_dual_branch_and_rejects_unknown_method() -> None:

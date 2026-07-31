@@ -11,10 +11,12 @@ from benchmark.safety_eval.fol_boundary import (
     InterpolationPoint,
     LabeledEditableState,
     behavior_flip_rate,
+    fit_right_censored_cox,
     exact_permutation_mean_difference,
     has_minimum_valid_paths,
     interpolate_joint_states,
     random_joint_direction,
+    select_primary_behavioral_radius,
     select_nearest_opposite_label_pairs,
     select_base_radius,
     split_fol_bands,
@@ -63,6 +65,31 @@ def test_select_base_radius_requires_each_source_to_meet_its_acceptance_floor() 
     ) is None
 
 
+def test_select_primary_behavioral_radius_requires_semantic_acceptance_and_targets_local_flips() -> None:
+    acceptance = {
+        0.1: [True] * 10,
+        0.2: [True] * 10,
+        0.4: [True] * 7 + [False] * 3,
+        0.8: [True] * 10,
+    }
+    primary_bfr = {0.1: 0.05, 0.2: 0.30, 0.4: 0.40, 0.8: 0.70}
+
+    assert select_primary_behavioral_radius(
+        acceptance,
+        primary_bfr,
+        target_lower=0.2,
+        target_upper=0.5,
+        minimum_semantic_rate=0.8,
+    ) == pytest.approx(0.2)
+    assert select_primary_behavioral_radius(
+        acceptance,
+        {radius: 0.05 for radius in acceptance},
+        target_lower=0.2,
+        target_upper=0.5,
+        minimum_semantic_rate=0.8,
+    ) is None
+
+
 def test_split_fol_bands_is_deterministic_and_enforces_disjoint_7_3_7_ids() -> None:
     values = [FolValue(sample_id=f"sample:{index:02d}", fol=float(index)) for index in range(45)]
 
@@ -97,6 +124,19 @@ def test_exact_permutation_mean_difference_uses_two_sided_label_permutations() -
     assert pvalue == pytest.approx(2 / 6)
 
 
+def test_right_censored_cox_recovers_positive_hazard_for_higher_covariates() -> None:
+    estimate = fit_right_censored_cox(
+        covariates=[-1.0, -0.5, 0.5, 1.0],
+        times=[4.0, 3.0, 2.0, 1.0],
+        events=[False, True, True, True],
+    )
+
+    assert estimate.event_count == 3
+    assert estimate.log_hazard_ratio > 0.0
+    assert estimate.hazard_ratio > 1.0
+    assert 0.0 <= estimate.pvalue <= 1.0
+
+
 def test_fol_bfr_summary_excludes_sparse_prompt_direction_sets() -> None:
     rows = [
         FolPerturbationOutcome("source", "sample:one", "low", 0.1, True, True, False, False, False),
@@ -118,6 +158,20 @@ def test_fol_bfr_summary_excludes_sparse_prompt_direction_sets() -> None:
     assert primary.accepted_direction_count == 7
     assert primary.mean_bfr == pytest.approx(0.5)
     assert secondary.mean_bfr == pytest.approx(0.0)
+
+
+def test_fol_bfr_summary_omits_secondary_when_only_primary_labels_exist() -> None:
+    rows = [
+        FolPerturbationOutcome("source", "sample:one", "high", 0.2, True, True, False, None, None),
+        FolPerturbationOutcome("source", "sample:one", "high", 0.2, True, False, False, None, None),
+        FolPerturbationOutcome("source", "sample:one", "high", 0.2, True, True, False, None, None),
+        FolPerturbationOutcome("source", "sample:one", "high", 0.2, True, False, False, None, None),
+    ]
+
+    summaries = summarize_fol_bfr(rows, minimum_accepted=4)
+
+    assert [summary.judge_key for summary in summaries] == ["primary"]
+    assert summaries[0].mean_bfr == pytest.approx(0.5)
 
 
 def test_interpolate_joint_states_has_21_inclusive_linear_points() -> None:

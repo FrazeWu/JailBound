@@ -32,6 +32,13 @@ from benchmark.safety_eval.transformer_objective import TransformerAttackObjecti
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def resolve_fol_roots(
+    default_state_root: Path, state_root: Path | None, output_root: Path | None
+) -> tuple[Path, Path]:
+    """Resolve immutable optimizer-state and mutable result roots independently."""
+    return state_root or default_state_root, output_root or state_root or default_state_root
+
+
 def _semantic_threshold(root: Path) -> float:
     payload = json.loads((root.parent / "manifests" / "semantic_calibration.json").read_text(encoding="utf-8"))
     value = payload.get("threshold")
@@ -79,16 +86,17 @@ def _primary_labels(root: Path, *, source: str, target_key: str, judge_key: str,
 
 
 def _candidate_states(
-    root: Path,
+    state_root: Path,
+    output_root: Path,
     *,
     source: str,
     target_key: str,
     judge_key: str,
     threshold: float,
 ) -> tuple[dict[str, dict[str, object]], tuple[LabeledEditableState, ...]]:
-    examples, optimized = _records(root, source)
-    labels = _primary_labels(root, source=source, target_key=target_key, judge_key=judge_key, threshold=threshold)
-    metadata = [row for row in read_jsonl(root / "selected_perturbations.jsonl") if row.get("source") == source]
+    examples, optimized = _records(state_root, source)
+    labels = _primary_labels(output_root, source=source, target_key=target_key, judge_key=judge_key, threshold=threshold)
+    metadata = [row for row in read_jsonl(output_root / "selected_perturbations.jsonl") if row.get("source") == source]
     states: dict[str, dict[str, object]] = {}
     selection: list[LabeledEditableState] = []
     for row in metadata:
@@ -194,19 +202,29 @@ def _state_metrics(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--state-fol-root", type=Path)
+    parser.add_argument("--output-fol-root", type=Path)
+    parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument("--two-gpu", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
-    root = ROOT / config.run.output_root / "fol_boundary"
+    default_state_root = ROOT / config.run.output_root / "fol_boundary"
+    state_root, output_root = resolve_fol_roots(
+        default_state_root,
+        (ROOT / args.state_fol_root) if args.state_fol_root is not None and not args.state_fol_root.is_absolute() else args.state_fol_root,
+        (ROOT / args.output_fol_root) if args.output_fol_root is not None and not args.output_fol_root.is_absolute() else args.output_fol_root,
+    )
     model_path = config.models.surrogate.local_path
     if model_path is None:
         raise ValueError("FOL interpolation requires the local model")
-    run_id, config_hash = _run_identity(root)
+    run_id, config_hash = _run_identity(state_root)
     sources = tuple(config.fol.sources)
     all_states: dict[str, dict[str, object]] = {}
     candidates: list[LabeledEditableState] = []
     for source in sources:
         states, source_candidates = _candidate_states(
-            root,
+            state_root,
+            output_root,
             source=source,
             target_key=config.models.targets[0].key,
             judge_key=config.judging.primary.key,
@@ -215,9 +233,13 @@ def main() -> int:
         all_states.update(states)
         candidates.extend(source_candidates)
     pairs = select_nearest_opposite_label_pairs(candidates)
-    threshold = _semantic_threshold(root)
+    threshold = _semantic_threshold(state_root)
     resolved = validate_model_assets(model_path)
-    handle = load_local_qwen(resolved)
+    handle = load_local_qwen(
+        resolved,
+        activation_checkpointing=args.activation_checkpointing,
+        device_map="balanced" if args.two_gpu else "auto",
+    )
     try:
         if handle.model is None or handle.tokenizer is None:
             raise ValueError("local FOL interpolation model did not load")
@@ -288,10 +310,10 @@ def main() -> int:
                     "fol": fol,
                     "curvature": curvature,
                 })
-        atomic_write_jsonl(root / "interpolation_points.jsonl", sorted(point_rows, key=lambda row: (str(row["path_id"]), int(row["point_index"]))))
-        materialized = write_stage_records(root, stage="interpolation_materialization", rows=materializations)
+        atomic_write_jsonl(output_root / "interpolation_points.jsonl", sorted(point_rows, key=lambda row: (str(row["path_id"]), int(row["point_index"]))))
+        materialized = write_stage_records(output_root, stage="interpolation_materialization", rows=materializations)
         generated = generate_materialized_records(
-            root, materializations, model=handle.model, tokenizer=handle.tokenizer,
+            output_root, materializations, model=handle.model, tokenizer=handle.tokenizer,
             target_key=config.models.targets[0].key, target_revision=resolved.revision,
             max_new_tokens=config.judging.max_new_tokens,
         )

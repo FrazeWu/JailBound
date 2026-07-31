@@ -15,6 +15,7 @@ from benchmark.safety_eval.generation import embedding_state_hash, generate_from
 from benchmark.safety_eval.io import JsonlLedger
 from benchmark.safety_eval.runtime import validate_model_assets
 from benchmark.safety_eval.schema import FailureKind, RecordStatus, ResponseRecord
+from benchmark.safety_eval.fol_runtime import select_id_shard
 
 from run_fol_embedding_generation import ROOT, _full_embedding_input, _resolve_root
 from run_fol_generation import _accepted_metadata, _final_records, _perturbed_payload
@@ -27,6 +28,8 @@ def main() -> int:
     parser.add_argument("--input-fol-root", type=Path)
     parser.add_argument("--output-fol-root", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     args = parser.parse_args()
     if args.batch_size < 1:
         raise ValueError("batch size must be positive")
@@ -67,7 +70,9 @@ def main() -> int:
             raise ValueError("local FOL target did not load")
         examples, optimized = _final_records(input_root, args.source)
         embedding_weight = handle.model.get_input_embeddings().weight.detach()
-        for source_sample_id in sorted(grouped):
+        for source_sample_id in select_id_shard(
+            tuple(grouped), shard_index=args.shard_index, shard_count=args.shard_count
+        ):
             pending = [
                 row for row in grouped[source_sample_id]
                 if not response_ledger.contains_key({"sample_id": row["perturbation_id"], "checkpoint": 0})

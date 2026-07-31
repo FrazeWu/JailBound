@@ -39,7 +39,7 @@ from benchmark.safety_eval.semantic import QwenHiddenMeanEncoder
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _EXECUTABLE_TENSOR_METHODS = frozenset(
-    ("init", "random_mutation", "zol", "pez", "gbda", "gcg", "jailbound_o_minus", "jailbound_o_plus", "dual_branch")
+    ("init", "random_mutation", "zol", "pez", "gbda", "gbda_official", "gcg", "jailbound_o_minus", "jailbound_o_plus", "dual_branch")
 )
 
 

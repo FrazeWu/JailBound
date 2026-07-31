@@ -1,0 +1,19 @@
+source_root: outputs/results/reviewer_additions_n17_qwen7b_local_qwen32_compat_eager_randomfix
+output_root: outputs/results/reviewer_materialization_ablation_qwen7b_n17
+sources: [harmbench, jailbound, s_eval]
+expected_samples_per_source: 17
+checkpoint: 100
+
+branch_methods:
+  High-Value: jailbound_o_minus
+  Safety-Sensitivity: jailbound_o_plus
+
+model:
+  key: qwen2_5_7b
+  repo_id: Qwen/Qwen2.5-7B-Instruct
+  local_path: /home/wh/models/qwen/Qwen2___5-7B-Instruct
+  revision: local
+  hidden_size: 3584
+  attention_implementation: eager
+
+max_new_tokens: 512

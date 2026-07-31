@@ -94,6 +94,22 @@ def test_adapter_scores_batched_candidates_with_one_model_forward() -> None:
     assert model.calls[0][0].shape[:2] == (2, 4)
 
 
+def test_adapter_optimization_loss_matches_attack_loss_with_one_model_forward() -> None:
+    model = _TinyCausalModel()
+    adapter = _adapter(model)
+    state = adapter.build_editable_state(torch.tensor([[5], [6]]), torch.tensor([[6], [5]]))
+
+    expected = adapter.evaluate(state, include_fol=False).attack_loss.detach()
+    model.calls.clear()
+    actual = adapter.optimization_loss(state)
+
+    assert torch.allclose(actual, expected)
+    assert len(model.calls) == 1
+    gradients = torch.autograd.grad(actual, (state.z, state.u))
+    assert gradients[0].abs().sum() > 0
+    assert gradients[1].abs().sum() > 0
+
+
 def test_gcg_batches_transformer_candidates_and_records_actual_forward_count() -> None:
     model = _TinyCausalModel()
     adapter = _adapter(model)

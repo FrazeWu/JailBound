@@ -10,11 +10,21 @@ from typing import Any, Callable
 
 import pytest
 
-from benchmark.safety_eval.config import ExperimentConfig, load_config
+from benchmark.safety_eval.config import (
+    ExperimentConfig,
+    H1V2Config,
+    H1V3StudyConfig,
+    load_config,
+    load_h1_v2_config,
+    load_h1_v3_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs/benchmark/safety_eval_additions.yaml"
+GBDA_OFFICIAL_CONFIG = ROOT / "configs/benchmark/safety_eval_gbda_official.yaml"
+H1_V2_CONFIG = ROOT / "configs/benchmark/safety_eval_h1_v2.yaml"
+H1_V3_CONFIG = ROOT / "configs/benchmark/safety_eval_h1_v3.yaml"
 PYPROJECT = ROOT / "pyproject.toml"
 
 Mutation = Callable[[Any], Any]
@@ -69,6 +79,71 @@ def test_checked_in_config_has_approved_scope() -> None:
     assert config.models.surrogate.local_path == Path("/home/wh/models/qwen/Qwen2___5-7B-Instruct")
     assert config.fol.validation_per_source == 17
     assert (config.fol.low, config.fol.middle, config.fol.high) == (7, 3, 7)
+
+
+def test_official_gbda_config_is_isolated_and_preserves_the_controlled_scope() -> None:
+    base = load_config(CONFIG)
+    config = load_config(GBDA_OFFICIAL_CONFIG)
+
+    assert config.run.output_root.name == "reviewer_gbda_official_n17"
+    assert config.run.output_root != base.run.output_root
+    assert config.data == base.data
+    assert config.models == base.models
+    assert config.optimization.methods == [
+        "init",
+        "random_mutation",
+        "zol",
+        "pez",
+        "gbda",
+        "gbda_official",
+        "gcg",
+        "jailbound_o_minus",
+        "jailbound_o_plus",
+        "dual_branch",
+    ]
+
+
+def test_h1_v2_config_is_isolated_and_uses_the_frozen_confirmation_counts() -> None:
+    config = load_h1_v2_config(H1_V2_CONFIG)
+
+    assert config.h1_v2.output_root.name == "fol_h1_v2"
+    assert config.h1_v2.primary_judge_local_path == Path("/home/dasp/models/Octopus-SEval-14B")
+    assert config.h1_v2.candidate_count == 81
+    assert (config.h1_v2.low, config.h1_v2.middle, config.h1_v2.high) == (17, 3, 17)
+    assert config.h1_v2.accepted_directions == 32
+    assert config.h1_v2.output_root != config.base.run.output_root
+
+
+def test_h1_v2_config_rejects_non_prime_display_band_count() -> None:
+    payload = load_h1_v2_config(H1_V2_CONFIG).model_dump(mode="json")
+    payload["h1_v2"]["low"] = 15
+
+    with pytest.raises(ValueError, match="prime"):
+        H1V2Config.model_validate(payload)
+
+
+def test_h1_v3_config_isolated_to_the_new_local_radius_extension() -> None:
+    config = load_h1_v3_config(H1_V3_CONFIG)
+
+    assert config.h1_v3.output_root.name == "fol_h1_v3"
+    assert config.h1_v3.source_root.name == "fol_h1_v2"
+    assert config.h1_v3.source_root != config.h1_v3.output_root
+    assert config.h1_v3.radius_candidates == [0.4, 0.6]
+    assert config.h1_v3.accepted_directions == 32
+
+
+def test_h1_v3_rejects_nonlocal_or_h1_v2_output_roots() -> None:
+    payload = load_h1_v3_config(H1_V3_CONFIG).model_dump(mode="json")
+    payload["h1_v3"]["output_root"] = (
+        "outputs/results/reviewer_additions_n17_qwen7b_local_qwen32_compat_eager_randomfix/fol_h1_v2"
+    )
+    with pytest.raises(ValueError, match="fol_h1_v3"):
+        H1V3StudyConfig.model_validate(payload["h1_v3"])
+
+    payload = load_h1_v3_config(H1_V3_CONFIG).model_dump(mode="json")
+    payload["h1_v3"]["radius_candidates"] = [0.4]
+    with pytest.raises(ValueError, match="requires exactly"):
+        H1V3StudyConfig.model_validate(payload["h1_v3"])
 
 
 def test_config_rejects_non_matched_dual_budget() -> None:

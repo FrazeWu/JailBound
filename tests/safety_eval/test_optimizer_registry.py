@@ -15,6 +15,7 @@ APPROVED_METHODS = [
     "zol",
     "pez",
     "gbda",
+    "gbda_official",
     "gcg",
     "jailbound_o_minus",
     "jailbound_o_plus",

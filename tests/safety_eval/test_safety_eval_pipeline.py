@@ -275,6 +275,87 @@ def test_materialize_optimization_record_loads_the_saved_state_and_preserves_che
     assert record.seed_token_ids == (2,)
 
 
+def test_materialize_optimization_record_treats_negative_cosine_as_semantic_rejection(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.pt"
+    torch.save(
+        {
+            "z": torch.zeros((1, 1, 2)),
+            "u": torch.zeros((1, 1, 2)),
+            "z_token_ids": torch.tensor([[1]]),
+            "u_token_ids": torch.tensor([[2]]),
+        },
+        state_path,
+    )
+    optimization = OptimizationRecord.model_validate(
+        {
+            "schema_version": "reviewer_eval.v1",
+            "run_id": "run:fixture",
+            "config_hash": "a" * 64,
+            "git_revision": "fixture",
+            "cell_id": "cell:fixture",
+            "sample_id": "source_a:001",
+            "source": "source_a",
+            "method": "method_a",
+            "checkpoint": 100,
+            "random_seed": 7,
+            "status": "complete",
+            "failure_kind": None,
+            "failure_reason": None,
+            "state_path": str(state_path),
+            "representation": "fixture",
+            "attack_loss": None,
+            "fol": None,
+            "internal_margin": None,
+            "materialized_prompt": None,
+            "counters": {},
+        }
+    )
+    example = BenchmarkExample.model_validate(
+        {
+            "example_id": "source_a:001",
+            "source": "source_a",
+            "source_file": "fixture.jsonl",
+            "source_row": 1,
+            "source_sha256": "b" * 64,
+            "intent": "fixture intent",
+            "attack_text": "fixture request",
+            "target_text": None,
+            "source_risk_label": None,
+            "source_attack_label": "direct_request",
+            "risk_category": "category_a",
+            "threat_domain": "domain_a",
+            "attack_type": "direct_request",
+            "language": "en",
+            "selection_stratum": "category_a|direct_request",
+            "selection_seed": 7,
+            "prompt_sha256": "c" * 64,
+            "preprocessing": (),
+        }
+    )
+
+    class Tokenizer:
+        all_special_ids: list[int] = []
+
+        @staticmethod
+        def decode(ids: list[int], *, skip_special_tokens: bool) -> str:
+            assert skip_special_tokens is True
+            return {1: "prefix", 2: "suffix"}[ids[0]]
+
+    record = materialize_optimization_record(
+        optimization,
+        example=example,
+        vocabulary_embeddings=torch.eye(3, 2),
+        tokenizer=Tokenizer(),
+        semantic_similarity=lambda before, after: -0.25,
+        semantic_threshold=0.9,
+    )
+
+    assert record.status is RecordStatus.failed
+    assert record.failure_kind is FailureKind.semantic_filter
+    assert record.failure_reason == "below semantic threshold"
+    assert record.semantic_similarity_after == 0.0
+
+
 def test_materialize_records_from_disk_joins_only_the_immutable_matching_manifest(tmp_path: Path) -> None:
     manifest_root = tmp_path / "manifests"
     manifest_root.mkdir()

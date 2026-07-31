@@ -92,3 +92,47 @@ def test_resolved_terminal_payloads_accepts_eager_retry_after_failed_sdpa(tmp_pa
     resolved = resolved_terminal_payloads(tmp_path, "fixture")
 
     assert resolved["sample:failed"]["method"] == "jailbound_o_plus_recovery_eager_retry"
+
+
+def test_resolved_terminal_payloads_accepts_cpu_offload_recovery(tmp_path) -> None:
+    primary = tmp_path / "optimization" / "fixture" / "jailbound_o_plus" / "records.jsonl"
+    recovery = tmp_path / "optimization" / "fixture" / "jailbound_o_plus_recovery_cpu_offload" / "records.jsonl"
+    atomic_write_jsonl(primary, (_record("sample:failed", status="failed", method="jailbound_o_plus"),))
+    atomic_write_jsonl(
+        recovery,
+        (_record("sample:failed", status="complete", method="jailbound_o_plus_recovery_cpu_offload"),),
+    )
+
+    resolved = resolved_terminal_payloads(tmp_path, "fixture")
+
+    assert resolved["sample:failed"]["method"] == "jailbound_o_plus_recovery_cpu_offload"
+
+
+def test_resolved_terminal_payloads_accepts_two_gpu_recovery(tmp_path) -> None:
+    primary = tmp_path / "optimization" / "fixture" / "jailbound_o_plus" / "records.jsonl"
+    recovery = tmp_path / "optimization" / "fixture" / "jailbound_o_plus_recovery_two_gpu" / "records.jsonl"
+    atomic_write_jsonl(primary, (_record("sample:failed", status="failed", method="jailbound_o_plus"),))
+    atomic_write_jsonl(
+        recovery,
+        (_record("sample:failed", status="complete", method="jailbound_o_plus_recovery_two_gpu"),),
+    )
+
+    resolved = resolved_terminal_payloads(tmp_path, "fixture")
+
+    assert resolved["sample:failed"]["method"] == "jailbound_o_plus_recovery_two_gpu"
+
+
+def test_resolved_terminal_payloads_prefers_eager_over_checkpointed_duplicate_success(tmp_path) -> None:
+    primary = tmp_path / "optimization" / "fixture" / "jailbound_o_plus" / "records.jsonl"
+    eager = tmp_path / "optimization" / "fixture" / "jailbound_o_plus_recovery_eager" / "records.jsonl"
+    checkpointed = tmp_path / "optimization" / "fixture" / "jailbound_o_plus_recovery_checkpointed" / "records.jsonl"
+    atomic_write_jsonl(primary, (_record("sample:failed", status="failed", method="jailbound_o_plus"),))
+    atomic_write_jsonl(eager, (_record("sample:failed", status="complete", method="jailbound_o_plus_recovery_eager"),))
+    atomic_write_jsonl(
+        checkpointed,
+        (_record("sample:failed", status="complete", method="jailbound_o_plus_recovery_checkpointed"),),
+    )
+
+    resolved = resolved_terminal_payloads(tmp_path, "fixture")
+
+    assert resolved["sample:failed"]["method"] == "jailbound_o_plus_recovery_eager"

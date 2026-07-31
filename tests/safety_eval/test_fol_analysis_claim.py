@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -34,3 +35,29 @@ def test_claim_payload_is_inconclusive_when_interpolation_has_too_few_paths() ->
     assert payload["reason"] == "interpolation_underpowered"
     assert payload["quality_gates"]["jailbound_valid_paths"] == 0
     assert payload["quality_gates"]["s_eval_valid_paths"] == 2
+
+
+def test_h4_reads_controls_from_state_root_when_outputs_are_separate(tmp_path: Path) -> None:
+    module = _analysis_module()
+    output_root = tmp_path / "outputs"
+    state_root = tmp_path / "states"
+    output_root.mkdir()
+    state_root.mkdir()
+    (state_root / "controls.jsonl").write_text(
+        json.dumps({"source": "jailbound", "sample_id": "opaque-id"}) + "\n",
+        encoding="utf-8",
+    )
+
+    status = module._write_h4(
+        tmp_path / "h4.csv",
+        root=output_root,
+        controls_root=state_root,
+        primary_key="primary",
+        primary_threshold=0.5,
+        target_key="target",
+        sources=("jailbound",),
+        folds=2,
+        seed=7,
+    )
+
+    assert status == {"status": "inconclusive", "reason": "ValueError"}

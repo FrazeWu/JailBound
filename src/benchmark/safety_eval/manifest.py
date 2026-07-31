@@ -189,7 +189,10 @@ def select_controlled(
 _FOL_MATCHING_CALIPERS = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0)
 
 
-def select_fol_validation(rows: Sequence[FolCandidate], *, validation_n: int, low_n: int, middle_n: int, high_n: int) -> FolSplit:
+def select_fol_validation(
+    rows: Sequence[FolCandidate], *, validation_n: int, low_n: int, middle_n: int, high_n: int,
+    match_risk_category: bool = True,
+) -> FolSplit:
     if validation_n != low_n + middle_n + high_n:
         raise ValueError("FOL split sizes must sum to validation_n")
     ordered = sorted(rows, key=lambda row: (row.fol, row.sample_id))
@@ -204,7 +207,7 @@ def select_fol_validation(rows: Sequence[FolCandidate], *, validation_n: int, lo
         distances: dict[tuple[int, int], float] = {}
         for i, low in enumerate(low_pool):
             for j, high in enumerate(high_pool):
-                if low.risk_category != high.risk_category or low.initial_label != high.initial_label:
+                if (match_risk_category and low.risk_category != high.risk_category) or low.initial_label != high.initial_label:
                     continue
                 distance = np.abs((np.array([low.attack_loss, low.token_length, low.perplexity]) - np.array([high.attack_loss, high.token_length, high.perplexity])) / scale)
                 maximum = float(distance.max())

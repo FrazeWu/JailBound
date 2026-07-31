@@ -43,6 +43,12 @@ def _build_gbda(*args: Any, **kwargs: Any) -> object:
     return GBDAOptimizer(*args, **kwargs)
 
 
+def _build_gbda_official(*args: Any, **kwargs: Any) -> object:
+    from .gbda_official import OfficialGBDAOptimizer
+
+    return OfficialGBDAOptimizer(*args, **kwargs)
+
+
 def _build_gcg(*args: Any, **kwargs: Any) -> object:
     from .gcg import GCGOptimizer
 
@@ -67,6 +73,7 @@ OPTIMIZER_REGISTRY: dict[str, OptimizerFactory] = {
     "zol": partial(_build_jailbound, "zol"),
     "pez": _build_pez,
     "gbda": _build_gbda,
+    "gbda_official": _build_gbda_official,
     "gcg": _build_gcg,
     "jailbound_o_minus": partial(_build_jailbound, "jailbound_o_minus"),
     "jailbound_o_plus": partial(_build_jailbound, "jailbound_o_plus"),

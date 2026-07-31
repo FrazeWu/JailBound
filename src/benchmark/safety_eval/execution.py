@@ -15,6 +15,7 @@ import torch
 from .io import JsonlLedger, canonical_hash, read_jsonl
 from .optimizers.base import BudgetLedger, CheckpointEmitter
 from .optimizers.gbda import GBDAOptimizer
+from .optimizers.gbda_official import OfficialGBDAOptimizer, build_official_logit_state
 from .optimizers.gcg import GCGOptimizer
 from .optimizers.jailbound import DualBranchOptimizer, InitOptimizer, build_jailbound_optimizer
 from .optimizers.pez import PEZOptimizer
@@ -68,7 +69,7 @@ class ExecutionSummary:
 
 
 _TENSOR_METHODS = frozenset(
-    ("init", "random_mutation", "zol", "pez", "gbda", "gcg", "jailbound_o_minus", "jailbound_o_plus", "dual_branch")
+    ("init", "random_mutation", "zol", "pez", "gbda", "gbda_official", "gcg", "jailbound_o_minus", "jailbound_o_plus", "dual_branch")
 )
 
 
@@ -78,6 +79,9 @@ def tensor_method_for_recovery(method: str) -> str:
         "_recovery_fd_sdpa",
         "_recovery_fd",
         "_recovery_rebalanced",
+        "_recovery_cpu_offload",
+        "_recovery_two_gpu_checkpointed",
+        "_recovery_two_gpu",
         "_recovery_checkpointed",
         "_recovery_eager_retry",
         "_recovery_sdpa",
@@ -303,6 +307,13 @@ def _initial_state_for_method(
     u_ids: torch.Tensor,
     embedding: torch.Tensor,
 ) -> Any:
+    if method == "gbda_official":
+        return build_official_logit_state(
+            z_ids,
+            u_ids,
+            vocabulary_size=embedding.shape[0],
+            device=z_ids.device,
+        )
     if method == "gbda":
         vocabulary_size = embedding.shape[0]
         z_logits = torch.full((*z_ids.shape, vocabulary_size), -8.0, device=z_ids.device, dtype=embedding.dtype)
@@ -322,6 +333,8 @@ def _initial_state_for_method(
 def _baseline_optimizer(method: str, settings: TensorOptimizationSettings, embedding: torch.Tensor) -> Any:
     if method == "pez":
         return PEZOptimizer(embedding, learning_rate=settings.learning_rate, max_grad_norm=settings.grad_clip)
+    if method == "gbda_official":
+        return OfficialGBDAOptimizer(embedding)
     if method == "gbda":
         return GBDAOptimizer(
             embedding,
@@ -443,6 +456,9 @@ def _run_local_qwen_tensor(
         f"{method}_recovery_eager_retry",
         f"{method}_recovery_checkpointed",
         f"{method}_recovery_rebalanced",
+        f"{method}_recovery_cpu_offload",
+        f"{method}_recovery_two_gpu",
+        f"{method}_recovery_two_gpu_checkpointed",
         f"{method}_recovery_fd",
         f"{method}_recovery_fd_sdpa",
     }:
@@ -453,7 +469,10 @@ def _run_local_qwen_tensor(
     if loaded.tokenizer is None or loaded.model is None:
         raise ExecutionError("local Qwen handle is closed")
 
-    encoded = loaded.tokenizer(record.attack_text, return_tensors="pt", add_special_tokens=True)
+    tokenizer_kwargs: dict[str, object] = {"return_tensors": "pt", "add_special_tokens": True}
+    if method == "gbda_official":
+        tokenizer_kwargs.update(max_length=256, truncation=True)
+    encoded = loaded.tokenizer(record.attack_text, **tokenizer_kwargs)
     token_ids = _input_ids(encoded)
     if not isinstance(token_ids, torch.Tensor):
         raise ExecutionError("local tensor executor tokenizer returned invalid token IDs")
@@ -482,7 +501,7 @@ def _run_local_qwen_tensor(
         )
     optimizer = (
         _baseline_optimizer(method, settings, embedding)
-        if method in {"pez", "gbda", "gcg"}
+        if method in {"pez", "gbda", "gbda_official", "gcg"}
         else _tensor_optimizer(method, settings)
     )
     snapshots = optimizer.run(

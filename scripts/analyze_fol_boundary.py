@@ -21,6 +21,7 @@ from benchmark.safety_eval.fol_boundary import (
     behavior_flip_rate,
     estimate_behavior_distance,
     exact_permutation_mean_difference,
+    fit_right_censored_cox,
     fit_margin_calibration,
     summarize_interpolation_peaks,
     summarize_fol_bfr,
@@ -192,6 +193,7 @@ def _write_h4(
     destination: Path,
     *,
     root: Path,
+    controls_root: Path,
     primary_key: str,
     primary_threshold: float,
     target_key: str,
@@ -207,7 +209,7 @@ def _write_h4(
     )
     controls = {
         (str(row.get("source")), str(row.get("sample_id"))): row
-        for row in read_jsonl(root / "controls.jsonl")
+        for row in read_jsonl(controls_root / "controls.jsonl")
         if isinstance(row.get("source"), str) and isinstance(row.get("sample_id"), str)
     }
     if not controls:
@@ -315,8 +317,8 @@ def _outcomes(
     *,
     primary_key: str,
     primary_threshold: float,
-    secondary_key: str,
-    secondary_threshold: float,
+    secondary_key: str | None,
+    secondary_threshold: float | None,
     target_key: str,
     sources: tuple[str, ...],
 ) -> tuple[tuple[FolPerturbationOutcome, ...], dict[str, int]]:
@@ -325,9 +327,10 @@ def _outcomes(
         root, judge_key=primary_key, target_key=target_key,
         threshold=primary_threshold, sources=sources,
     )
-    secondary = _labels(
-        root, judge_key=secondary_key, target_key=target_key,
-        threshold=secondary_threshold, sources=sources,
+    secondary = (
+        _labels(root, judge_key=secondary_key, target_key=target_key, threshold=secondary_threshold, sources=sources)
+        if secondary_key is not None and secondary_threshold is not None
+        else {}
     )
     baseline: dict[tuple[str, str], dict[str, str]] = {}
     perturbations: list[dict[str, object]] = []
@@ -361,10 +364,10 @@ def _outcomes(
         if not isinstance(baseline_id, str) or not isinstance(perturbation_id, str):
             raise ValueError("FOL perturbation baseline is missing")
         primary_ready = baseline_id in primary and perturbation_id in primary
-        secondary_ready = baseline_id in secondary and perturbation_id in secondary
+        secondary_ready = secondary_key is None or (baseline_id in secondary and perturbation_id in secondary)
         if not primary_ready:
             failures["primary"] += 1
-        if not secondary_ready:
+        if secondary_key is not None and not secondary_ready:
             failures["secondary"] += 1
         if not primary_ready or not secondary_ready:
             failures["both"] += 1
@@ -380,8 +383,8 @@ def _outcomes(
             accepted=True,
             primary_label=primary[perturbation_id],
             primary_baseline_label=primary[baseline_id],
-            secondary_label=secondary[perturbation_id],
-            secondary_baseline_label=secondary[baseline_id],
+            secondary_label=secondary[perturbation_id] if secondary_key is not None else None,
+            secondary_baseline_label=secondary[baseline_id] if secondary_key is not None else None,
         ))
         selected_groups.add((source, sample_id, float(radius)))
 
@@ -404,7 +407,7 @@ def _outcomes(
         if baseline_row is None:
             continue
         baseline_id = baseline_row["perturbation_id"]
-        if baseline_id not in primary or baseline_id not in secondary:
+        if baseline_id not in primary or (secondary_key is not None and baseline_id not in secondary):
             continue
         output.append(FolPerturbationOutcome(
             source=source,
@@ -414,8 +417,8 @@ def _outcomes(
             accepted=False,
             primary_label=primary[baseline_id],
             primary_baseline_label=primary[baseline_id],
-            secondary_label=secondary[baseline_id],
-            secondary_baseline_label=secondary[baseline_id],
+            secondary_label=secondary[baseline_id] if secondary_key is not None else None,
+            secondary_baseline_label=secondary[baseline_id] if secondary_key is not None else None,
         ))
         selected_groups.add(group)
     return tuple(output), failures
@@ -449,10 +452,10 @@ def _d50_rows(
 ) -> list[dict[str, object]]:
     groups: dict[tuple[str, str, str, str], dict[float, list[bool]]] = {}
     for row in rows:
-        for judge, label, baseline in (
-            ("primary", row.primary_label, row.primary_baseline_label),
-            ("secondary", row.secondary_label, row.secondary_baseline_label),
-        ):
+        labels = [("primary", row.primary_label, row.primary_baseline_label)]
+        if row.secondary_label is not None and row.secondary_baseline_label is not None:
+            labels.append(("secondary", row.secondary_label, row.secondary_baseline_label))
+        for judge, label, baseline in labels:
             groups.setdefault((row.source, row.sample_id, row.band, judge), {}).setdefault(row.radius, []).append(label is not baseline)
     output: list[dict[str, object]] = []
     for (source, sample_id, band, judge), flips_by_radius in sorted(groups.items()):
@@ -515,6 +518,8 @@ def _terminal_fol(root: Path, sources: tuple[str, ...]) -> dict[tuple[str, str],
 
 
 def _write_h2(destination: Path, d50_rows: list[dict[str, object]], fol_by_sample: dict[tuple[str, str], float]) -> None:
+    import math
+
     from scipy.stats import spearmanr
 
     groups: dict[tuple[str, str], list[dict[str, object]]] = {}
@@ -526,7 +531,8 @@ def _write_h2(destination: Path, d50_rows: list[dict[str, object]], fol_by_sampl
     with destination.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=(
             "Source", "Judge", "Usable samples", "Right censored", "Uncensored samples",
-            "FOL-d50 Spearman rho", "Spearman p", "Provenance",
+            "FOL-d50 Spearman rho", "Spearman p", "Cox events",
+            "Cox HR per log-FOL SD", "Cox p", "Provenance",
         ))
         writer.writeheader()
         for (source, judge), rows in sorted(groups.items()):
@@ -538,6 +544,22 @@ def _write_h2(destination: Path, d50_rows: list[dict[str, object]], fol_by_sampl
                 rho, pvalue = float(statistic.statistic), float(statistic.pvalue)
             else:
                 rho = pvalue = None
+            log_fol = [math.log(fol_by_sample[(source, str(row["sample_id"]))]) for row in rows]
+            mean_log_fol = sum(log_fol) / len(log_fol)
+            variance = sum((value - mean_log_fol) ** 2 for value in log_fol) / len(log_fol)
+            if variance > 0.0:
+                scale = math.sqrt(variance)
+                try:
+                    cox = fit_right_censored_cox(
+                        covariates=[(value - mean_log_fol) / scale for value in log_fol],
+                        times=[float(row["d50"]) if row["d50"] is not None else float(row["lower_bound"]) for row in rows],
+                        events=[row["d50"] is not None for row in rows],
+                    )
+                    cox_events, cox_hr, cox_pvalue = cox.event_count, cox.hazard_ratio, cox.pvalue
+                except ValueError:
+                    cox_events = cox_hr = cox_pvalue = None
+            else:
+                cox_events = cox_hr = cox_pvalue = None
             writer.writerow({
                 "Source": source,
                 "Judge": judge,
@@ -546,6 +568,9 @@ def _write_h2(destination: Path, d50_rows: list[dict[str, object]], fol_by_sampl
                 "Uncensored samples": len(uncensored),
                 "FOL-d50 Spearman rho": rho,
                 "Spearman p": pvalue,
+                "Cox events": cox_events,
+                "Cox HR per log-FOL SD": cox_hr,
+                "Cox p": cox_pvalue,
                 "Provenance": "new_run",
             })
 
@@ -554,10 +579,10 @@ def _write_h1(destination: Path, rows: tuple[FolPerturbationOutcome, ...], minim
     groups: dict[tuple[str, str, float, str], dict[str, list[float]]] = {}
     direction_groups: dict[tuple[str, str, str, float, str], list[bool]] = {}
     for row in rows:
-        for judge, label, baseline in (
-            ("primary", row.primary_label, row.primary_baseline_label),
-            ("secondary", row.secondary_label, row.secondary_baseline_label),
-        ):
+        labels = [("primary", row.primary_label, row.primary_baseline_label)]
+        if row.secondary_label is not None and row.secondary_baseline_label is not None:
+            labels.append(("secondary", row.secondary_label, row.secondary_baseline_label))
+        for judge, label, baseline in labels:
             direction_groups.setdefault(
                 (row.source, row.sample_id, row.band, row.radius, judge), []
             ).append(label is not baseline)
@@ -641,6 +666,8 @@ def main() -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--fol-root", type=Path)
     parser.add_argument("--state-fol-root", type=Path)
+    parser.add_argument("--analysis-dir", type=Path)
+    parser.add_argument("--primary-only", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
     root = args.fol_root or (ROOT / config.run.output_root / "fol_boundary")
@@ -653,12 +680,14 @@ def main() -> int:
         root,
         primary_key=config.judging.primary.key,
         primary_threshold=config.judging.primary.threshold,
-        secondary_key=config.judging.secondary.key,
-        secondary_threshold=config.judging.secondary.threshold,
+        secondary_key=None if args.primary_only else config.judging.secondary.key,
+        secondary_threshold=None if args.primary_only else config.judging.secondary.threshold,
         target_key=config.models.targets[0].key,
         sources=tuple(config.fol.sources),
     )
-    analysis = root / "analysis"
+    analysis = args.analysis_dir or (root / "analysis")
+    if not analysis.is_absolute():
+        analysis = ROOT / analysis
     analysis.mkdir(parents=True, exist_ok=True)
     _write_bfr(analysis / "fol_bfr.csv", rows, config.fol.minimum_accepted_directions)
     d50_rows = _d50_rows(rows, config.fol.minimum_accepted_directions)
@@ -684,6 +713,7 @@ def main() -> int:
     h4 = _write_h4(
         analysis / "fol_h4_controls.csv",
         root=root,
+        controls_root=state_root,
         primary_key=config.judging.primary.key,
         primary_threshold=config.judging.primary.threshold,
         target_key=config.models.targets[0].key,

@@ -57,8 +57,8 @@ class FolPerturbationOutcome:
     accepted: bool
     primary_label: bool
     primary_baseline_label: bool
-    secondary_label: bool
-    secondary_baseline_label: bool
+    secondary_label: bool | None
+    secondary_baseline_label: bool | None
 
 
 @dataclass(frozen=True)
@@ -157,6 +157,71 @@ class BehaviorDistance:
     lower: float
     upper: float
     right_censored: bool
+
+
+@dataclass(frozen=True)
+class RightCensoredCoxEstimate:
+    """One-covariate Cox estimate retaining right-censored distances."""
+
+    sample_count: int
+    event_count: int
+    log_hazard_ratio: float
+    hazard_ratio: float
+    standard_error: float
+    pvalue: float
+
+
+def fit_right_censored_cox(
+    *, covariates: Sequence[float], times: Sequence[float], events: Sequence[bool]
+) -> RightCensoredCoxEstimate:
+    """Fit a one-covariate Cox model using observed flips as events.
+
+    Larger covariates with positive coefficients imply a higher flip hazard and
+    therefore a smaller behavior-boundary distance.  Censored rows remain in
+    every compatible risk set.
+    """
+    if len(covariates) != len(times) or len(times) != len(events) or len(times) < 3:
+        raise ValueError("Cox fitting requires equally sized inputs with at least three rows")
+    if any(not math.isfinite(float(value)) for value in (*covariates, *times)):
+        raise ValueError("Cox covariates and times must be finite")
+    if any(float(value) <= 0.0 for value in times):
+        raise ValueError("Cox times must be positive")
+    if any(type(event) is not bool for event in events):
+        raise TypeError("Cox events must be booleans")
+    if sum(events) < 2 or len(set(float(value) for value in covariates)) < 2:
+        raise ValueError("Cox fitting requires at least two events and variable covariates")
+
+    import numpy as np
+    from scipy.optimize import minimize
+    from scipy.stats import norm
+
+    x = np.asarray(covariates, dtype=float)
+    t = np.asarray(times, dtype=float)
+    observed = np.asarray(events, dtype=bool)
+
+    def negative_log_partial_likelihood(beta: np.ndarray) -> float:
+        value = 0.0
+        for index in np.flatnonzero(observed):
+            risk = beta[0] * x[t >= t[index]]
+            value -= beta[0] * x[index] - float(np.logaddexp.reduce(risk))
+        return value
+
+    fitted = minimize(negative_log_partial_likelihood, np.zeros(1), method="BFGS")
+    if not fitted.success or fitted.hess_inv.shape != (1, 1):
+        raise ValueError("Cox optimizer did not converge")
+    variance = float(fitted.hess_inv[0, 0])
+    if not math.isfinite(variance) or variance <= 0.0:
+        raise ValueError("Cox optimizer returned an invalid variance")
+    coefficient = float(fitted.x[0])
+    standard_error = math.sqrt(variance)
+    return RightCensoredCoxEstimate(
+        sample_count=len(covariates),
+        event_count=int(observed.sum()),
+        log_hazard_ratio=coefficient,
+        hazard_ratio=math.exp(coefficient),
+        standard_error=standard_error,
+        pvalue=float(2.0 * norm.sf(abs(coefficient / standard_error))),
+    )
 
 
 def estimate_behavior_distance(rates_by_radius: Mapping[float, float]) -> BehaviorDistance:
@@ -319,6 +384,35 @@ def select_base_radius(
     return max(eligible, default=None)
 
 
+def select_primary_behavioral_radius(
+    acceptance: Mapping[float, Sequence[bool]],
+    primary_bfr: Mapping[float, float],
+    *,
+    target_lower: float,
+    target_upper: float,
+    minimum_semantic_rate: float = 0.8,
+) -> float | None:
+    """Choose the smallest semantic-valid radius in the primary flip-rate target band."""
+    if not 0.0 <= minimum_semantic_rate <= 1.0:
+        raise ValueError("minimum semantic rate must be in [0, 1]")
+    if not 0.0 <= target_lower <= target_upper <= 1.0:
+        raise ValueError("primary BFR target interval must be in [0, 1]")
+    if set(acceptance) != set(primary_bfr):
+        raise ValueError("semantic acceptance and primary BFR radii must match")
+    selected: list[float] = []
+    for radius, outcomes in acceptance.items():
+        if not math.isfinite(radius) or radius <= 0:
+            raise ValueError("radii must be finite positive values")
+        if not outcomes or any(type(outcome) is not bool for outcome in outcomes):
+            raise TypeError("semantic acceptance values must be non-empty booleans")
+        bfr = primary_bfr[radius]
+        if not math.isfinite(bfr) or not 0.0 <= bfr <= 1.0:
+            raise ValueError("primary BFR values must be finite probabilities")
+        if sum(outcomes) / len(outcomes) >= minimum_semantic_rate and target_lower <= bfr <= target_upper:
+            selected.append(float(radius))
+    return min(selected, default=None)
+
+
 def split_fol_bands(values: Sequence[FolValue]) -> FolBandSplit:
     """Select deterministic, disjoint 7/3/7 FOL bands from neutral values."""
     required = LOW_BAND_SIZE + MIDDLE_BAND_SIZE + HIGH_BAND_SIZE
@@ -399,26 +493,27 @@ def summarize_fol_bfr(
             raise ValueError("FOL outcome identities must be non-empty")
         if not math.isfinite(row.radius) or row.radius <= 0.0:
             raise ValueError("FOL outcome radius must be finite and positive")
-        if any(
-            type(value) is not bool
-            for value in (
-                row.accepted,
-                row.primary_label,
-                row.primary_baseline_label,
-                row.secondary_label,
-                row.secondary_baseline_label,
-            )
-        ):
+        if any(type(value) is not bool for value in (row.accepted, row.primary_label, row.primary_baseline_label)):
             raise TypeError("FOL outcome labels must be booleans")
+        if (row.secondary_label is None) is not (row.secondary_baseline_label is None):
+            raise ValueError("secondary FOL labels must be both present or both absent")
+        if row.secondary_label is not None and any(
+            type(value) is not bool for value in (row.secondary_label, row.secondary_baseline_label)
+        ):
+            raise TypeError("secondary FOL labels must be booleans when present")
         by_sample = grouped.setdefault((row.source, row.band, float(row.radius)), {})
         by_sample.setdefault(row.sample_id, []).append(row)
 
     summaries: list[FolBfrSummary] = []
     for (source, band, radius), by_sample in sorted(grouped.items()):
-        for judge_key, label_field, baseline_field in (
-            ("primary", "primary_label", "primary_baseline_label"),
-            ("secondary", "secondary_label", "secondary_baseline_label"),
+        judge_fields = [("primary", "primary_label", "primary_baseline_label")]
+        if all(
+            row.secondary_label is not None and row.secondary_baseline_label is not None
+            for directions in by_sample.values()
+            for row in directions
         ):
+            judge_fields.append(("secondary", "secondary_label", "secondary_baseline_label"))
+        for judge_key, label_field, baseline_field in judge_fields:
             rates: list[float] = []
             accepted_direction_count = 0
             sparse_prompt_count = 0

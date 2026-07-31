@@ -6,6 +6,10 @@ import torch
 from benchmark.safety_eval.objective import AttackObjective, EditableState
 from benchmark.safety_eval.optimizers.base import BudgetLedger, CheckpointEmitter
 from benchmark.safety_eval.optimizers.gbda import GBDAOptimizer, linear_temperature, masked_logits
+from benchmark.safety_eval.optimizers.gbda_official import (
+    OfficialGBDAOptimizer,
+    build_official_logit_state,
+)
 from benchmark.safety_eval.optimizers.pez import PEZOptimizer, straight_through_project
 
 
@@ -51,6 +55,28 @@ def _logit_state() -> EditableState:
         z0=torch.zeros(1, 1, 3),
         u0=torch.zeros(1, 1, 3),
     )
+
+
+class _BatchCandidateObjective(AttackObjective):
+    forward_passes_per_evaluation = 1
+
+    def evaluate_candidates(self, state: EditableState) -> torch.Tensor:
+        pooled = torch.cat((state.z, state.u), dim=1).mean(dim=1)
+        answer = (pooled * self.answer_vector.to(pooled)).sum(dim=-1)
+        refusal = (pooled * self.refusal_vector.to(pooled)).sum(dim=-1)
+        z_penalty = (state.z - state.z0).square().sum(dim=(1, 2))
+        u_penalty = (state.u - state.u0).square().sum(dim=(1, 2))
+        return answer - refusal - self.gamma_z * z_penalty - self.gamma_u * u_penalty
+
+
+class _RecordingBatchObjective(_BatchCandidateObjective):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.soft_batch_sizes: list[int] = []
+
+    def evaluate(self, state: EditableState, **kwargs: object):  # type: ignore[no-untyped-def]
+        self.soft_batch_sizes.append(state.z.shape[0])
+        return super().evaluate(state, **kwargs)
 
 
 def test_pez_projects_to_nearest_allowed_embedding_with_identity_ste_gradient() -> None:
@@ -110,6 +136,86 @@ def test_gbda_optimizer_runs_exact_budget_and_snapshots_allowed_argmax_ids() -> 
     assert torch.equal(snapshots[0].state.z, _embedding()[snapshots[0].z_token_ids])
     assert snapshots[-1].soft_state.z.requires_grad is False
     assert snapshots[-1].logits_state.z.requires_grad is False
+
+
+def test_official_gbda_initializes_original_tokens_to_fifteen_over_zero_logits() -> None:
+    state = build_official_logit_state(
+        torch.tensor([[0, 2]]),
+        torch.tensor([[1]]),
+        vocabulary_size=3,
+        device=torch.device("cpu"),
+    )
+
+    assert state.z.dtype == state.u.dtype == torch.float32
+    assert state.z.tolist() == [[[15.0, 0.0, 0.0], [0.0, 0.0, 15.0]]]
+    assert state.u.tolist() == [[[0.0, 15.0, 0.0]]]
+
+
+def test_official_gbda_uses_fixed_soft_samples_and_selects_one_final_hard_candidate() -> None:
+    torch.manual_seed(7)
+    objective = _BatchCandidateObjective(
+        answer_vector=torch.tensor([1.0, 0.0]),
+        refusal_vector=torch.tensor([0.0, 1.0]),
+        epsilon=0.1,
+        lambda_fol=0.3,
+        gamma_z=0.1,
+        gamma_u=0.1,
+    )
+    state = build_official_logit_state(
+        torch.tensor([[0]]),
+        torch.tensor([[1]]),
+        vocabulary_size=3,
+        device=torch.device("cpu"),
+    )
+    ledger = BudgetLedger(update_limit=2, candidate_limit=32)
+
+    snapshots = OfficialGBDAOptimizer(
+        _embedding(),
+        forbidden_token_ids=(2,),
+        soft_samples_per_update=3,
+        hard_samples=5,
+        hard_sample_batch_size=2,
+    ).run(objective, state, ledger, CheckpointEmitter([0, 1, 2]))
+
+    defaults = OfficialGBDAOptimizer(_embedding())
+    assert defaults.learning_rate == pytest.approx(0.3)
+    assert defaults.soft_sample_batch_size == 5
+    assert [snapshot.checkpoint for snapshot in snapshots] == [0, 1, 2]
+    assert [snapshot.temperature for snapshot in snapshots] == [1.0, 1.0, 1.0]
+    assert (ledger.updates, ledger.candidates_attempted, ledger.candidates_accepted) == (2, 11, 1)
+    assert (ledger.forward_passes, ledger.backward_passes, ledger.hvp_calls) == (7, 2, 0)
+    assert snapshots[-1].hard_samples == 5
+    assert all((snapshot.z_token_ids != 2).all() and (snapshot.u_token_ids != 2).all() for snapshot in snapshots)
+
+
+def test_official_gbda_microbatches_ten_soft_samples_without_changing_the_update_budget() -> None:
+    objective = _RecordingBatchObjective(
+        answer_vector=torch.tensor([1.0, 0.0]),
+        refusal_vector=torch.tensor([0.0, 1.0]),
+        epsilon=0.1,
+        lambda_fol=0.3,
+        gamma_z=0.1,
+        gamma_u=0.1,
+    )
+    state = build_official_logit_state(
+        torch.tensor([[0]]),
+        torch.tensor([[1]]),
+        vocabulary_size=3,
+        device=torch.device("cpu"),
+    )
+    ledger = BudgetLedger(update_limit=1, candidate_limit=16)
+
+    OfficialGBDAOptimizer(
+        _embedding(),
+        soft_samples_per_update=10,
+        soft_sample_batch_size=2,
+        hard_samples=1,
+        hard_sample_batch_size=1,
+    ).run(objective, state, ledger, CheckpointEmitter([0, 1]))
+
+    assert objective.soft_batch_sizes == [2, 2, 2, 2, 2]
+    assert (ledger.updates, ledger.candidates_attempted, ledger.candidates_accepted) == (1, 11, 1)
+    assert (ledger.forward_passes, ledger.backward_passes) == (7, 5)
 
 
 @pytest.mark.parametrize("method", ["pez", "gbda"])

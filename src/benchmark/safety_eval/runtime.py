@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
-from typing import Mapping
+from typing import Any, Mapping
 
 from .config import ExperimentConfig
 from .io import atomic_write_json, canonical_hash, sha256_file
@@ -27,7 +27,7 @@ class ResolvedModel:
 
 @dataclass(frozen=True)
 class LockedRuntime:
-    config: ExperimentConfig
+    config: Any
     config_hash: str
     run_id: str
 
@@ -52,12 +52,23 @@ def _git(command: list[str]) -> str:
         return "unavailable"
 
 
-def lock_runtime_config(config: ExperimentConfig, *, output_root: str | Path, source_hashes: Mapping[str, str]) -> LockedRuntime:
+def lock_runtime_config(config: Any, *, output_root: str | Path, source_hashes: Mapping[str, str]) -> LockedRuntime:
+    """Lock a configuration object that exposes the base run contract.
+
+    The independent H1-v2 protocol deliberately has a separate top-level
+    configuration, while retaining the same immutable run metadata contract.
+    """
     root = Path(output_root)
     payload = config.model_dump(mode="json")
     config_hash = canonical_hash(payload)
     run_id = f"run:{canonical_hash({'config_hash': config_hash, 'sources': dict(sorted(source_hashes.items()))})[:20]}"
-    locked_path = root / config.run.locked_config_name
+    run = getattr(config, "run", None)
+    if run is None:
+        run = getattr(getattr(config, "base", None), "run", None)
+    locked_name = getattr(run, "locked_config_name", None)
+    if not isinstance(locked_name, str) or not locked_name:
+        raise PreflightError("configuration has no locked run metadata")
+    locked_path = root / locked_name
     if locked_path.exists() and json.loads(locked_path.read_text(encoding="utf-8")) != payload:
         raise PreflightError("output root already has a different locked config")
     atomic_write_json(locked_path, payload)

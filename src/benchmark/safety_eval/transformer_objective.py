@@ -146,6 +146,22 @@ class TransformerAttackObjective:
         u_penalty = (state.u - state.u0).square().sum(dim=(1, 2))
         return answer - refusal - self.gamma_z * z_penalty - self.gamma_u * u_penalty
 
+    def optimization_loss(self, state: EditableState) -> torch.Tensor:
+        """Return the differentiable attack loss without diagnostic forwards."""
+        full_embeds, attention_mask = self._full_inputs(state)
+        proxy_risk = compute_dual_anchor_risk(
+            model=self.model,
+            perturbed_embeds=full_embeds,
+            attention_mask=attention_mask,
+            answer_token_ids=self.answer_token_ids.to(full_embeds.device),
+            refusal_token_ids=self.refusal_token_ids.to(full_embeds.device),
+        )
+        return (
+            proxy_risk
+            - self.gamma_z * (state.z - state.z0).square().sum()
+            - self.gamma_u * (state.u - state.u0).square().sum()
+        )
+
     def evaluate(
         self,
         state: EditableState,

@@ -101,6 +101,7 @@ def _candidate_similarity(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--fol-root", type=Path)
     parser.add_argument("--schedule-name", default="radius_calibration_schedule.jsonl")
     parser.add_argument("--outcomes-name", default="radius_calibration_outcomes.jsonl")
     parser.add_argument("--source", action="append")
@@ -109,7 +110,9 @@ def main() -> int:
     parser.add_argument("--shard-count", type=int, default=1)
     args = parser.parse_args()
     config = load_config(args.config)
-    root = ROOT / config.run.output_root / "fol_boundary"
+    root = args.fol_root or (ROOT / config.run.output_root / "fol_boundary")
+    if not root.is_absolute():
+        root = ROOT / root
     threshold = _threshold(root)
     schedule_name = _artifact_name(args.schedule_name, field="schedule name")
     outcomes_name = _artifact_name(args.outcomes_name, field="outcomes name")

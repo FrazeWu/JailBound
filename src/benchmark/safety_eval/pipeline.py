@@ -164,8 +164,9 @@ def materialize_optimization_record(
     if provisional.status is RecordStatus.failed:
         return provisional
     score = float(semantic_similarity(example.attack_text, provisional.flat_prompt))
-    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+    if not math.isfinite(score) or not -1.0 <= score <= 1.0:
         return _materialization_failure(optimization, category=example.risk_category, reason="invalid semantic similarity")
+    score = max(0.0, score)
     if score < semantic_threshold:
         return provisional.model_copy(
             update={

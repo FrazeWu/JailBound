@@ -1,0 +1,14 @@
+base_config: safety_eval_additions.yaml
+
+h1_v3:
+  source_root: outputs/results/reviewer_additions_n17_qwen7b_local_qwen32_compat_eager_randomfix/fol_h1_v2
+  output_root: outputs/results/reviewer_additions_n17_qwen7b_local_qwen32_compat_eager_randomfix/fol_h1_v3
+  primary_judge_local_path: /home/dasp/models/Octopus-SEval-14B
+  sources: [jailbound, s_eval]
+  radius_candidates: [0.4, 0.6]
+  accepted_directions: 32
+  max_direction_attempts: 64
+  semantic_acceptance_floor: 0.95
+  relative_state_change_cap: 0.10
+  permutation_replicates: 10000
+  bootstrap_replicates: 10000
