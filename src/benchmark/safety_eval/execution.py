@@ -520,7 +520,7 @@ def _run_local_qwen_tensor(
         if method in {"pez", "gbda", "gcg"}
         else _tensor_optimizer(method, settings)
     )
-    snapshots = optimizer.run(
+    result = optimizer.run(
         objective,
         _initial_state_for_method(
             method,
@@ -532,6 +532,7 @@ def _run_local_qwen_tensor(
         _tensor_ledger(method, settings),
         CheckpointEmitter(list(checkpoints)),
     )
+    branch_pool = tuple(getattr(result, "pool", ()))
     return [
         OptimizationSnapshot(
             checkpoint=snapshot.checkpoint,
@@ -553,8 +554,9 @@ def _run_local_qwen_tensor(
                 prompt_tokens=prompt_tokens,
             ),
             state=_checkpoint_state(snapshot, prompt, record),
+            branch_pool=branch_pool if index == 0 else (),
         )
-        for snapshot in snapshots
+        for index, snapshot in enumerate(result)
     ]
 
 

@@ -13,7 +13,7 @@ from typing import Any, Literal
 import torch
 
 from .io import JsonlLedger, atomic_write_json, read_jsonl
-from .schema import ComputeCounters, OptimizationRecord, RecordStatus
+from .schema import ComputeCounters, OptimizationRecord, RecordStatus, stable_id
 
 
 class RunConfigMismatch(RuntimeError):
@@ -91,6 +91,7 @@ class OptimizationSnapshot:
     internal_margin: float | None = None
     state_filename: str | None = None
     state: dict[str, Any] | None = None
+    branch_pool: tuple[Any, ...] = ()
 
 
 SnapshotFactory = Callable[[tuple[int, ...]], Iterable[OptimizationSnapshot]]
@@ -158,12 +159,49 @@ class OptimizationRunner:
             if snapshot.checkpoint not in expected or snapshot.checkpoint in observed:
                 raise ValueError("snapshot factory returned an unexpected checkpoint")
             observed.add(snapshot.checkpoint)
+            self._persist_branch_pool(job, snapshot, path.parent)
             record = self._record_for(job, snapshot, path.parent)
             if ledger.append_once(record.model_dump(mode="json")):
                 written.append(record)
         if observed != expected:
             raise ValueError("snapshot factory did not return every requested checkpoint")
         return written
+
+    def _persist_branch_pool(
+        self, job: OptimizationJob, snapshot: OptimizationSnapshot, method_directory: Path
+    ) -> None:
+        if not snapshot.branch_pool:
+            return
+        ledger = JsonlLedger(
+            method_directory / "branch_pool.jsonl",
+            key_fields=("cell_id", "sample_id", "branch", "step"),
+        )
+        for item in snapshot.branch_pool:
+            value = item if isinstance(item, dict) else vars(item)
+            branch, step = value["branch"], value["step"]
+            state_id = stable_id("branch_state", (job.cell_id, job.sample_id, branch, step))
+            state_path = method_directory / "branch_states" / f"{state_id}.pt"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            if not state_path.exists():
+                state = value["state"]
+                torch.save(
+                    {"z": state.z.detach().cpu(), "u": state.u.detach().cpu()}, state_path
+                )
+            ledger.append_once(
+                {
+                    "schema_version": self.schema_version,
+                    "run_id": self.run_id,
+                    "config_hash": self.config_hash,
+                    "cell_id": job.cell_id,
+                    "sample_id": job.sample_id,
+                    "branch": branch,
+                    "step": step,
+                    "attack_loss": value["attack_loss"],
+                    "fol": value["fol"],
+                    "branch_objective": value["branch_objective"],
+                    "state_path": str(state_path),
+                }
+            )
 
     def _lock_config_hash(self) -> None:
         self.output_root.mkdir(parents=True, exist_ok=True)

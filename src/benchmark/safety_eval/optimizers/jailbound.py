@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal, Mapping
+from typing import Iterator, Literal, Mapping, Sequence
 
 import torch
 
@@ -31,6 +31,45 @@ class OptimizerSnapshot:
     forward_passes: int
     backward_passes: int
     hvp_calls: int
+
+
+@dataclass(frozen=True)
+class BranchStateRecord:
+    """One detached post-update candidate from a dual-branch search."""
+
+    branch: str
+    step: int
+    attack_loss: float
+    fol: float | None
+    branch_objective: float
+    state: EditableState
+
+
+@dataclass(frozen=True)
+class BranchSearchResult(Sequence[OptimizerSnapshot]):
+    """Dual-branch checkpoints together with all candidates and selections."""
+
+    pool: tuple[BranchStateRecord, ...]
+    selected: tuple[BranchStateRecord, ...]
+    snapshots: tuple[OptimizerSnapshot, ...]
+
+    def __len__(self) -> int:
+        return len(self.snapshots)
+
+    def __getitem__(self, index: int | slice) -> OptimizerSnapshot | tuple[OptimizerSnapshot, ...]:
+        return self.snapshots[index]
+
+    def __iter__(self) -> Iterator[OptimizerSnapshot]:
+        return iter(self.snapshots)
+
+
+def select_branch_states(
+    pool: Sequence[BranchStateRecord], branch: str, k: int
+) -> tuple[BranchStateRecord, ...]:
+    candidates = [item for item in pool if item.branch == branch]
+    if len(candidates) < k:
+        raise ValueError(f"branch {branch} has fewer than {k} valid states")
+    return tuple(sorted(candidates, key=lambda item: (-item.branch_objective, item.step))[:k])
 
 
 def _clone_live_state(state: EditableState) -> EditableState:
@@ -297,7 +336,10 @@ class DualBranchOptimizer:
         initial_state: EditableState,
         ledger: BudgetLedger,
         emitter: CheckpointEmitter,
-    ) -> list[OptimizerSnapshot]:
+        final_states_per_branch: int = 1,
+    ) -> BranchSearchResult:
+        if final_states_per_branch < 1:
+            raise ValueError("final_states_per_branch must be positive")
         self._validate_ledger(ledger)
         states = {"o_minus": _clone_live_state(initial_state), "o_plus": _clone_live_state(initial_state)}
         optimizers = {
@@ -305,6 +347,7 @@ class DualBranchOptimizer:
             for name, state in states.items()
         }
         snapshots: list[OptimizerSnapshot] = []
+        pool: list[BranchStateRecord] = []
 
         if emitter.due(0):
             snapshots.append(self._selected_snapshot(0, objective, states, ledger))
@@ -324,12 +367,32 @@ class DualBranchOptimizer:
             ledger.record_backward()
             torch.nn.utils.clip_grad_norm_((states[branch].z, states[branch].u), self.max_grad_norm)
             optimizer.step()
+            pooled_value = _evaluate(
+                objective,
+                states[branch],
+                fol_sign=-1 if branch == "o_minus" else 1,
+                include_fol=True,
+                ledger=ledger,
+            )
+            pool.append(
+                BranchStateRecord(
+                    branch=branch,
+                    step=step,
+                    attack_loss=float(pooled_value.attack_loss.detach().cpu()),
+                    fol=None if pooled_value.fol is None else float(pooled_value.fol.detach().cpu()),
+                    branch_objective=float(pooled_value.maximize.detach().cpu()),
+                    state=_clone_snapshot_state(states[branch]),
+                )
+            )
             if emitter.due(step):
                 snapshots.append(self._selected_snapshot(step, objective, states, ledger))
 
         if ledger.branch_updates != dict(ledger.branch_limits):
             raise AssertionError("terminal branch accounting does not match configured limits")
-        return snapshots
+        selected = select_branch_states(pool, "o_minus", final_states_per_branch) + select_branch_states(
+            pool, "o_plus", final_states_per_branch
+        )
+        return BranchSearchResult(tuple(pool), selected, tuple(snapshots))
 
     @staticmethod
     def _validate_ledger(ledger: BudgetLedger) -> None:

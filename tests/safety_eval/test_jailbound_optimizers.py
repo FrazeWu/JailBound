@@ -6,7 +6,13 @@ import torch
 from benchmark.safety_eval.objective import AttackObjective, EditableState
 from benchmark.safety_eval.optimizers.base import BudgetLedger, CheckpointEmitter
 from benchmark.safety_eval.optimizers import jailbound
-from benchmark.safety_eval.optimizers.jailbound import DualBranchOptimizer, InitOptimizer, build_jailbound_optimizer
+from benchmark.safety_eval.optimizers.jailbound import (
+    BranchStateRecord,
+    DualBranchOptimizer,
+    InitOptimizer,
+    build_jailbound_optimizer,
+    select_branch_states,
+)
 
 
 def _state() -> EditableState:
@@ -131,6 +137,35 @@ def test_dual_branch_alternates_exactly_and_breaks_initial_tie_toward_o_minus() 
     assert dict(snapshots[-1].branch_updates) == {"o_minus": 2, "o_plus": 2}
     assert torch.equal(initial.z.detach(), _state().z.detach())
     assert torch.equal(initial.u.detach(), _state().u.detach())
+
+
+def test_dual_branch_keeps_each_post_update_state_and_selects_each_branch() -> None:
+    result = DualBranchOptimizer(learning_rate=0.05).run(
+        _objective(),
+        _state(),
+        BudgetLedger(
+            update_limit=6,
+            candidate_limit=9,
+            branch_limits={"o_minus": 3, "o_plus": 3},
+        ),
+        CheckpointEmitter([0, 3, 6]),
+        final_states_per_branch=1,
+    )
+
+    assert [item.branch for item in result.pool] == ["o_minus", "o_plus"] * 3
+    assert {item.branch for item in result.selected} == {"o_minus", "o_plus"}
+    assert len(result.selected) == 2
+    assert [snapshot.checkpoint for snapshot in result.snapshots] == [0, 3, 6]
+
+
+def test_branch_selection_breaks_objective_ties_by_earlier_step() -> None:
+    state = _state()
+    pool = (
+        BranchStateRecord("o_minus", 4, 1.0, 0.1, 2.0, state),
+        BranchStateRecord("o_minus", 2, 1.0, 0.1, 2.0, state),
+    )
+
+    assert select_branch_states(pool, "o_minus", 1)[0].step == 2
 
 
 def test_dual_branch_rejects_terminal_budget_mismatch() -> None:
