@@ -95,8 +95,8 @@ def _schema_error(response: str, prompt: str) -> tuple[EditableSpan, ...]:
     raw_spans = payload["spans"]
     if not isinstance(raw_spans, list):
         raise SpanAnnotationError("spans must be an array")
-    if not raw_spans:
-        raise SpanAnnotationError("spans must contain at least one item")
+    if len(raw_spans) != 1:
+        raise SpanAnnotationError("spans must contain exactly one item")
 
     spans: list[EditableSpan] = []
     previous_end = 0

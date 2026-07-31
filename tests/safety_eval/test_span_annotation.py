@@ -187,7 +187,7 @@ def test_second_invalid_response_raises_after_exactly_one_repair(
 
     with pytest.raises(
         SpanAnnotationError,
-        match=r"annotation remained invalid after one repair: spans must contain at least one item",
+        match=r"annotation remained invalid after one repair: spans must contain exactly one item",
     ):
         _annotate(
             SpanAnnotator(_config(template_path), transport, confidence_threshold=0.0)
@@ -215,13 +215,46 @@ def test_low_confidence_is_typed_failure_without_repair(template_path: Path) -> 
     assert len(transport.calls) == 1
 
 
+def test_annotator_rejects_multi_span_response_before_acceptance(
+    template_path: Path,
+) -> None:
+    second_quote = "Thanks"
+    multi_span_response = json.dumps(
+        {
+            "spans": [
+                json.loads(_response())["spans"][0],
+                {
+                    "start": PROMPT.index(second_quote),
+                    "end": PROMPT.index(second_quote) + len(second_quote),
+                    "quote": second_quote,
+                    "role": "attack_instruction",
+                    "confidence": 0.95,
+                    "rationale": "Trailing wrapper text.",
+                },
+            ]
+        },
+        separators=(",", ":"),
+    )
+    transport = StubTransport([multi_span_response, multi_span_response])
+
+    with pytest.raises(
+        SpanAnnotationError,
+        match="annotation remained invalid after one repair: spans must contain exactly one item",
+    ):
+        _annotate(
+            SpanAnnotator(_config(template_path), transport, confidence_threshold=0.0)
+        )
+
+    assert len(transport.calls) == 2
+
+
 @pytest.mark.parametrize(
     ("response", "message"),
     [
         ("[]", "response must be a JSON object"),
         ('{"spans":[],"other":1}', "response has unexpected fields: other"),
         ('{"spans":[],"spans":[]}', "response contains duplicate JSON field: spans"),
-        ('{"spans":[]}', "spans must contain at least one item"),
+        ('{"spans":[]}', "spans must contain exactly one item"),
         (
             '{"spans":[{"start":0,"end":1,"quote":"W","role":"unknown",'
             '"confidence":0.9,"rationale":"x"}]}',
@@ -236,7 +269,7 @@ def test_low_confidence_is_typed_failure_without_repair(template_path: Path) -> 
             '{"spans":[{"start":9,"end":16,"quote":"explain","role":"attack_instruction",'
             '"confidence":0.9,"rationale":"x"},{"start":0,"end":7,"quote":"Wrapper",'
             '"role":"seed_intent","confidence":0.9,"rationale":"x"}]}',
-            "spans must be ordered and non-overlapping",
+            "spans must contain exactly one item",
         ),
     ],
 )
