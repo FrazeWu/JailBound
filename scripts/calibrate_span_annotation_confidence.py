@@ -11,8 +11,14 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 from typing import Any, Protocol
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
 
 from benchmark.safety_eval.config import AnnotationConfig, load_v2_config
 from benchmark.safety_eval.datasets import RawExample, load_source
@@ -23,8 +29,6 @@ from benchmark.safety_eval.span_annotation import (
     SpanAnnotator,
 )
 
-
-ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_VERSION = "span_annotation_confidence.v1"
 FREEZE_COMMAND = "calibrate_span_annotation_confidence.py freeze"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")

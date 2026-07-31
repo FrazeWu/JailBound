@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 from threading import Barrier
 from types import SimpleNamespace
 import sys
@@ -39,6 +40,26 @@ freeze_reviewed_annotations = _MODULE.freeze_reviewed_annotations
 parse_args = _MODULE.parse_args
 prepare_review_rows = _MODULE.prepare_review_rows
 write_frozen_artifact = _MODULE.write_frozen_artifact
+
+
+def test_script_prefers_its_worktree_source_over_inherited_pythonpath(
+    tmp_path: Path,
+) -> None:
+    inherited_source = tmp_path / "inherited-src"
+    config = inherited_source / "benchmark" / "safety_eval" / "config.py"
+    config.parent.mkdir(parents=True)
+    (config.parent.parent / "__init__.py").touch()
+    (config.parent / "__init__.py").touch()
+    config.write_text("# Deliberately missing AnnotationConfig.\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT_PATH), "--help"],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(inherited_source)},
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def _review(confidence: float, accepted: bool) -> object:
