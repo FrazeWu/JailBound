@@ -8,7 +8,12 @@ from typing import Any
 
 import torch
 
-from .materialization import build_v2_materialization_record, materialize_v2_candidate
+from .materialization import (
+    ContinuousCandidate,
+    build_v2_materialization_record,
+    materialize_v2_candidate,
+)
+from .objective import EditableState
 from .prompt_contract import tokenize_editable_prompt
 from .schema import OptimizationRecord, V2BenchmarkExample, V2MaterializationRecord
 
@@ -39,11 +44,14 @@ def materialize_v2_optimization_state(
     prompt = tokenize_editable_prompt(
         example.attack_text, example.editable_spans, tokenizer, optimization.sample_id
     )
+    z = z.to(vocabulary_embeddings.device)
+    u = u.to(vocabulary_embeddings.device)
     result = materialize_v2_candidate(
-        z=z.to(vocabulary_embeddings.device),
-        u=u.to(vocabulary_embeddings.device),
+        candidate=ContinuousCandidate(
+            state=EditableState(z=z, u=u, z0=z.detach().clone(), u0=u.detach().clone()),
+            vocabulary_embeddings=vocabulary_embeddings,
+        ),
         prompt=prompt,
-        vocabulary_embeddings=vocabulary_embeddings,
         tokenizer=tokenizer,
     )
     branch = optimization.representation.rsplit(":", 1)[-1]
