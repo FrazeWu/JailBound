@@ -15,7 +15,13 @@ from .materialization import (
 )
 from .objective import EditableState
 from .prompt_contract import tokenize_editable_prompt
-from .schema import OptimizationRecord, V2BenchmarkExample, V2MaterializationRecord
+from .io import JsonlLedger, read_jsonl
+from .schema import (
+    OptimizationRecord,
+    RecordStatus,
+    V2BenchmarkExample,
+    V2MaterializationRecord,
+)
 
 
 def materialize_v2_optimization_state(
@@ -66,3 +72,55 @@ def materialize_v2_optimization_state(
         branch=branch,
         step=optimization.checkpoint,
     )
+
+
+def materialize_v2_terminal_records(
+    output_root: str | Path,
+    *,
+    source: str,
+    method: str,
+    vocabulary_embeddings: torch.Tensor,
+    tokenizer: Any,
+) -> tuple[V2MaterializationRecord, ...]:
+    """Materialize each single-branch terminal v2 state once, resumably."""
+    root = Path(output_root)
+    examples = {
+        example.example_id: example
+        for example in (
+            V2BenchmarkExample.model_validate(row)
+            for row in read_jsonl(root / "manifests" / "v2" / f"controlled_{source}.jsonl")
+        )
+    }
+    expected_step = 0 if method == "init" else 100
+    records = [
+        OptimizationRecord.model_validate(row)
+        for row in read_jsonl(root / "optimization" / source / method / "records.jsonl")
+    ]
+    terminal = [
+        record
+        for record in records
+        if record.schema_version == "reviewer_eval.v2"
+        and record.checkpoint == expected_step
+        and record.status is RecordStatus.complete
+    ]
+    if len(terminal) != len(examples):
+        raise ValueError("v2 terminal optimization records are incomplete")
+    by_sample = {record.sample_id: record for record in terminal}
+    if len(by_sample) != len(terminal) or set(by_sample) != set(examples):
+        raise ValueError("v2 terminal optimization identities do not match manifest")
+    materializations = tuple(
+        materialize_v2_optimization_state(
+            by_sample[sample_id],
+            example=examples[sample_id],
+            vocabulary_embeddings=vocabulary_embeddings,
+            tokenizer=tokenizer,
+        )
+        for sample_id in sorted(examples)
+    )
+    ledger = JsonlLedger(
+        root / "optimization" / source / method / "materialization.jsonl",
+        key_fields=("sample_id", "step", "branch", "transport"),
+    )
+    for record in materializations:
+        ledger.append_once(record.model_dump(mode="json"))
+    return materializations
