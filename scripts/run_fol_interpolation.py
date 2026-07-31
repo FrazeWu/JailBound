@@ -11,7 +11,8 @@ from typing import Any
 import torch
 
 from benchmark.safety_eval.config import load_config
-from benchmark.safety_eval.execution import _embedding_device, load_local_qwen
+from benchmark.safety_eval.anchor_scorer import tokenize_anchor_set
+from benchmark.safety_eval.execution import load_local_qwen
 from benchmark.safety_eval.fol_records import resolved_terminal_payloads
 from benchmark.safety_eval.fol_boundary import (
     LabeledEditableState,
@@ -22,9 +23,10 @@ from benchmark.safety_eval.fol_boundary import (
 from benchmark.safety_eval.io import atomic_write_jsonl, canonical_hash, read_jsonl
 from benchmark.safety_eval.materialization import materialize_checkpoint
 from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.prompt_contract import tokenize_editable_prompt
 from benchmark.safety_eval.pipeline import generate_materialized_records, write_stage_records
 from benchmark.safety_eval.runtime import validate_model_assets
-from benchmark.safety_eval.schema import BenchmarkExample, JudgmentRecord, OptimizationRecord, RecordStatus, stable_id
+from benchmark.safety_eval.schema import JudgmentRecord, OptimizationRecord, RecordStatus, V2BenchmarkExample, stable_id
 from benchmark.safety_eval.semantic import QwenHiddenMeanEncoder
 from benchmark.safety_eval.transformer_objective import TransformerAttackObjective
 
@@ -48,10 +50,10 @@ def _run_identity(root: Path) -> tuple[str, str]:
     return run_id, config_hash
 
 
-def _records(root: Path, source: str) -> tuple[dict[str, BenchmarkExample], dict[str, OptimizationRecord]]:
+def _records(root: Path, source: str) -> tuple[dict[str, V2BenchmarkExample], dict[str, OptimizationRecord]]:
     examples = {
         row.example_id: row
-        for row in (BenchmarkExample.model_validate(row) for row in read_jsonl(root / "manifests" / f"controlled_{source}.jsonl"))
+        for row in (V2BenchmarkExample.model_validate(row) for row in read_jsonl(root / "manifests" / "v2" / f"controlled_{source}.jsonl"))
     }
     optimized = {
         row.sample_id: row
@@ -141,17 +143,15 @@ def _objective(
     *,
     model: Any,
     tokenizer: Any,
-    attack_text: str,
+    example: V2BenchmarkExample,
     config: Any,
 ) -> TransformerAttackObjective:
-    token_ids = tokenizer(attack_text, return_tensors="pt", add_special_tokens=True)["input_ids"]
-    device = _embedding_device(model)
-    token_ids = token_ids.to(device=device, dtype=torch.long)
+    prompt = tokenize_editable_prompt(example.attack_text, example.editable_spans, tokenizer, "fol-interpolation")
     return TransformerAttackObjective(
         model,
-        frozen_prompt_token_ids=token_ids,
-        answer_token_ids=_anchor_token_ids(tokenizer, tuple(config.optimization.answer_anchors), device),
-        refusal_token_ids=_anchor_token_ids(tokenizer, tuple(config.optimization.refusal_anchors), device),
+        prompt=prompt,
+        answer_anchor_ids=tokenize_anchor_set(tokenizer, tuple(config.optimization.answer_anchors)),
+        refusal_anchor_ids=tokenize_anchor_set(tokenizer, tuple(config.optimization.refusal_anchors)),
         epsilon=config.optimization.epsilon,
         lambda_fol=config.optimization.lambda_fol,
         gamma_z=config.optimization.gamma_z,
@@ -244,7 +244,7 @@ def main() -> int:
             unsafe_z, unsafe_u = unsafe["z"], unsafe["u"]
             if not all(isinstance(value, torch.Tensor) for value in (safe_z, safe_u, unsafe_z, unsafe_u)):
                 raise ValueError("interpolation endpoint state is invalid")
-            objective = _objective(model=handle.model, tokenizer=handle.tokenizer, attack_text=example.attack_text, config=config)
+            objective = _objective(model=handle.model, tokenizer=handle.tokenizer, example=example, config=config)
             device, dtype = embedding.device, embedding.dtype
             states = interpolate_joint_states(
                 safe_z.to(device=device, dtype=dtype),

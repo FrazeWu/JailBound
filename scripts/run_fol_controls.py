@@ -11,14 +11,16 @@ from typing import Any
 import torch
 
 from benchmark.safety_eval.config import load_config
-from benchmark.safety_eval.execution import _embedding_device, load_local_qwen
+from benchmark.safety_eval.anchor_scorer import tokenize_anchor_set
+from benchmark.safety_eval.execution import load_local_qwen
 from benchmark.safety_eval.fol_records import resolved_terminal_payloads
 from benchmark.safety_eval.fol_boundary import random_joint_direction
 from benchmark.safety_eval.fol_runtime import causal_perplexity
 from benchmark.safety_eval.io import JsonlLedger, canonical_hash, read_jsonl
 from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.prompt_contract import tokenize_editable_prompt
 from benchmark.safety_eval.runtime import validate_model_assets
-from benchmark.safety_eval.schema import BenchmarkExample, OptimizationRecord, RecordStatus
+from benchmark.safety_eval.schema import OptimizationRecord, RecordStatus, V2BenchmarkExample
 from benchmark.safety_eval.transformer_objective import TransformerAttackObjective
 
 
@@ -51,10 +53,10 @@ def _validation_ids(root: Path, source: str) -> set[str]:
     return values
 
 
-def _records(root: Path, source: str) -> tuple[dict[str, BenchmarkExample], dict[str, OptimizationRecord]]:
+def _records(root: Path, source: str) -> tuple[dict[str, V2BenchmarkExample], dict[str, OptimizationRecord]]:
     examples = {
         row.example_id: row
-        for row in (BenchmarkExample.model_validate(row) for row in read_jsonl(root / "manifests" / f"controlled_{source}.jsonl"))
+        for row in (V2BenchmarkExample.model_validate(row) for row in read_jsonl(root / "manifests" / "v2" / f"controlled_{source}.jsonl"))
     }
     terminal = {
         row.sample_id: row
@@ -75,15 +77,13 @@ def _acceptance_rates(root: Path) -> dict[tuple[str, str], float]:
     return {key: sum(values) / len(values) for key, values in grouped.items() if values}
 
 
-def _objective(*, model: Any, tokenizer: Any, attack_text: str, config: Any) -> TransformerAttackObjective:
-    token_ids = tokenizer(attack_text, return_tensors="pt", add_special_tokens=True)["input_ids"]
-    device = _embedding_device(model)
-    token_ids = token_ids.to(device=device, dtype=torch.long)
+def _objective(*, model: Any, tokenizer: Any, example: V2BenchmarkExample, config: Any) -> TransformerAttackObjective:
+    prompt = tokenize_editable_prompt(example.attack_text, example.editable_spans, tokenizer, "fol-controls")
     return TransformerAttackObjective(
         model,
-        frozen_prompt_token_ids=token_ids,
-        answer_token_ids=_anchor_token_ids(tokenizer, tuple(config.optimization.answer_anchors), device),
-        refusal_token_ids=_anchor_token_ids(tokenizer, tuple(config.optimization.refusal_anchors), device),
+        prompt=prompt,
+        answer_anchor_ids=tokenize_anchor_set(tokenizer, tuple(config.optimization.answer_anchors)),
+        refusal_anchor_ids=tokenize_anchor_set(tokenizer, tuple(config.optimization.refusal_anchors)),
         epsilon=config.optimization.epsilon,
         lambda_fol=config.optimization.lambda_fol,
         gamma_z=config.optimization.gamma_z,
@@ -174,7 +174,7 @@ def main() -> int:
                 if not isinstance(payload, dict) or not isinstance(payload.get("z"), torch.Tensor) or not isinstance(payload.get("u"), torch.Tensor):
                     raise ValueError("FOL terminal state is invalid")
                 z, u = payload["z"].to(device=device, dtype=dtype), payload["u"].to(device=device, dtype=dtype)
-                objective = _objective(model=handle.model, tokenizer=handle.tokenizer, attack_text=example.attack_text, config=config)
+                objective = _objective(model=handle.model, tokenizer=handle.tokenizer, example=example, config=config)
                 rows.append({
                     "source": source,
                     "sample_id": sample_id,
