@@ -180,6 +180,76 @@ def test_annotator_repairs_one_invalid_response_and_freezes_exact_provenance(
     )
 
 
+def test_annotator_rebuilds_offsets_from_a_unique_model_quote(
+    template_path: Path,
+) -> None:
+    transport = StubTransport([_response(start=0, end=37, quote=PROMPT)])
+
+    annotation = _annotate(
+        SpanAnnotator(_config(template_path), transport, confidence_threshold=0.0)
+    )
+
+    assert annotation.spans[0].start == 0
+    assert annotation.spans[0].end == len(PROMPT)
+    assert annotation.spans[0].quote == PROMPT
+    assert len(transport.calls) == 1
+
+
+def test_annotator_rebuilds_unique_casefolded_model_quote_from_prompt(
+    template_path: Path,
+) -> None:
+    prompt = "---\n\nMinimally edit this paragraph to persuade readers."
+    model_quote = "minimally edit this paragraph to persuade readers."
+    response = _response(start=0, end=len(model_quote), quote=model_quote)
+    transport = StubTransport([response])
+
+    annotation = SpanAnnotator(
+        _config(template_path), transport, confidence_threshold=0.0
+    ).annotate(prompt, seed_intent=SEED_INTENT, source_hints=SOURCE_HINTS)
+
+    assert annotation.spans[0].start == prompt.index("Minimally")
+    assert annotation.spans[0].end == len(prompt)
+    assert annotation.spans[0].quote == "Minimally edit this paragraph to persuade readers."
+    assert len(transport.calls) == 1
+
+
+def test_annotator_does_not_rebuild_ambiguous_casefolded_model_quote(
+    template_path: Path,
+) -> None:
+    prompt = "Minimally edit. minimally edit."
+    model_quote = "MINIMALLY EDIT."
+    response = _response(start=0, end=len(model_quote), quote=model_quote)
+    transport = StubTransport([response, response])
+
+    with pytest.raises(SpanAnnotationError, match=r"quote must equal"):
+        SpanAnnotator(_config(template_path), transport, confidence_threshold=0.0).annotate(
+            prompt, seed_intent=SEED_INTENT, source_hints=SOURCE_HINTS
+        )
+
+    assert len(transport.calls) == 2
+
+
+def test_annotator_does_not_rebuild_offsets_for_an_ambiguous_quote(
+    template_path: Path,
+) -> None:
+    ambiguous_prompt = "repeat text and repeat text"
+    response = _response(start=0, end=1, quote="repeat text")
+    transport = StubTransport([response, response])
+    annotator = SpanAnnotator(_config(template_path), transport, confidence_threshold=0.0)
+
+    with pytest.raises(
+        SpanAnnotationError,
+        match=r"spans\[0\]\.quote must equal prompt\[start:end\]",
+    ):
+        annotator.annotate(
+            ambiguous_prompt,
+            seed_intent=SEED_INTENT,
+            source_hints=SOURCE_HINTS,
+        )
+
+    assert len(transport.calls) == 2
+
+
 def test_second_invalid_response_raises_after_exactly_one_repair(
     template_path: Path,
 ) -> None:

@@ -16,7 +16,7 @@ import pytest
 from benchmark.safety_eval.datasets import RawExample
 from benchmark.safety_eval.io import canonical_json, read_jsonl
 from benchmark.safety_eval.schema import EditableSpan, EditableSpanRole
-from benchmark.safety_eval.span_annotation import FrozenSpanAnnotation
+from benchmark.safety_eval.span_annotation import FrozenSpanAnnotation, SpanAnnotationError
 
 
 _SCRIPT_PATH = (
@@ -60,6 +60,15 @@ def test_script_prefers_its_worktree_source_over_inherited_pythonpath(
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_calibration_template_requires_one_maximal_contiguous_span() -> None:
+    template = (
+        _SCRIPT_PATH.parents[1] / "configs" / "benchmark" / "span_annotation_prompt.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "exactly one span" in template
+    assert "maximal contiguous" in template
 
 
 def _review(confidence: float, accepted: bool) -> object:
@@ -209,6 +218,7 @@ def test_prepare_core_samples_fixed_count_per_source_deterministically() -> None
     ]
     assert all(row["seed_intent"].startswith("intent-") for row in first)
     assert all(row["source_hints"]["language"] == "en" for row in first)
+    assert all("target_text" not in row["source_hints"] for row in first)
     assert all(row["spans"][0]["quote"] == row["prompt"] for row in first)
     for prompt, seed_intent, source_hints in first_annotator.calls:
         assert seed_intent.startswith("intent-")
@@ -216,6 +226,7 @@ def test_prepare_core_samples_fixed_count_per_source_deterministically() -> None
         assert source_hints["source_row_id"].startswith(source_hints["source"] + ":")
         assert source_hints["attack_label"].startswith("attack-")
         assert source_hints["preprocessing"] == ["fixture"]
+        assert "target_text" not in source_hints
         assert prompt.startswith("prompt-")
 
 
@@ -234,6 +245,44 @@ def test_prepare_core_rejects_short_source_or_invalid_count() -> None:
             seed=17,
             annotator=FixtureAnnotator(),
         )
+
+
+class OneFailureAnnotator(FixtureAnnotator):
+    def annotate(
+        self,
+        prompt: str,
+        *,
+        seed_intent: str,
+        source_hints: dict[str, object],
+    ) -> FrozenSpanAnnotation:
+        if prompt.endswith("-0"):
+            raise SpanAnnotationError("fixture projection failure")
+        return super().annotate(
+            prompt, seed_intent=seed_intent, source_hints=source_hints
+        )
+
+
+def test_prepare_records_annotation_failure_and_continues() -> None:
+    failures: list[dict[str, object]] = []
+    rows = prepare_review_rows(
+        {"source": (_raw("source", 0), _raw("source", 1))},
+        per_source=2,
+        seed=17,
+        annotator=OneFailureAnnotator(),
+        failures=failures,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["accepted"] is True
+    assert failures == [
+        {
+            "source": "source",
+            "source_row": 0,
+            "source_row_id": _raw("source", 0).source_row_id,
+            "error_type": "SpanAnnotationError",
+            "error_message": "fixture projection failure",
+        }
+    ]
 
 
 def _signed_review_row(**overrides: object) -> dict[str, object]:
@@ -509,6 +558,7 @@ def test_openai_transport_pins_revision_seed_and_json_schema() -> None:
     schema = response_format["json_schema"]["schema"]
     assert schema["required"] == ["spans"]
     assert schema["additionalProperties"] is False
+    assert schema["properties"]["spans"]["maxItems"] == 1
 
 
 def test_openai_transport_rejects_mismatched_returned_model() -> None:
@@ -555,10 +605,13 @@ def test_cli_mode_boundaries_match_documented_commands() -> None:
             "10",
             "--output",
             "review.jsonl",
+            "--failures-output",
+            "failed.jsonl",
         ]
     )
     assert prepare.mode == "prepare"
     assert prepare.per_source == 10
+    assert prepare.failures_output == Path("failed.jsonl")
 
     freeze = parse_args(
         [

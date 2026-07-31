@@ -27,6 +27,7 @@ from benchmark.safety_eval.span_annotation import (
     AnnotationTransport,
     FrozenSpanAnnotation,
     SpanAnnotator,
+    SpanAnnotationError,
 )
 
 ARTIFACT_VERSION = "span_annotation_confidence.v1"
@@ -43,6 +44,7 @@ _ANNOTATION_RESPONSE_FORMAT: dict[str, object] = {
                 "spans": {
                     "type": "array",
                     "minItems": 1,
+                    "maxItems": 1,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -220,6 +222,7 @@ def prepare_review_rows(
     per_source: int,
     seed: int,
     annotator: Annotator,
+    failures: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     """Deterministically sample and annotate a fixed number from every source."""
     if type(per_source) is not int or per_source < 1:
@@ -249,14 +252,27 @@ def prepare_review_rows(
                 "domain_label": raw.source_domain_label,
                 "language": raw.language,
                 "risk_label": raw.source_risk_label,
-                "target_text": raw.target_text,
                 "preprocessing": list(raw.preprocessing),
             }
-            annotation = annotator.annotate(
-                raw.attack_text,
-                seed_intent=raw.intent,
-                source_hints=source_hints,
-            )
+            try:
+                annotation = annotator.annotate(
+                    raw.attack_text,
+                    seed_intent=raw.intent,
+                    source_hints=source_hints,
+                )
+            except SpanAnnotationError as error:
+                if failures is None:
+                    raise
+                failures.append(
+                    {
+                        "source": source,
+                        "source_row": raw.source_row,
+                        "source_row_id": raw.source_row_id,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    }
+                )
+                continue
             row: dict[str, object] = {
                 "source": source,
                 "source_row": raw.source_row,
@@ -476,6 +492,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     prepare.add_argument("--config", type=Path, required=True)
     prepare.add_argument("--per-source", type=int, required=True)
     prepare.add_argument("--output", type=Path, required=True)
+    prepare.add_argument("--failures-output", type=Path, required=True)
 
     freeze = subparsers.add_parser("freeze")
     freeze.add_argument("--reviewed", type=Path, required=True)
@@ -513,13 +530,18 @@ def _prepare(args: argparse.Namespace) -> None:
         sources[source] = load_source(
             source, _rooted(config.data.paths[source]), targets
         )
+    failures: list[dict[str, object]] = []
     rows = prepare_review_rows(
         sources,
         per_source=args.per_source,
         seed=config.run.seed,
         annotator=annotator,
+        failures=failures,
     )
+    if not rows:
+        raise CalibrationError("all selected annotations failed validation")
     write_prepared_rows(args.output, rows)
+    write_prepared_rows(args.failures_output, failures)
 
 
 def _freeze(args: argparse.Namespace) -> None:

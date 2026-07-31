@@ -73,6 +73,18 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _unique_casefolded_match(prompt: str, quote: str) -> tuple[int, int] | None:
+    """Return the unique case-insensitive match when offsets remain safe to map."""
+    folded_prompt = prompt.casefold()
+    folded_quote = quote.casefold()
+    if len(folded_prompt) != len(prompt) or len(folded_quote) != len(quote):
+        return None
+    start = folded_prompt.find(folded_quote)
+    if start < 0 or folded_prompt.find(folded_quote, start + 1) >= 0:
+        return None
+    return start, start + len(quote)
+
+
 def _schema_error(response: str, prompt: str) -> tuple[EditableSpan, ...]:
     try:
         payload = json.loads(response, object_pairs_hook=_unique_object)
@@ -139,26 +151,34 @@ def _schema_error(response: str, prompt: str) -> tuple[EditableSpan, ...]:
             raise SpanAnnotationError(f"{prefix}.confidence must be between 0 and 1")
         if not isinstance(rationale, str):
             raise SpanAnnotationError(f"{prefix}.rationale must be a string")
-        if end > len(prompt):
-            raise SpanAnnotationError(f"{prefix}.end must be within the prompt")
-        if prompt[start:end] != quote:
-            raise SpanAnnotationError(
-                f"{prefix}.quote must equal prompt[start:end]"
-            )
-        if index and start < previous_end:
+        if end <= len(prompt) and prompt[start:end] == quote:
+            resolved_start, resolved_end = start, end
+        else:
+            resolved_start = prompt.find(quote)
+            if resolved_start >= 0 and prompt.find(quote, resolved_start + 1) < 0:
+                resolved_end = resolved_start + len(quote)
+            else:
+                casefolded_match = _unique_casefolded_match(prompt, quote)
+                if casefolded_match is None:
+                    raise SpanAnnotationError(
+                        f"{prefix}.quote must equal prompt[start:end]"
+                    )
+                resolved_start, resolved_end = casefolded_match
+                quote = prompt[resolved_start:resolved_end]
+        if index and resolved_start < previous_end:
             raise SpanAnnotationError("spans must be ordered and non-overlapping")
 
         spans.append(
             EditableSpan(
-                start=start,
-                end=end,
+                start=resolved_start,
+                end=resolved_end,
                 quote=quote,
                 role=role,
                 confidence=float(confidence),
                 rationale=rationale,
             )
         )
-        previous_end = end
+        previous_end = resolved_end
     return tuple(spans)
 
 
