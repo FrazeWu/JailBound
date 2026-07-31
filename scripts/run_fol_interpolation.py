@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from benchmark.safety_eval.config import load_config
-from benchmark.safety_eval.execution import _anchor_token_ids, _embedding_device, load_local_qwen
+from benchmark.safety_eval.execution import _embedding_device, load_local_qwen
 from benchmark.safety_eval.fol_records import resolved_terminal_payloads
 from benchmark.safety_eval.fol_boundary import (
     LabeledEditableState,
