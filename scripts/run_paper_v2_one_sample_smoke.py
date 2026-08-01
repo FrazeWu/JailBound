@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 import urllib.request
-import types
 
 import torch
 
@@ -92,17 +91,39 @@ EVIDENCE_OUTPUTS = frozenset(
     ("evidence.json", "evidence_judgments.jsonl", "evidence_report.md", "judge_events.jsonl")
 )
 
-if __name__ not in sys.modules:
-    _self_module = types.ModuleType(__name__)
-    _self_module.__dict__.update(globals())
-    sys.modules[__name__] = _self_module
-
-
 @dataclass(frozen=True)
 class ProjectionArguments:
     allowed_token_ids: tuple[int, ...] | None
     prefix_allowed_token_ids_by_position: tuple[tuple[int, ...], ...] | None
     seed_allowed_token_ids_by_position: tuple[tuple[int, ...], ...] | None
+    position_mask_manifest: tuple[
+        tuple[tuple[int, tuple[int, ...]], ...],
+        tuple[tuple[int, tuple[int, ...]], ...],
+    ] | None = None
+    position_mask_manifest_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        positioned = self.prefix_allowed_token_ids_by_position is not None
+        if positioned != (self.seed_allowed_token_ids_by_position is not None):
+            raise ValueError("positioned projection requires both z and U masks")
+        if positioned:
+            if self.allowed_token_ids is not None or self.position_mask_manifest is None:
+                raise ValueError("positioned projection has inconsistent manifest arguments")
+            prefix_manifest, seed_manifest = self.position_mask_manifest
+            if (
+                tuple(row[1] for row in prefix_manifest)
+                != self.prefix_allowed_token_ids_by_position
+                or tuple(row[1] for row in seed_manifest)
+                != self.seed_allowed_token_ids_by_position
+            ):
+                raise ValueError("position mask manifest differs from projection masks")
+            expected_sha256 = canonical_hash(
+                _position_mask_manifest_payload(self.position_mask_manifest)
+            )
+            if self.position_mask_manifest_sha256 != expected_sha256:
+                raise ValueError("position mask manifest SHA-256 differs from projection masks")
+        elif self.position_mask_manifest is not None or self.position_mask_manifest_sha256 is not None:
+            raise ValueError("legacy projection must not carry a position mask manifest")
 
     def kwargs(self) -> dict[str, object]:
         return {
@@ -536,6 +557,9 @@ def run_checkpoint_search(
     manual_rejections: Sequence[ManualCheckpointRejection] = (),
 ) -> dict[str, object]:
     """Advance synchronized branch streams until one checkpoint passes every gate."""
+    manual_rejections = tuple(manual_rejections)
+    if any(not isinstance(row, ManualCheckpointRejection) for row in manual_rejections):
+        raise TypeError("manual_rejections must contain ManualCheckpointRejection entries")
     rejection_by_branch_step: dict[tuple[str, int], ManualCheckpointRejection] = {}
     for rejection in manual_rejections:
         if rejection.branch_step in rejection_by_branch_step:
@@ -778,6 +802,9 @@ def serialize_trajectory_pools(
                     "u_projection_cosine": projected.seed_projection_cosine,
                     "projected_z_changes_vs_step_0": z_changes,
                     "projected_u_changes_vs_step_0": u_changes,
+                    "position_mask_manifest_sha256": (
+                        projection_arguments.position_mask_manifest_sha256
+                    ),
                 }
             )
     return rows
@@ -941,22 +968,70 @@ def _validate_optimization_settings(
         raise ValueError("full answer and refusal anchor sets must be non-empty")
 
 
+def _position_mask_manifest_payload(
+    manifest: tuple[
+        tuple[tuple[int, tuple[int, ...]], ...],
+        tuple[tuple[int, tuple[int, ...]], ...],
+    ],
+) -> dict[str, list[dict[str, object]]]:
+    prefix_manifest, seed_manifest = manifest
+
+    def rows(values: tuple[tuple[int, tuple[int, ...]], ...]) -> list[dict[str, object]]:
+        return [
+            {
+                "original_token_id": original_token_id,
+                "allowed_token_ids": list(allowed_token_ids),
+            }
+            for original_token_id, allowed_token_ids in values
+        ]
+
+    return {
+        "z_position_masks": rows(prefix_manifest),
+        "u_position_masks": rows(seed_manifest),
+    }
+
+
+def _valid_lower_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _projection_arguments_from_vocabulary(vocabulary: Any) -> ProjectionArguments:
     policy = str(getattr(vocabulary, "policy", ""))
     if policy == "english_common_positioned":
-        prefix_masks = tuple(
-            tuple(int(token_id) for token_id in mask.allowed_token_ids)
+        prefix_manifest = tuple(
+            (
+                int(mask.original_token_id),
+                tuple(int(token_id) for token_id in mask.allowed_token_ids),
+            )
             for mask in getattr(vocabulary, "z_position_masks", ())
         )
-        seed_masks = tuple(
-            tuple(int(token_id) for token_id in mask.allowed_token_ids)
+        seed_manifest = tuple(
+            (
+                int(mask.original_token_id),
+                tuple(int(token_id) for token_id in mask.allowed_token_ids),
+            )
             for mask in getattr(vocabulary, "u_position_masks", ())
         )
+        manifest = (prefix_manifest, seed_manifest)
+        expected_sha256 = canonical_hash(_position_mask_manifest_payload(manifest))
+        recorded_sha256 = getattr(vocabulary, "position_mask_manifest_sha256", None)
+        if not _valid_lower_sha256(recorded_sha256):
+            raise ValueError("positioned projection requires a lowercase-hex manifest SHA-256")
+        if recorded_sha256 != expected_sha256:
+            raise ValueError("position mask manifest SHA-256 differs from the exact projection masks")
         return ProjectionArguments(
             allowed_token_ids=None,
-            prefix_allowed_token_ids_by_position=prefix_masks,
-            seed_allowed_token_ids_by_position=seed_masks,
+            prefix_allowed_token_ids_by_position=tuple(row[1] for row in prefix_manifest),
+            seed_allowed_token_ids_by_position=tuple(row[1] for row in seed_manifest),
+            position_mask_manifest=manifest,
+            position_mask_manifest_sha256=expected_sha256,
         )
+    if getattr(vocabulary, "position_mask_manifest_sha256", None) is not None:
+        raise ValueError("legacy projection must not carry position mask manifest evidence")
     return ProjectionArguments(
         allowed_token_ids=tuple(int(token_id) for token_id in getattr(vocabulary, "allowed_token_ids", ())),
         prefix_allowed_token_ids_by_position=None,
@@ -1007,15 +1082,6 @@ def _manual_rejection_ledger_payload(
     }
 
 
-def _position_mask_manifest_sha256(vocabulary: Any) -> str | None:
-    value = getattr(vocabulary, "position_mask_manifest_sha256", None)
-    if value is None:
-        return None
-    if not isinstance(value, str) or len(value) != 64:
-        raise ValueError("projection vocabulary has invalid position mask manifest evidence")
-    return value
-
-
 def _require_position_mask_manifest_match(
     row: Mapping[str, object],
     *,
@@ -1023,6 +1089,21 @@ def _require_position_mask_manifest_match(
 ) -> None:
     if row.get("position_mask_manifest_sha256") != expected_sha256:
         raise ValueError("generated checkpoint position mask manifest does not match configuration")
+
+
+def _attach_materialization_provenance(
+    row: dict[str, object],
+    *,
+    expected_manifest_sha256: str | None,
+    fields: Mapping[str, object],
+) -> None:
+    if "position_mask_manifest_sha256" in fields:
+        raise ValueError("materialization provenance must not overwrite the position mask manifest")
+    _require_position_mask_manifest_match(
+        row,
+        expected_sha256=expected_manifest_sha256,
+    )
+    row.update(fields)
 
 
 def _checkpoint_projection_probe(
@@ -1077,6 +1158,7 @@ def _checkpoint_projection_probe(
         "final_u_token_ids": list(projected.seed_token_ids),
         "final_z_text": _decoded_snippet(tokenizer, projected.prefix_token_ids),
         "final_u_text": _decoded_snippet(tokenizer, projected.seed_token_ids),
+        "position_mask_manifest_sha256": projection_arguments.position_mask_manifest_sha256,
     }
 
 
@@ -1094,7 +1176,6 @@ def _branch_materialization(
     projection_arguments: ProjectionArguments,
     max_new_tokens: int,
     include_continuous_response: bool = True,
-    position_mask_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
     if snapshot.state.u.shape[1] != len(prompt.editable_positions):
         raise ValueError("selected state has the wrong U length")
@@ -1214,7 +1295,7 @@ def _branch_materialization(
         "projected_token_changes": {"z": z_changes, "u": u_changes, "total": z_changes + u_changes},
         "projected_z_changes_vs_step_0": z_changes,
         "projected_u_changes_vs_step_0": u_changes,
-        "position_mask_manifest_sha256": position_mask_manifest_sha256,
+        "position_mask_manifest_sha256": projection_arguments.position_mask_manifest_sha256,
     }
 
 
@@ -2157,7 +2238,7 @@ def optimize_sample(
             u_token_ids=initial_u_token_ids,
         )
         projection_arguments = _projection_arguments_from_vocabulary(projection_vocabulary)
-        position_mask_manifest_sha = _position_mask_manifest_sha256(projection_vocabulary)
+        position_mask_manifest_sha = projection_arguments.position_mask_manifest_sha256
         annotation_sha = sha256_file(annotation_path)
         configuration = {
             "steps": steps,
@@ -2296,23 +2377,23 @@ def optimize_sample(
                     projection_arguments=projection_arguments,
                     max_new_tokens=max_new_tokens,
                     include_continuous_response=True,
-                    position_mask_manifest_sha256=position_mask_manifest_sha,
                 )
-                row.update({
-                    "schema_version": SCHEMA_VERSION,
-                    "run_id": run_id,
-                    "config_hash": config_hash,
-                    "sample_id": annotation["sample_id"],
-                    "prompt_sha256": annotation["prompt_sha256"],
-                    "model_revision": resolved.revision,
-                    "state_sha256": state_sha256(snapshot.state),
-                    "materialized_text_sha256": _sha256_text(str(row["materialized_text"])),
-                    "generated_at": _utc_now(),
-                    "position_mask_manifest_sha256": position_mask_manifest_sha,
-                })
-                _require_position_mask_manifest_match(
+                _attach_materialization_provenance(
                     row,
-                    expected_sha256=position_mask_manifest_sha,
+                    expected_manifest_sha256=position_mask_manifest_sha,
+                    fields={
+                        "schema_version": SCHEMA_VERSION,
+                        "run_id": run_id,
+                        "config_hash": config_hash,
+                        "sample_id": annotation["sample_id"],
+                        "prompt_sha256": annotation["prompt_sha256"],
+                        "model_revision": resolved.revision,
+                        "state_sha256": state_sha256(snapshot.state),
+                        "materialized_text_sha256": _sha256_text(
+                            str(row["materialized_text"])
+                        ),
+                        "generated_at": _utc_now(),
+                    },
                 )
                 return row
 
@@ -2416,22 +2497,22 @@ def optimize_sample(
                         projection_arguments=projection_arguments,
                         max_new_tokens=max_new_tokens,
                         include_continuous_response=include_continuous_checkpoints,
-                        position_mask_manifest_sha256=position_mask_manifest_sha,
                     )
-                    row.update({
-                        "schema_version": SCHEMA_VERSION,
-                        "run_id": run_id,
-                        "config_hash": config_hash,
-                        "sample_id": annotation["sample_id"],
-                        "prompt_sha256": annotation["prompt_sha256"],
-                        "model_revision": resolved.revision,
-                        "state_sha256": state_sha256(snapshot.state),
-                        "materialized_text_sha256": _sha256_text(str(row["materialized_text"])),
-                        "position_mask_manifest_sha256": position_mask_manifest_sha,
-                    })
-                    _require_position_mask_manifest_match(
+                    _attach_materialization_provenance(
                         row,
-                        expected_sha256=position_mask_manifest_sha,
+                        expected_manifest_sha256=position_mask_manifest_sha,
+                        fields={
+                            "schema_version": SCHEMA_VERSION,
+                            "run_id": run_id,
+                            "config_hash": config_hash,
+                            "sample_id": annotation["sample_id"],
+                            "prompt_sha256": annotation["prompt_sha256"],
+                            "model_revision": resolved.revision,
+                            "state_sha256": state_sha256(snapshot.state),
+                            "materialized_text_sha256": _sha256_text(
+                                str(row["materialized_text"])
+                            ),
+                        },
                     )
                     rows.append(row)
                 checkpoint_evidence[branch] = rows
@@ -2466,35 +2547,35 @@ def optimize_sample(
                     forbidden_ids=forbidden_ids,
                     projection_arguments=projection_arguments,
                     max_new_tokens=max_new_tokens,
-                    position_mask_manifest_sha256=position_mask_manifest_sha,
                 )
-            branch_result.update({
-                "schema_version": SCHEMA_VERSION,
-                "run_id": run_id,
-                "config_hash": config_hash,
-                "sample_id": annotation["sample_id"],
-                "prompt_sha256": annotation["prompt_sha256"],
-                "annotation_sha256": annotation_sha,
-                "model_revision": resolved.revision,
-                "state_sha256": state_payload["state_sha256"],
-                "state_artifact": state_path.name,
-                "state_artifact_sha256": state_file_hashes[state_path.name],
-                "materialized_text_sha256": _sha256_text(str(branch_result["materialized_text"])),
-                "position_mask_manifest_sha256": position_mask_manifest_sha,
-                "transports": {
-                    "continuous": {
-                        "type": "embedding_access",
-                        "target_adapter_identity": "paper_v2_continuous_chat_input:v1",
-                    },
-                    "materialized": {
-                        "type": "text_chat_template",
-                        "target_adapter_identity": "generate_one:v1",
+            _attach_materialization_provenance(
+                branch_result,
+                expected_manifest_sha256=position_mask_manifest_sha,
+                fields={
+                    "schema_version": SCHEMA_VERSION,
+                    "run_id": run_id,
+                    "config_hash": config_hash,
+                    "sample_id": annotation["sample_id"],
+                    "prompt_sha256": annotation["prompt_sha256"],
+                    "annotation_sha256": annotation_sha,
+                    "model_revision": resolved.revision,
+                    "state_sha256": state_payload["state_sha256"],
+                    "state_artifact": state_path.name,
+                    "state_artifact_sha256": state_file_hashes[state_path.name],
+                    "materialized_text_sha256": _sha256_text(
+                        str(branch_result["materialized_text"])
+                    ),
+                    "transports": {
+                        "continuous": {
+                            "type": "embedding_access",
+                            "target_adapter_identity": "paper_v2_continuous_chat_input:v1",
+                        },
+                        "materialized": {
+                            "type": "text_chat_template",
+                            "target_adapter_identity": "generate_one:v1",
+                        },
                     },
                 },
-            })
-            _require_position_mask_manifest_match(
-                branch_result,
-                expected_sha256=position_mask_manifest_sha,
             )
             branch_results[branch] = branch_result
         events.append(_event(phase, "complete", phase_started))

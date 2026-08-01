@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -19,10 +20,19 @@ SCRIPT = ROOT / "scripts/run_paper_v2_one_sample_smoke.py"
 
 
 def _load_script() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("paper_v2_one_sample_smoke_cli", SCRIPT)
+    module_name = "paper_v2_one_sample_smoke_cli"
+    spec = importlib.util.spec_from_file_location(module_name, SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
     return module
 
 
@@ -1060,6 +1070,29 @@ def test_checkpoint_search_rejects_duplicate_direct_manual_rejections_before_con
         )
 
 
+def test_checkpoint_search_rejects_invalid_manual_rejection_type_before_consuming_streams() -> None:
+    module = _load_script()
+
+    class FailOnNext:
+        def __iter__(self) -> "FailOnNext":
+            return self
+
+        def __next__(self) -> SimpleNamespace:
+            pytest.fail("streams should not be consumed")
+
+    with pytest.raises(TypeError, match="ManualCheckpointRejection"):
+        module.run_checkpoint_search(
+            streams={branch: FailOnNext() for branch in module.BRANCHES},
+            schedule=(25,),
+            probe=lambda *args: pytest.fail("probe should not be called"),
+            generate=lambda *args: pytest.fail("generation should not be called"),
+            persist_generations=lambda rows: pytest.fail("generation persistence should not be called"),
+            judge_pair=lambda evidence: pytest.fail("judge should not be called"),
+            persist_decisions=lambda rows: pytest.fail("decision persistence should not be called"),
+            manual_rejections=(object(),),
+        )
+
+
 def test_checkpoint_search_fails_closed_when_manual_rejection_is_never_encountered() -> None:
     module = _load_script()
 
@@ -1100,14 +1133,14 @@ def test_checkpoint_search_fails_closed_when_manual_rejection_is_never_encounter
                 "transition": "unsafe_to_safe" if evidence["branch"] == "jailbound_o_minus" else "unchanged",
             },
             persist_decisions=lambda rows: None,
-            manual_rejections=(
+            manual_rejections=(row for row in (
                 ManualCheckpointRejection(
                     branch="jailbound_o_plus",
                     step=25,
                     state_sha256=f"{25:064x}",
                     reason="Readable ASCII but code-like English",
                 ),
-            ),
+            )),
         )
 
 
@@ -1145,6 +1178,87 @@ def test_checkpoint_search_fails_closed_when_manual_rejection_never_passes_machi
                     reason="Readable ASCII but code-like English",
                 ),
             ),
+        )
+
+
+def _positioned_vocabulary(module: ModuleType, *, digest: str | None = None) -> SimpleNamespace:
+    manifest = {
+        "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 3]}],
+        "u_position_masks": [{"original_token_id": 2, "allowed_token_ids": [2, 4]}],
+    }
+    return SimpleNamespace(
+        policy="english_common_positioned",
+        allowed_token_ids=(1, 2, 3, 4),
+        z_position_masks=(SimpleNamespace(original_token_id=1, allowed_token_ids=(1, 3)),),
+        u_position_masks=(SimpleNamespace(original_token_id=2, allowed_token_ids=(2, 4)),),
+        position_mask_manifest_sha256=(
+            module.canonical_hash(manifest) if digest is None else digest
+        ),
+    )
+
+
+def test_projection_arguments_cryptographically_bind_the_exact_position_manifest() -> None:
+    module = _load_script()
+
+    arguments = module._projection_arguments_from_vocabulary(_positioned_vocabulary(module))
+
+    assert arguments.position_mask_manifest == (
+        ((1, (1, 3)),),
+        ((2, (2, 4)),),
+    )
+    assert arguments.position_mask_manifest_sha256 == module.canonical_hash({
+        "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 3]}],
+        "u_position_masks": [{"original_token_id": 2, "allowed_token_ids": [2, 4]}],
+    })
+
+
+@pytest.mark.parametrize("digest", [None, "g" * 64, "0" * 64])
+def test_positioned_projection_rejects_missing_nonhex_or_stale_manifest_digest(
+    digest: str | None,
+) -> None:
+    module = _load_script()
+    vocabulary = _positioned_vocabulary(module, digest=digest)
+    if digest is None:
+        vocabulary.position_mask_manifest_sha256 = None
+
+    with pytest.raises(ValueError, match="manifest"):
+        module._projection_arguments_from_vocabulary(vocabulary)
+
+
+def test_legacy_projection_rejects_position_manifest_evidence() -> None:
+    module = _load_script()
+    vocabulary = SimpleNamespace(
+        policy="ascii_printable",
+        allowed_token_ids=(1, 2),
+        position_mask_manifest_sha256="a" * 64,
+    )
+
+    with pytest.raises(ValueError, match="manifest"):
+        module._projection_arguments_from_vocabulary(vocabulary)
+
+
+def test_materialization_provenance_is_checked_before_fields_are_attached() -> None:
+    module = _load_script()
+    row = {"position_mask_manifest_sha256": "b" * 64}
+
+    with pytest.raises(ValueError, match="manifest"):
+        module._attach_materialization_provenance(
+            row,
+            expected_manifest_sha256="a" * 64,
+            fields={"state_sha256": "c" * 64},
+        )
+
+    assert "state_sha256" not in row
+
+
+def test_materialization_provenance_fields_cannot_overwrite_the_manifest() -> None:
+    module = _load_script()
+
+    with pytest.raises(ValueError, match="overwrite"):
+        module._attach_materialization_provenance(
+            {"position_mask_manifest_sha256": "a" * 64},
+            expected_manifest_sha256="a" * 64,
+            fields={"position_mask_manifest_sha256": "a" * 64},
         )
 
 
@@ -1199,6 +1313,11 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
         allowed_token_ids=None,
         prefix_allowed_token_ids_by_position=((1, 3),),
         seed_allowed_token_ids_by_position=((2, 4),),
+        position_mask_manifest=(((1, (1, 3)),), ((2, (2, 4)),)),
+        position_mask_manifest_sha256=module.canonical_hash({
+            "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 3]}],
+            "u_position_masks": [{"original_token_id": 2, "allowed_token_ids": [2, 4]}],
+        }),
     )
     monkeypatch.setattr(module, "materialize_continuous_state", project)
     def materialize_v2_candidate(**kwargs):
@@ -1239,7 +1358,7 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
         ),
     )
 
-    module._checkpoint_projection_probe(
+    probe_row = module._checkpoint_projection_probe(
         branch="jailbound_o_minus",
         snapshot=snapshot,
         initial_state=_state(),
@@ -1248,7 +1367,7 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
         forbidden_ids=(0,),
         projection_arguments=projection_arguments,
     )
-    module._branch_materialization(
+    materialized_row = module._branch_materialization(
         branch="jailbound_o_minus",
         snapshot=snapshot,
         initial_state=_state(),
@@ -1261,7 +1380,7 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
         projection_arguments=projection_arguments,
         max_new_tokens=16,
     )
-    module.serialize_trajectory_pools(
+    trajectory_rows = module.serialize_trajectory_pools(
         {branch: [snapshot] for branch in module.BRANCHES},
         vocabulary_embeddings=torch.eye(3),
         tokenizer=Tokenizer(),
@@ -1279,6 +1398,15 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
         entry["seed_allowed_token_ids_by_position"] is projection_arguments.seed_allowed_token_ids_by_position
         for entry in seen
     )
+    assert (
+        materialized_row["position_mask_manifest_sha256"]
+        == projection_arguments.position_mask_manifest_sha256
+    )
+    assert probe_row["position_mask_manifest_sha256"] == projection_arguments.position_mask_manifest_sha256
+    assert all(
+        row["position_mask_manifest_sha256"] == projection_arguments.position_mask_manifest_sha256
+        for row in trajectory_rows
+    )
 
 
 def test_branch_materialization_rejects_projection_ids_outside_position_masks(monkeypatch) -> None:
@@ -1293,6 +1421,11 @@ def test_branch_materialization_rejects_projection_ids_outside_position_masks(mo
         allowed_token_ids=None,
         prefix_allowed_token_ids_by_position=((1,),),
         seed_allowed_token_ids_by_position=((2,),),
+        position_mask_manifest=(((1, (1,)),), ((2, (2,)),)),
+        position_mask_manifest_sha256=module.canonical_hash({
+            "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1]}],
+            "u_position_masks": [{"original_token_id": 2, "allowed_token_ids": [2]}],
+        }),
     )
     monkeypatch.setattr(
         module,
@@ -1348,6 +1481,10 @@ def test_optimize_sample_reuses_one_projection_arguments_object_without_early_st
     initial_state = _state()
     final_state = _state(2.0)
     captured: dict[str, object] = {"projection_ids": []}
+    manifest_sha256 = module.canonical_hash({
+        "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 4]}],
+        "u_position_masks": [{"original_token_id": 3, "allowed_token_ids": [3]}],
+    })
 
     class Tokenizer:
         all_special_ids = (0,)
@@ -1405,12 +1542,12 @@ def test_optimize_sample_reuses_one_projection_arguments_object_without_early_st
         return SimpleNamespace(
             policy="english_common_positioned",
             allowed_token_ids=(1, 4),
-            z_position_masks=(SimpleNamespace(allowed_token_ids=(1, 4)),),
-            u_position_masks=(SimpleNamespace(allowed_token_ids=(3,)),),
-            position_mask_manifest_sha256="m" * 64,
+            z_position_masks=(SimpleNamespace(original_token_id=1, allowed_token_ids=(1, 4)),),
+            u_position_masks=(SimpleNamespace(original_token_id=3, allowed_token_ids=(3,)),),
+            position_mask_manifest_sha256=manifest_sha256,
             evidence=lambda: {
                 "policy": "english_common_positioned",
-                "position_mask_manifest_sha256": "m" * 64,
+                "position_mask_manifest_sha256": manifest_sha256,
             },
         )
 
@@ -1505,6 +1642,9 @@ def test_optimize_sample_reuses_one_projection_arguments_object_without_early_st
             "projected_token_changes": {"z": 1, "u": 1, "total": 2},
             "projected_z_changes_vs_step_0": 1,
             "projected_u_changes_vs_step_0": 1,
+            "position_mask_manifest_sha256": (
+                kwargs["projection_arguments"].position_mask_manifest_sha256
+            ),
         }
 
     monkeypatch.setattr(module, "_branch_materialization", branch_materialization)
@@ -1553,15 +1693,15 @@ def test_optimize_sample_reuses_one_projection_arguments_object_without_early_st
         "sha256": None,
         "entries": [],
     }
-    assert result["configuration"]["projection_vocabulary"]["position_mask_manifest_sha256"] == "m" * 64
+    assert result["configuration"]["projection_vocabulary"]["position_mask_manifest_sha256"] == manifest_sha256
     assert result["safety_judge_called"] is False
     assert all(
-        row["position_mask_manifest_sha256"] == "m" * 64
+        row["position_mask_manifest_sha256"] == manifest_sha256
         for rows in result["checkpoint_evidence"].values()
         for row in rows
     )
     assert all(
-        result["branches"][branch]["position_mask_manifest_sha256"] == "m" * 64
+        result["branches"][branch]["position_mask_manifest_sha256"] == manifest_sha256
         for branch in module.BRANCHES
     )
 
@@ -1587,6 +1727,10 @@ def test_optimize_sample_reuses_one_projection_arguments_object_with_early_stop(
     initial_state = _state()
     final_state = _state(2.0)
     captured: dict[str, object] = {"projection_ids": []}
+    manifest_sha256 = module.canonical_hash({
+        "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 4]}],
+        "u_position_masks": [{"original_token_id": 3, "allowed_token_ids": [3]}],
+    })
 
     class Tokenizer:
         all_special_ids = (0,)
@@ -1640,12 +1784,12 @@ def test_optimize_sample_reuses_one_projection_arguments_object_with_early_stop(
         lambda tokenizer, vocabulary_size, policy, **kwargs: SimpleNamespace(
             policy="english_common_positioned",
             allowed_token_ids=(1, 4),
-            z_position_masks=(SimpleNamespace(allowed_token_ids=(1, 4)),),
-            u_position_masks=(SimpleNamespace(allowed_token_ids=(3,)),),
-            position_mask_manifest_sha256="m" * 64,
+            z_position_masks=(SimpleNamespace(original_token_id=1, allowed_token_ids=(1, 4)),),
+            u_position_masks=(SimpleNamespace(original_token_id=3, allowed_token_ids=(3,)),),
+            position_mask_manifest_sha256=manifest_sha256,
             evidence=lambda: {
                 "policy": "english_common_positioned",
-                "position_mask_manifest_sha256": "m" * 64,
+                "position_mask_manifest_sha256": manifest_sha256,
             },
         ),
     )
@@ -1717,6 +1861,9 @@ def test_optimize_sample_reuses_one_projection_arguments_object_with_early_stop(
             "projected_token_changes": {"z": 1, "u": 1, "total": 2},
             "projected_z_changes_vs_step_0": 1,
             "projected_u_changes_vs_step_0": 1,
+            "position_mask_manifest_sha256": (
+                kwargs["projection_arguments"].position_mask_manifest_sha256
+            ),
         }
 
     monkeypatch.setattr(module, "_branch_materialization", branch_materialization)
@@ -1839,12 +1986,12 @@ def test_optimize_sample_reuses_one_projection_arguments_object_with_early_stop(
     assert result["checkpoint_search"]["accepted"] is True
     assert result["safety_judge_called"] is True
     assert all(
-        row["position_mask_manifest_sha256"] == "m" * 64
+        row["position_mask_manifest_sha256"] == manifest_sha256
         for rows in result["checkpoint_evidence"].values()
         for row in rows
     )
     assert all(
-        result["branches"][branch]["position_mask_manifest_sha256"] == "m" * 64
+        result["branches"][branch]["position_mask_manifest_sha256"] == manifest_sha256
         for branch in module.BRANCHES
     )
 
