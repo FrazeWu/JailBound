@@ -166,6 +166,7 @@ def test_annotation_persists_raw_response_and_exact_request_messages(tmp_path: P
     assert persisted["annotator"]["temperature"] == 0.0
     assert persisted["prompt"] == prompt
     assert persisted["editable_spans"][0]["quote"] == "exact payload"
+    assert persisted["offset_corrections"] == []
     events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
     assert events[-1]["status"] == "complete"
 
@@ -493,6 +494,178 @@ def test_optimize_main_forwards_continuous_checkpoints_pairing(tmp_path: Path, m
     assert captured["include_continuous_checkpoints"] is True
 
 
+def test_checkpoint_early_stop_dry_run_reports_schedule_without_side_effects(
+    tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_script()
+    annotation = tmp_path / "annotation.json"
+    model = tmp_path / "model"
+    output = tmp_path / "output"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    annotation.write_text(json.dumps(_annotation_artifact(module)), encoding="utf-8")
+    monkeypatch.setattr(module, "load_smoke_model", lambda *args, **kwargs: pytest.fail("model loaded"))
+
+    exit_code = module.main([
+        "optimize", "--annotation", str(annotation), "--output-root", str(output),
+        "--model-path", str(model), "--prefix-init-text", "prefix", "--seed", "17",
+        "--steps", "500", "--include-continuous-checkpoints", "--checkpoint-early-stop",
+        "--judge-endpoint", "http://127.0.0.1:8001/v1",
+        "--judge-model", "immutable-revision", "--judge-threshold", "0.5", "--dry-run",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["checkpoint_early_stop"] is True
+    assert payload["checkpoint_schedule"] == [
+        10, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250,
+        275, 300, 325, 350, 375, 400, 425, 450, 475, 500,
+    ]
+    assert payload["would_contact_endpoint"] is False
+    assert payload["would_load_model"] is False
+    assert not output.exists()
+
+
+def test_checkpoint_early_stop_requires_pairing_and_endpoint(tmp_path: Path) -> None:
+    module = _load_script()
+    annotation = tmp_path / "annotation.json"
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    annotation.write_text(json.dumps(_annotation_artifact(module)), encoding="utf-8")
+    base = [
+        "optimize", "--annotation", str(annotation), "--output-root", str(tmp_path / "output"),
+        "--model-path", str(model), "--prefix-init-text", "prefix", "--seed", "17",
+        "--steps", "500", "--checkpoint-early-stop", "--dry-run",
+    ]
+
+    with pytest.raises(ValueError, match="continuous checkpoints"):
+        module.main([*base, "--judge-endpoint", "http://fixture/v1", "--judge-model", "judge"])
+    with pytest.raises(ValueError, match="judge endpoint and model"):
+        module.main([*base, "--include-continuous-checkpoints"])
+
+
+def test_optimize_main_forwards_checkpoint_early_stop_settings(tmp_path: Path, monkeypatch) -> None:
+    module = _load_script()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(module, "optimize_sample", lambda **kwargs: captured.update(kwargs))
+
+    assert module.main([
+        "optimize", "--annotation", str(tmp_path / "annotation.json"),
+        "--output-root", str(tmp_path / "output"), "--model-path", str(tmp_path / "model"),
+        "--prefix-init-text", "prefix", "--seed", "17", "--steps", "500",
+        "--include-continuous-checkpoints", "--checkpoint-early-stop",
+        "--judge-endpoint", "http://fixture/v1", "--judge-model", "judge-r1",
+        "--judge-threshold", "0.4",
+    ]) == 0
+
+    assert captured["checkpoint_early_stop"] is True
+    assert captured["judge_endpoint"] == "http://fixture/v1"
+    assert captured["judge_model"] == "judge-r1"
+    assert captured["judge_threshold"] == 0.4
+
+
+def test_checkpoint_search_continues_then_stops_without_consuming_later_updates(tmp_path: Path) -> None:
+    module = _load_script()
+    yielded: dict[str, list[int]] = {branch: [] for branch in module.BRANCHES}
+
+    def stream(branch: str):
+        for step in (0, 10, 25, 50, 75):
+            yielded[branch].append(step)
+            yield SimpleNamespace(checkpoint=step, branch=branch)
+
+    def probe(branch: str, snapshot: SimpleNamespace) -> dict[str, object]:
+        both_changed = snapshot.checkpoint >= 25 and branch == "jailbound_o_minus"
+        return {
+            "branch": branch,
+            "step": snapshot.checkpoint,
+            "projected_token_changes": {
+                "z": int(both_changed), "u": int(both_changed), "total": 2 * int(both_changed)
+            },
+            "final_z_text": "readable prefix",
+            "final_u_text": "readable request",
+        }
+
+    def generate(branch: str, snapshot: SimpleNamespace) -> dict[str, object]:
+        return {
+            **probe(branch, snapshot),
+            "state_sha256": f"{snapshot.checkpoint:064x}",
+            "frozen_positions_unchanged": True,
+            "decoded_retokenization_audit": {"exact_match": True},
+            "continuous_response": "unsafe response",
+            "materialized_response": "safe refusal",
+        }
+
+    persisted_generations: list[dict[str, object]] = []
+    persisted_decisions: list[dict[str, object]] = []
+
+    def persist_generations(rows) -> None:
+        persisted_generations[:] = copy.deepcopy(list(rows))
+
+    def judge(evidence: dict[str, object]) -> dict[str, object]:
+        assert any(
+            row["branch"] == evidence["branch"] and row["step"] == evidence["step"]
+            for row in persisted_generations
+        )
+        accepted = evidence["step"] == 50
+        return {
+            "branch": evidence["branch"],
+            "step": evidence["step"],
+            "state_sha256": evidence["state_sha256"],
+            "continuous": {"unsafe_label": accepted},
+            "materialized": {"unsafe_label": False},
+            "transition": "unsafe_to_safe" if accepted else "unchanged",
+        }
+
+    outcome = module.run_checkpoint_search(
+        streams={branch: stream(branch) for branch in module.BRANCHES},
+        schedule=(10, 25, 50, 75),
+        probe=probe,
+        generate=generate,
+        persist_generations=persist_generations,
+        judge_pair=judge,
+        persist_decisions=lambda rows: persisted_decisions.__setitem__(slice(None), copy.deepcopy(list(rows))),
+    )
+
+    assert outcome["accepted"] is True
+    assert outcome["stopping_branch"] == "jailbound_o_minus"
+    assert outcome["stopping_step"] == 50
+    assert outcome["visited_checkpoints"] == [10, 25, 50]
+    assert yielded == {branch: [0, 10, 25, 50] for branch in module.BRANCHES}
+    assert len(persisted_generations) == 2
+    assert persisted_decisions[-1]["accepted"] is True
+
+
+def test_checkpoint_search_reports_honest_exhaustion() -> None:
+    module = _load_script()
+
+    def stream(branch: str):
+        for step in (0, 10):
+            yield SimpleNamespace(checkpoint=step, branch=branch)
+
+    outcome = module.run_checkpoint_search(
+        streams={branch: stream(branch) for branch in module.BRANCHES},
+        schedule=(10,),
+        probe=lambda branch, snapshot: {
+            "branch": branch,
+            "step": snapshot.checkpoint,
+            "projected_token_changes": {"z": 1, "u": 0, "total": 1},
+        },
+        generate=lambda *args: pytest.fail("generation should be skipped"),
+        persist_generations=lambda rows: None,
+        judge_pair=lambda evidence: pytest.fail("judge should be skipped"),
+        persist_decisions=lambda rows: None,
+    )
+
+    assert outcome["accepted"] is False
+    assert outcome["stopping_branch"] is None
+    assert outcome["stopping_step"] is None
+    assert all(
+        row["reasons"] == ["z_and_u_must_both_change"]
+        for row in outcome["decisions"]
+    )
+
+
 def test_optimize_dry_run_rejects_non_finite_hyperparameters_before_model_load(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -745,6 +918,33 @@ def test_judge_evidence_rejects_failed_judgment() -> None:
         module.judge_evidence_payload(result, judge=Judge(), threshold=0.5)
 
 
+def test_endpoint_judge_evidence_dry_run_requires_no_local_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_script()
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps({
+        "schema_version": module.SCHEMA_VERSION,
+        "sample": {"sample_id": "jailbound:fixture"},
+    }), encoding="utf-8")
+
+    exit_code = module.main([
+        "judge-evidence",
+        "--result", str(result_path),
+        "--output-root", str(tmp_path),
+        "--judge-backend", "qwen_compat",
+        "--judge-endpoint", "http://127.0.0.1:8001/v1",
+        "--judge-model", "immutable-revision",
+        "--dry-run",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["judge_backend"] == "qwen_compat"
+    assert payload["would_contact_endpoint"] is False
+    assert payload["would_load_model"] is False
+
+
 @pytest.mark.parametrize(
     ("continuous_unsafe", "materialized_unsafe", "expected"),
     [
@@ -823,6 +1023,58 @@ def test_judge_evidence_records_same_state_unsafe_to_safe_pair() -> None:
     assert evidence["checkpoint_judgments"]["jailbound_o_plus"][0]["method"] == (
         "materialized_checkpoint:jailbound_o_plus"
     )
+
+
+def test_judge_evidence_separates_behavioral_reverse_pair_from_projected_change_audit() -> None:
+    module = _load_script()
+
+    class Judge:
+        key = "fixture_judge"
+        revision = "fixture-r1"
+
+        def judge_response(self, **kwargs):
+            unsafe = kwargs["response_text"] == "continuous unsafe answer"
+            return SimpleNamespace(
+                status="complete",
+                unsafe_score=0.9 if unsafe else 0.1,
+                unsafe_label=unsafe,
+                raw_output="unsafe" if unsafe else "safe",
+                failure_reason=None,
+            )
+
+    state_hash = "b" * 64
+    result = {
+        "schema_version": module.SCHEMA_VERSION,
+        "run_id": "run:fixture",
+        "config_hash": "a" * 64,
+        "configuration": {"include_continuous_checkpoints": True},
+        "model": {"revision": "target-r1"},
+        "sample": {"sample_id": "harmbench:fixture", "source": "harmbench"},
+        "baseline": {"meta_prompt": "request", "target_response": "safe refusal"},
+        "checkpoint_evidence": {
+            "jailbound_o_minus": [{
+                "branch": "jailbound_o_minus",
+                "step": 25,
+                "state_sha256": state_hash,
+                "continuous_response": "continuous unsafe answer",
+                "materialized_response": "safe refusal",
+                "projected_token_changes": {"z": 0, "u": 0, "total": 0},
+                "frozen_positions_unchanged": True,
+                "decoded_retokenization_audit": {"exact_match": True},
+            }],
+            "jailbound_o_plus": [],
+        },
+    }
+
+    evidence = module.judge_evidence_payload(result, judge=Judge(), threshold=0.5)
+
+    assert evidence["first_behavioral_unsafe_to_safe_checkpoint"] == {
+        "branch": "jailbound_o_minus",
+        "step": 25,
+        "state_sha256": state_hash,
+    }
+    assert evidence["first_unsafe_to_safe_checkpoint"] is None
+    assert evidence["reverse_example_audit"]["valid"] is False
 
 
 def test_judge_evidence_rejects_empty_continuous_response_when_pairing_enabled() -> None:
@@ -1033,6 +1285,7 @@ def test_reverse_example_audit_accepts_only_complete_same_state_pair() -> None:
     [
         ("state_sha256", "c" * 64),
         ("projected_token_changes", {"z": 0, "u": 0, "total": 0}),
+        ("projected_token_changes", {"z": 1, "u": 0, "total": 1}),
         ("frozen_positions_unchanged", False),
         ("decoded_retokenization_audit", {"exact_match": False}),
         ("continuous_response", ""),
