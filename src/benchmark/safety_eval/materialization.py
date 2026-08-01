@@ -243,17 +243,30 @@ def calibrate_threshold(
 def _allowed_vocabulary(
     vocabulary_embeddings: torch.Tensor,
     forbidden_token_ids: Iterable[int],
+    allowed_token_ids: Iterable[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if vocabulary_embeddings.ndim != 2:
         raise ValueError("vocabulary embeddings must have shape [vocabulary, hidden]")
     forbidden = set(int(token_id) for token_id in forbidden_token_ids)
-    ids = torch.tensor(
-        [index for index in range(vocabulary_embeddings.shape[0]) if index not in forbidden],
-        device=vocabulary_embeddings.device,
-        dtype=torch.long,
-    )
-    if not len(ids):
-        raise ValueError("no allowed vocabulary ids remain after masking")
+    if allowed_token_ids is None:
+        ids = torch.tensor(
+            [index for index in range(vocabulary_embeddings.shape[0]) if index not in forbidden],
+            device=vocabulary_embeddings.device,
+            dtype=torch.long,
+        )
+        if not len(ids):
+            raise ValueError("no allowed vocabulary ids remain after masking")
+    else:
+        allowed = tuple(int(token_id) for token_id in allowed_token_ids)
+        if not allowed:
+            raise ValueError("allowed token ids must not be empty")
+        if len(set(allowed)) != len(allowed):
+            raise ValueError("allowed token ids must be unique")
+        if any(token_id < 0 or token_id >= vocabulary_embeddings.shape[0] for token_id in allowed):
+            raise ValueError("allowed token ids must be in range")
+        if forbidden.intersection(allowed):
+            raise ValueError("allowed token ids must not be forbidden")
+        ids = torch.tensor(allowed, device=vocabulary_embeddings.device, dtype=torch.long)
     return ids, vocabulary_embeddings.index_select(0, ids)
 
 
@@ -277,10 +290,11 @@ def materialize_continuous_state(
     vocabulary_embeddings: torch.Tensor,
     *,
     forbidden_token_ids: Iterable[int] = (),
+    allowed_token_ids: Iterable[int] | None = None,
 ) -> ContinuousMaterialization:
     """Project *both* ``z`` and ``u`` against one masked vocabulary."""
     allowed_ids, allowed_embeddings = _allowed_vocabulary(
-        vocabulary_embeddings, forbidden_token_ids
+        vocabulary_embeddings, forbidden_token_ids, allowed_token_ids
     )
     prefix_ids, prefix_cosine = _project_block(state.z, allowed_ids, allowed_embeddings)
     seed_ids, seed_cosine = _project_block(state.u, allowed_ids, allowed_embeddings)

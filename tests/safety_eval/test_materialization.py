@@ -50,6 +50,29 @@ def test_materializer_rejects_forbidden_projection_ids() -> None:
         materialize_continuous_state(_state(), vocabulary, forbidden_token_ids=(0, 1))
 
 
+def test_materializer_projects_both_blocks_only_into_explicit_allowed_ids() -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
+
+    materialization = materialize_continuous_state(
+        _state(), vocabulary, allowed_token_ids=(1, 3)
+    )
+
+    assert materialization.prefix_token_ids == (1,)
+    assert materialization.seed_token_ids == (3,)
+
+
+@pytest.mark.parametrize("allowed_token_ids", [(), (4,), (1, 1)])
+def test_materializer_rejects_invalid_explicit_allowed_token_ids(
+    allowed_token_ids: tuple[int, ...],
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match="allowed token"):
+        materialize_continuous_state(
+            _state(), vocabulary, allowed_token_ids=allowed_token_ids
+        )
+
+
 def test_discrete_candidate_builds_a_complete_strict_materialization_record() -> None:
     record = build_materialization_record(
         schema_version="reviewer_eval.v1",
