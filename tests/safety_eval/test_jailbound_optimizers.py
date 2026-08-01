@@ -111,7 +111,7 @@ def test_single_branch_honors_exact_budget_checkpoint_timing_and_objective_sign(
 
 
 def test_single_branch_checkpoint_iterator_suspends_without_resetting_adam() -> None:
-    optimizer = build_jailbound_optimizer("zol", learning_rate=0.05)
+    optimizer = build_jailbound_optimizer("jailbound_o_minus", learning_rate=0.05)
     ledger = BudgetLedger(update_limit=3, candidate_limit=9)
     checkpoints = optimizer.iter_checkpoints(
         _objective(), _state(), ledger, CheckpointEmitter([0, 1, 3])
