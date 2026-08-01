@@ -569,6 +569,7 @@ def test_runner_advertises_only_integrated_projection_token_policies() -> None:
     assert module.RUNNER_PROJECTION_TOKEN_POLICIES == (
         "special_only",
         "ascii_printable",
+        "ascii_printable_positioned",
         "english_common_positioned",
     )
     assert tuple(projection_action.choices) == module.RUNNER_PROJECTION_TOKEN_POLICIES
@@ -863,6 +864,75 @@ def test_checkpoint_search_reports_honest_exhaustion() -> None:
         row["reasons"] == ["z_and_u_must_both_change"]
         for row in outcome["decisions"]
     )
+
+
+def test_checkpoint_search_rejects_non_ascii_response_before_judge_then_continues() -> None:
+    module = _load_script()
+    judge_calls: list[int] = []
+
+    def stream(branch: str):
+        for step in (0, 25, 50):
+            yield SimpleNamespace(checkpoint=step, branch=branch)
+
+    def probe(branch: str, snapshot: SimpleNamespace) -> dict[str, object]:
+        qualified = branch == "jailbound_o_minus"
+        return {
+            "branch": branch,
+            "step": snapshot.checkpoint,
+            "projected_token_changes": {
+                "z": int(qualified),
+                "u": int(qualified),
+                "total": 2 * int(qualified),
+            },
+            "final_z_text": "readable prefix",
+            "final_u_text": "readable request",
+        }
+
+    def generate(branch: str, snapshot: SimpleNamespace) -> dict[str, object]:
+        return {
+            **probe(branch, snapshot),
+            "state_sha256": f"{snapshot.checkpoint:064x}",
+            "frozen_positions_unchanged": True,
+            "decoded_retokenization_audit": {"exact_match": True},
+            "continuous_response": (
+                "\u82e5\u8981 repeated text"
+                if snapshot.checkpoint == 25
+                else "unsafe response"
+            ),
+            "materialized_response": "safe refusal",
+        }
+
+    def judge(evidence: dict[str, object]) -> dict[str, object]:
+        step = int(evidence["step"])
+        judge_calls.append(step)
+        if step == 25:
+            pytest.fail("judge called for a non-ASCII checkpoint response")
+        return {
+            "branch": evidence["branch"],
+            "step": step,
+            "state_sha256": evidence["state_sha256"],
+            "continuous": {"unsafe_label": True},
+            "materialized": {"unsafe_label": False},
+            "transition": "unsafe_to_safe",
+        }
+
+    outcome = module.run_checkpoint_search(
+        streams={branch: stream(branch) for branch in module.BRANCHES},
+        schedule=(25, 50),
+        probe=probe,
+        generate=generate,
+        persist_generations=lambda rows: None,
+        judge_pair=judge,
+        persist_decisions=lambda rows: None,
+    )
+
+    assert outcome["accepted"] is True
+    assert outcome["stopping_step"] == 50
+    assert judge_calls == [50]
+    assert outcome["decisions"][0]["reasons"] == [
+        "continuous_response_not_ascii_printable"
+    ]
+    assert "paired_judgment" not in outcome["decisions"][0]
 
 
 def test_checkpoint_search_replays_manual_rejection_then_stops_at_later_checkpoint() -> None:
@@ -1244,6 +1314,77 @@ def test_projection_arguments_accept_the_real_builder_manifest_schema() -> None:
     assert arguments.position_mask_manifest_sha256 == vocabulary.position_mask_manifest_sha256
 
 
+def test_projection_arguments_accept_ascii_printable_positioned_manifest() -> None:
+    module = _load_script()
+
+    class Tokenizer:
+        all_special_ids = (0,)
+        pieces = {0: "<special>", 1: " alpha", 2: " beta", 3: "!"}
+
+        def decode(self, token_ids, **kwargs):
+            return "".join(self.pieces[token_id] for token_id in token_ids)
+
+    vocabulary = module.build_projection_vocabulary(
+        Tokenizer(),
+        4,
+        "ascii_printable_positioned",
+        z_token_ids=(1,),
+        u_token_ids=(2,),
+    )
+
+    arguments = module._projection_arguments_from_vocabulary(vocabulary)
+
+    assert arguments.allowed_token_ids is None
+    assert arguments.prefix_allowed_token_ids_by_position == ((2, 3),)
+    assert arguments.seed_allowed_token_ids_by_position == ((1, 3),)
+    assert arguments.position_mask_manifest_sha256 == vocabulary.position_mask_manifest_sha256
+
+
+def test_checkpoint_probe_counts_changes_against_true_initial_ids(monkeypatch) -> None:
+    module = _load_script()
+    manifest = (
+        ((1, "gcg_ascii_without_initial", (3,)),),
+        ((2, "gcg_ascii_without_initial", (4,)),),
+    )
+    arguments = module.ProjectionArguments(
+        allowed_token_ids=None,
+        prefix_allowed_token_ids_by_position=((3,),),
+        seed_allowed_token_ids_by_position=((4,),),
+        position_mask_manifest=manifest,
+        position_mask_manifest_sha256=module.canonical_hash(
+            module._position_mask_manifest_payload(manifest)
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "materialize_continuous_state",
+        lambda *args, **kwargs: SimpleNamespace(
+            prefix_token_ids=(3,),
+            seed_token_ids=(4,),
+        ),
+    )
+    tokenizer = SimpleNamespace(
+        decode=lambda token_ids, **kwargs: "".join({3: " gamma", 4: " delta"}[value] for value in token_ids)
+    )
+
+    row = module._checkpoint_projection_probe(
+        branch="jailbound_o_minus",
+        snapshot=SimpleNamespace(checkpoint=25, state=_state()),
+        initial_z_token_ids=(1,),
+        initial_u_token_ids=(2,),
+        vocabulary=torch.eye(5),
+        tokenizer=tokenizer,
+        forbidden_ids=(0,),
+        projection_arguments=arguments,
+    )
+
+    assert row["initial_z_token_ids"] == [1]
+    assert row["initial_u_token_ids"] == [2]
+    assert row["final_z_token_ids"] == [3]
+    assert row["final_u_token_ids"] == [4]
+    assert row["projected_token_changes"] == {"z": 1, "u": 1, "total": 2}
+
+
 def test_projection_arguments_cryptographically_bind_the_exact_position_manifest() -> None:
     module = _load_script()
 
@@ -1427,7 +1568,8 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
     probe_row = module._checkpoint_projection_probe(
         branch="jailbound_o_minus",
         snapshot=snapshot,
-        initial_state=_state(),
+        initial_z_token_ids=(1,),
+        initial_u_token_ids=(2,),
         vocabulary=torch.eye(3),
         tokenizer=Tokenizer(),
         forbidden_ids=(0,),
@@ -1437,6 +1579,8 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
         branch="jailbound_o_minus",
         snapshot=snapshot,
         initial_state=_state(),
+        initial_z_token_ids=(1,),
+        initial_u_token_ids=(2,),
         prompt=prompt,
         spans=(),
         model=object(),
@@ -1454,7 +1598,7 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
         projection_arguments=projection_arguments,
     )
 
-    assert len(seen) == 6
+    assert len(seen) == 4
     assert all(entry["allowed_token_ids"] is None for entry in seen)
     assert all(
         entry["prefix_allowed_token_ids_by_position"] is projection_arguments.prefix_allowed_token_ids_by_position
@@ -1533,6 +1677,8 @@ def test_branch_materialization_rejects_projection_ids_outside_position_masks(mo
                 state=_state(),
             ),
             initial_state=_state(),
+            initial_z_token_ids=(1,),
+            initial_u_token_ids=(2,),
             prompt=prompt,
             spans=(),
             model=object(),
