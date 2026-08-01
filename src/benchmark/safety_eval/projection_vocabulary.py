@@ -208,6 +208,16 @@ def _build_english_common_vocabulary(
     zipf_frequency: Callable[[str, str], float] | None,
     wordfreq_version: str | None,
 ) -> ProjectionVocabulary:
+    z_ids = _editable_token_ids(
+        z_token_ids,
+        block="z",
+        vocabulary_size=vocabulary_size,
+    )
+    u_ids = _editable_token_ids(
+        u_token_ids,
+        block="u",
+        vocabulary_size=vocabulary_size,
+    )
     frequency, resolved_version = _resolve_word_frequency(
         zipf_frequency,
         wordfreq_version,
@@ -225,16 +235,6 @@ def _build_english_common_vocabulary(
         raise ValueError("projection token policy leaves no common-English tokens")
 
     ordered = tuple(common_ids)
-    z_ids = _editable_token_ids(
-        z_token_ids,
-        block="z",
-        vocabulary_size=vocabulary_size,
-    )
-    u_ids = _editable_token_ids(
-        u_token_ids,
-        block="u",
-        vocabulary_size=vocabulary_size,
-    )
     z_masks = tuple(_position_mask(tokenizer, token_id, ordered) for token_id in z_ids)
     u_masks = tuple(_position_mask(tokenizer, token_id, ordered) for token_id in u_ids)
     manifest = _full_position_manifest(z_masks, u_masks)
@@ -317,12 +317,22 @@ def validate_initial_editable_ids(
     z_ids = tuple(int(value) for value in z_token_ids)
     u_ids = tuple(int(value) for value in u_token_ids)
     if vocabulary.policy == "english_common_positioned":
-        supplied = z_ids + u_ids
-        masks = vocabulary.z_position_masks + vocabulary.u_position_masks
-        if len(supplied) != len(masks) or any(
-            token_id != mask.original_token_id
-            or token_id not in mask.allowed_token_ids
-            for token_id, mask in zip(supplied, masks, strict=True)
+        def matches_position_masks(
+            token_ids: tuple[int, ...],
+            masks: tuple[PositionProjectionMask, ...],
+        ) -> bool:
+            return len(token_ids) == len(masks) and all(
+                token_id == mask.original_token_id
+                and token_id in mask.allowed_token_ids
+                for token_id, mask in zip(token_ids, masks, strict=True)
+            )
+
+        if not matches_position_masks(
+            z_ids,
+            vocabulary.z_position_masks,
+        ) or not matches_position_masks(
+            u_ids,
+            vocabulary.u_position_masks,
         ):
             raise ValueError("projection policy excludes an initial editable token")
         return

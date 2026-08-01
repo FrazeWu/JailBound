@@ -515,6 +515,25 @@ def test_optimize_dry_run_reports_projection_token_policy(
     assert json.loads(capsys.readouterr().out)["projection_token_policy"] == "ascii_printable"
 
 
+def test_runner_advertises_only_integrated_projection_token_policies() -> None:
+    module = _load_script()
+    parser = module._parser()
+    optimize_parser = next(
+        action for action in parser._actions if action.dest == "command"
+    ).choices["optimize"]
+    projection_action = next(
+        action
+        for action in optimize_parser._actions
+        if action.dest == "projection_token_policy"
+    )
+
+    assert module.RUNNER_PROJECTION_TOKEN_POLICIES == (
+        "special_only",
+        "ascii_printable",
+    )
+    assert tuple(projection_action.choices) == module.RUNNER_PROJECTION_TOKEN_POLICIES
+
+
 @pytest.mark.parametrize(
     ("extra_args", "expected"),
     [([], "special_only"), (["--projection-token-policy", "ascii_printable"], "ascii_printable")],

@@ -142,6 +142,32 @@ def _frequency(word: str, language: str) -> float:
     return {"common": 5.0, "obscure": 2.0}.get(word, 0.0)
 
 
+class FailOnDecodeTokenizer:
+    all_special_ids: tuple[int, ...] = ()
+
+    def decode(
+        self,
+        token_ids: list[int],
+        *,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        raise AssertionError("editable token validation must happen before vocabulary scanning")
+
+
+class MultiCommonEnglishTokenizer(EnglishTokenizer):
+    pieces = {
+        **EnglishTokenizer.pieces,
+        11: " beta",
+        42: " alpha",
+    }
+
+
+def _multi_frequency(word: str, language: str) -> float:
+    assert language == "en"
+    return {"common": 5.0, "alpha": 4.5, "beta": 4.0}.get(word, 0.0)
+
+
 def _full_position_manifest(result: object) -> dict[str, list[dict[str, object]]]:
     return {
         "z_position_masks": [
@@ -230,6 +256,88 @@ def test_word_start_original_exceptions_are_local_to_their_position() -> None:
 
     with pytest.raises(FrozenInstanceError):
         z_mask.position_class = "other"
+
+
+@pytest.mark.parametrize(
+    ("z_token_ids", "u_token_ids"),
+    [
+        ((), (1, 2)),
+        ((1, 2), ()),
+        ((2,), (2,)),
+    ],
+)
+def test_positioned_validation_preserves_block_boundaries_and_original_ids(
+    z_token_ids: tuple[int, ...],
+    u_token_ids: tuple[int, ...],
+) -> None:
+    result = build_projection_vocabulary(
+        EnglishTokenizer(),
+        11,
+        "english_common_positioned",
+        z_token_ids=(1,),
+        u_token_ids=(2,),
+        zipf_frequency=_frequency,
+        wordfreq_version=WORDFREQ_VERSION,
+    )
+
+    with pytest.raises(ValueError, match="initial editable token"):
+        validate_initial_editable_ids(
+            result,
+            z_token_ids=z_token_ids,
+            u_token_ids=u_token_ids,
+        )
+
+
+@pytest.mark.parametrize(
+    ("z_token_ids", "u_token_ids", "message"),
+    [
+        (None, (1,), "z_token_ids are required"),
+        ((1,), None, "u_token_ids are required"),
+        ((True,), (1,), "z_token_ids contain an invalid token ID"),
+        ((1,), (3,), "u_token_ids contain an invalid token ID"),
+    ],
+)
+def test_positioned_editable_ids_fail_before_common_vocabulary_scan(
+    z_token_ids: tuple[int, ...] | None,
+    u_token_ids: tuple[int, ...] | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_projection_vocabulary(
+            FailOnDecodeTokenizer(),
+            3,
+            "english_common_positioned",
+            z_token_ids=z_token_ids,
+            u_token_ids=u_token_ids,
+            zipf_frequency=_frequency,
+            wordfreq_version=WORDFREQ_VERSION,
+        )
+
+
+def test_multiple_common_candidates_are_sorted_with_deterministic_digest() -> None:
+    kwargs = {
+        "z_token_ids": (1,),
+        "u_token_ids": (42,),
+        "zipf_frequency": _multi_frequency,
+        "wordfreq_version": WORDFREQ_VERSION,
+    }
+
+    first = build_projection_vocabulary(
+        MultiCommonEnglishTokenizer(),
+        43,
+        "english_common_positioned",
+        **kwargs,
+    )
+    second = build_projection_vocabulary(
+        MultiCommonEnglishTokenizer(),
+        43,
+        "english_common_positioned",
+        **kwargs,
+    )
+
+    assert first.common_english_token_ids == (1, 11, 42)
+    assert first.common_english_token_ids_sha256 == canonical_hash([1, 11, 42])
+    assert second.common_english_token_ids_sha256 == first.common_english_token_ids_sha256
 
 
 @pytest.mark.parametrize("wordfreq_version", ["3.0.0", ""])
