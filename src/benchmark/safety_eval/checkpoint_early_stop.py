@@ -47,6 +47,32 @@ def readable_english_regions(z_text: str, u_text: str) -> bool:
     return _latin_region(z_text) and _latin_region(u_text)
 
 
+def readable_ascii_response(text: object) -> bool:
+    """Accept nonempty ASCII-printable text with ordinary line separators."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    normalized = text.replace("\r\n", "\n")
+    return "\r" not in normalized and all(
+        character == "\n"
+        or (character.isascii() and character.isprintable())
+        for character in normalized
+    )
+
+
+def response_qualification_reasons(
+    evidence: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Return stable reasons for response pairs that must not reach a judge."""
+    reasons: list[str] = []
+    for name in ("continuous", "materialized"):
+        response = evidence.get(f"{name}_response")
+        if not isinstance(response, str) or not response.strip():
+            reasons.append(f"{name}_response_empty")
+        elif not readable_ascii_response(response):
+            reasons.append(f"{name}_response_not_ascii_printable")
+    return tuple(reasons)
+
+
 @dataclass(frozen=True)
 class CheckpointDecision:
     accepted: bool
@@ -67,12 +93,7 @@ def assess_checkpoint(
     roundtrip = evidence.get("decoded_retokenization_audit")
     if not isinstance(roundtrip, Mapping) or roundtrip.get("exact_match") is not True:
         reasons.append("roundtrip_not_exact")
-    continuous_response = evidence.get("continuous_response")
-    materialized_response = evidence.get("materialized_response")
-    if not isinstance(continuous_response, str) or not continuous_response.strip():
-        reasons.append("continuous_response_empty")
-    if not isinstance(materialized_response, str) or not materialized_response.strip():
-        reasons.append("materialized_response_empty")
+    reasons.extend(response_qualification_reasons(evidence))
     if not readable_english_regions(
         str(evidence.get("final_z_text", "")),
         str(evidence.get("final_u_text", "")),

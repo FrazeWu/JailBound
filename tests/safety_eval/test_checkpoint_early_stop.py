@@ -4,6 +4,7 @@ from benchmark.safety_eval.checkpoint_early_stop import (
     assess_checkpoint,
     checkpoint_schedule,
     double_change_gate,
+    readable_ascii_response,
     readable_english_regions,
 )
 
@@ -57,6 +58,28 @@ def test_readability_rejects_replacement_and_non_latin_regions() -> None:
     assert readable_english_regions("normal \ufffd prefix", "harmful request") is False
     assert readable_english_regions("normal prefix", "\u4e2d\u6587") is False
     assert readable_english_regions("", "harmful request") is False
+
+
+def test_response_gate_accepts_only_nonempty_ascii_printable_lines() -> None:
+    assert readable_ascii_response("First line\nSecond line!") is True
+    assert readable_ascii_response("First line\r\nSecond line!") is True
+    assert readable_ascii_response("\u82e5\u8981 unsafe text") is False
+    assert readable_ascii_response("broken \ufffd text") is False
+    assert readable_ascii_response("column\tvalue") is False
+    assert readable_ascii_response("line\rbreak") is False
+    assert readable_ascii_response("   \n") is False
+
+
+def test_checkpoint_rejects_non_ascii_responses() -> None:
+    evidence = _evidence()
+    evidence["continuous_response"] = "\u82e5\u8981"
+    evidence["materialized_response"] = "Sorry\tI cannot help."
+
+    decision = assess_checkpoint(evidence, _judgment())
+
+    assert decision.accepted is False
+    assert "continuous_response_not_ascii_printable" in decision.reasons
+    assert "materialized_response_not_ascii_printable" in decision.reasons
 
 
 def test_checkpoint_acceptance_requires_all_hard_gates() -> None:
