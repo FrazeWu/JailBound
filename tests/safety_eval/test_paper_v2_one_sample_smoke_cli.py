@@ -53,6 +53,10 @@ def _write_manifest(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
+def _write_manual_rejection_ledger(path: Path, rows: list[dict[str, object]]) -> None:
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
 class _Transport:
     model = "fixture-annotator"
     revision = "fixture-r1"
@@ -357,6 +361,30 @@ def test_review_report_contains_required_audit_evidence() -> None:
         assert required in report
 
 
+@pytest.mark.parametrize(
+    ("safety_judge_called", "expected"),
+    [
+        (False, "No safety judge was called and no batch work was launched."),
+        (True, "A safety judge was called and no batch work was launched."),
+    ],
+)
+def test_review_report_describes_actual_safety_judge_usage(
+    safety_judge_called: bool,
+    expected: str,
+) -> None:
+    module = _load_script()
+
+    report = module.build_review_report(
+        {
+            "safety_judge_called": safety_judge_called,
+            "batch_work_launched": False,
+        },
+        {},
+    )
+
+    assert expected in report
+
+
 def test_conflicting_output_artifact_is_refused(tmp_path: Path) -> None:
     module = _load_script()
     output = tmp_path / "output"
@@ -510,10 +538,10 @@ def test_optimize_dry_run_reports_projection_token_policy(
     assert module.main([
         "optimize", "--annotation", str(annotation), "--output-root", str(output),
         "--model-path", str(model), "--prefix-init-text", "prefix", "--seed", "17",
-        "--projection-token-policy", "ascii_printable", "--dry-run",
+        "--projection-token-policy", "english_common_positioned", "--dry-run",
     ]) == 0
 
-    assert json.loads(capsys.readouterr().out)["projection_token_policy"] == "ascii_printable"
+    assert json.loads(capsys.readouterr().out)["projection_token_policy"] == "english_common_positioned"
 
 
 def test_runner_advertises_only_integrated_projection_token_policies() -> None:
@@ -531,13 +559,18 @@ def test_runner_advertises_only_integrated_projection_token_policies() -> None:
     assert module.RUNNER_PROJECTION_TOKEN_POLICIES == (
         "special_only",
         "ascii_printable",
+        "english_common_positioned",
     )
     assert tuple(projection_action.choices) == module.RUNNER_PROJECTION_TOKEN_POLICIES
 
 
 @pytest.mark.parametrize(
     ("extra_args", "expected"),
-    [([], "special_only"), (["--projection-token-policy", "ascii_printable"], "ascii_printable")],
+    [
+        ([], "special_only"),
+        (["--projection-token-policy", "ascii_printable"], "ascii_printable"),
+        (["--projection-token-policy", "english_common_positioned"], "english_common_positioned"),
+    ],
 )
 def test_optimize_main_forwards_projection_token_policy(
     tmp_path: Path,
@@ -556,6 +589,98 @@ def test_optimize_main_forwards_projection_token_policy(
     ]) == 0
 
     assert captured["projection_token_policy"] == expected
+
+
+def test_optimize_main_rejects_manual_rejection_ledger_without_checkpoint_early_stop(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    annotation = tmp_path / "annotation.json"
+    model = tmp_path / "model"
+    ledger = tmp_path / "manual_rejections.jsonl"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    annotation.write_text(json.dumps(_annotation_artifact(module)), encoding="utf-8")
+    _write_manual_rejection_ledger(ledger, [{
+        "branch": "jailbound_o_minus",
+        "step": 25,
+        "state_sha256": "a" * 64,
+        "reason": "Readable ASCII but code-like English",
+    }])
+
+    with pytest.raises(ValueError, match="manual rejection ledger requires checkpoint early stop"):
+        module.main([
+            "optimize", "--annotation", str(annotation), "--output-root", str(tmp_path / "output"),
+            "--model-path", str(model), "--prefix-init-text", "prefix", "--seed", "17",
+            "--manual-rejection-ledger", str(ledger), "--dry-run",
+        ])
+
+
+def test_checkpoint_early_stop_dry_run_reports_manual_rejection_ledger_evidence_without_side_effects(
+    tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_script()
+    annotation = tmp_path / "annotation.json"
+    model = tmp_path / "model"
+    output = tmp_path / "output"
+    ledger = tmp_path / "manual_rejections.jsonl"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    annotation.write_text(json.dumps(_annotation_artifact(module)), encoding="utf-8")
+    _write_manual_rejection_ledger(ledger, [{
+        "branch": "jailbound_o_minus",
+        "step": 25,
+        "state_sha256": "a" * 64,
+        "reason": "Readable ASCII but code-like English",
+    }])
+    before = ledger.read_text(encoding="utf-8")
+    monkeypatch.setattr(module, "load_smoke_model", lambda *args, **kwargs: pytest.fail("model loaded"))
+
+    exit_code = module.main([
+        "optimize", "--annotation", str(annotation), "--output-root", str(output),
+        "--model-path", str(model), "--prefix-init-text", "prefix", "--seed", "17",
+        "--steps", "500", "--include-continuous-checkpoints", "--checkpoint-early-stop",
+        "--judge-endpoint", "http://127.0.0.1:8001/v1",
+        "--judge-model", "immutable-revision",
+        "--manual-rejection-ledger", str(ledger),
+        "--dry-run",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["manual_rejection_ledger"] == {
+        "path": str(ledger.resolve()),
+        "sha256": hashlib.sha256(before.encode("utf-8")).hexdigest(),
+        "entries": [{
+            "branch": "jailbound_o_minus",
+            "step": 25,
+            "state_sha256": "a" * 64,
+            "reason": "Readable ASCII but code-like English",
+        }],
+    }
+    assert payload["would_contact_endpoint"] is False
+    assert payload["would_load_model"] is False
+    assert not output.exists()
+    assert ledger.read_text(encoding="utf-8") == before
+
+
+def test_optimize_main_forwards_manual_rejection_ledger(tmp_path: Path, monkeypatch) -> None:
+    module = _load_script()
+    ledger = tmp_path / "manual_rejections.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(module, "optimize_sample", lambda **kwargs: captured.update(kwargs))
+
+    assert module.main([
+        "optimize", "--annotation", str(tmp_path / "annotation.json"),
+        "--output-root", str(tmp_path / "output"), "--model-path", str(tmp_path / "model"),
+        "--prefix-init-text", "prefix", "--seed", "17", "--steps", "500",
+        "--include-continuous-checkpoints", "--checkpoint-early-stop",
+        "--judge-endpoint", "http://fixture/v1", "--judge-model", "judge-r1",
+        "--manual-rejection-ledger", str(ledger),
+    ]) == 0
+
+    assert captured["manual_rejection_ledger"] == ledger
 
 
 def test_checkpoint_early_stop_dry_run_reports_schedule_without_side_effects(
@@ -1023,12 +1148,18 @@ def test_checkpoint_search_fails_closed_when_manual_rejection_never_passes_machi
         )
 
 
-def test_checkpoint_and_trajectory_projection_share_explicit_allowed_ids(monkeypatch) -> None:
+def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_allowed_ids(
+    monkeypatch,
+) -> None:
     module = _load_script()
-    seen: list[tuple[int, ...]] = []
+    seen: list[dict[str, object]] = []
 
     def project(*args, **kwargs):
-        seen.append(tuple(kwargs["allowed_token_ids"]))
+        seen.append({
+            "allowed_token_ids": kwargs["allowed_token_ids"],
+            "prefix_allowed_token_ids_by_position": kwargs["prefix_allowed_token_ids_by_position"],
+            "seed_allowed_token_ids_by_position": kwargs["seed_allowed_token_ids_by_position"],
+        })
         return SimpleNamespace(
             prefix_token_ids=(1,),
             seed_token_ids=(2,),
@@ -1039,6 +1170,11 @@ def test_checkpoint_and_trajectory_projection_share_explicit_allowed_ids(monkeyp
     class Tokenizer:
         def decode(self, token_ids, *, skip_special_tokens):
             return "text"
+
+        def __call__(self, text: str, *, return_tensors: str, add_special_tokens: bool):
+            assert text == "text"
+            assert return_tensors == "pt"
+            return {"input_ids": torch.tensor([[3, 4]], dtype=torch.long)}
 
     snapshot = SimpleNamespace(
         checkpoint=25,
@@ -1053,7 +1189,55 @@ def test_checkpoint_and_trajectory_projection_share_explicit_allowed_ids(monkeyp
         hvp_calls=0,
         state=_state(),
     )
+    prompt = SimpleNamespace(
+        editable_positions=(1,),
+        frozen_positions=(0,),
+        boundary_expansions=((),),
+        base_token_ids=torch.tensor([[9, 8]], dtype=torch.long),
+    )
+    projection_arguments = module.ProjectionArguments(
+        allowed_token_ids=None,
+        prefix_allowed_token_ids_by_position=((1, 3),),
+        seed_allowed_token_ids_by_position=((2, 4),),
+    )
     monkeypatch.setattr(module, "materialize_continuous_state", project)
+    def materialize_v2_candidate(**kwargs):
+        kwargs["tokenizer"].decode([9, 8], skip_special_tokens=False)
+        return SimpleNamespace(
+            frozen_positions_unchanged=True,
+            reconstructed_base_token_ids=[9, 8],
+            complete_token_ids=[9, 8],
+            text="text",
+        )
+
+    monkeypatch.setattr(module, "materialize_v2_candidate", materialize_v2_candidate)
+    monkeypatch.setattr(
+        module,
+        "generate_one",
+        lambda *args, **kwargs: SimpleNamespace(
+            response="safe refusal",
+            input_tokens=3,
+            generated_tokens=2,
+            used_system_fallback=False,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "generate_from_embeddings",
+        lambda *args, **kwargs: SimpleNamespace(
+            response="unsafe answer",
+            input_tokens=3,
+            generated_tokens=2,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_paper_v2_continuous_chat_input",
+        lambda **kwargs: SimpleNamespace(
+            inputs_embeds=torch.zeros(1, 1, 2),
+            attention_mask=torch.ones(1, 1, dtype=torch.long),
+        ),
+    )
 
     module._checkpoint_projection_probe(
         branch="jailbound_o_minus",
@@ -1062,26 +1246,616 @@ def test_checkpoint_and_trajectory_projection_share_explicit_allowed_ids(monkeyp
         vocabulary=torch.eye(3),
         tokenizer=Tokenizer(),
         forbidden_ids=(0,),
-        allowed_token_ids=(1, 2),
+        projection_arguments=projection_arguments,
+    )
+    module._branch_materialization(
+        branch="jailbound_o_minus",
+        snapshot=snapshot,
+        initial_state=_state(),
+        prompt=prompt,
+        spans=(),
+        model=object(),
+        tokenizer=Tokenizer(),
+        vocabulary=torch.eye(3),
+        forbidden_ids=(0,),
+        projection_arguments=projection_arguments,
+        max_new_tokens=16,
     )
     module.serialize_trajectory_pools(
         {branch: [snapshot] for branch in module.BRANCHES},
         vocabulary_embeddings=torch.eye(3),
         tokenizer=Tokenizer(),
         forbidden_token_ids=(0,),
-        allowed_token_ids=(1, 2),
+        projection_arguments=projection_arguments,
     )
 
-    assert seen == [(1, 2), (1, 2), (1, 2), (1, 2)]
+    assert len(seen) == 6
+    assert all(entry["allowed_token_ids"] is None for entry in seen)
+    assert all(
+        entry["prefix_allowed_token_ids_by_position"] is projection_arguments.prefix_allowed_token_ids_by_position
+        for entry in seen
+    )
+    assert all(
+        entry["seed_allowed_token_ids_by_position"] is projection_arguments.seed_allowed_token_ids_by_position
+        for entry in seen
+    )
 
 
-def test_safety_judge_called_requires_generated_checkpoint_evidence() -> None:
+def test_branch_materialization_rejects_projection_ids_outside_position_masks(monkeypatch) -> None:
+    module = _load_script()
+    prompt = SimpleNamespace(
+        editable_positions=(1,),
+        frozen_positions=(0,),
+        boundary_expansions=((),),
+        base_token_ids=torch.tensor([[9, 8]], dtype=torch.long),
+    )
+    projection_arguments = module.ProjectionArguments(
+        allowed_token_ids=None,
+        prefix_allowed_token_ids_by_position=((1,),),
+        seed_allowed_token_ids_by_position=((2,),),
+    )
+    monkeypatch.setattr(
+        module,
+        "materialize_continuous_state",
+        lambda *args, **kwargs: SimpleNamespace(
+            prefix_token_ids=(3,),
+            seed_token_ids=(2,),
+            prefix_projection_cosine=0.9,
+            seed_projection_cosine=0.8,
+        ),
+    )
+    monkeypatch.setattr(module, "generate_one", lambda *args, **kwargs: pytest.fail("materialized generation called"))
+    monkeypatch.setattr(
+        module,
+        "generate_from_embeddings",
+        lambda *args, **kwargs: pytest.fail("continuous generation called"),
+    )
+
+    with pytest.raises(ValueError, match="position mask"):
+        module._branch_materialization(
+            branch="jailbound_o_minus",
+            snapshot=SimpleNamespace(
+                checkpoint=25,
+                maximize=1.0,
+                attack_loss=0.5,
+                internal_margin=0.25,
+                fol=0.1,
+                state=_state(),
+            ),
+            initial_state=_state(),
+            prompt=prompt,
+            spans=(),
+            model=object(),
+            tokenizer=SimpleNamespace(),
+            vocabulary=torch.eye(4),
+            forbidden_ids=(0,),
+            projection_arguments=projection_arguments,
+            max_new_tokens=16,
+        )
+
+
+def test_optimize_sample_reuses_one_projection_arguments_object_without_early_stop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_script()
+    annotation = tmp_path / "annotation.json"
+    model = tmp_path / "model"
+    output = tmp_path / "output"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    annotation.write_text(json.dumps(_annotation_artifact(module)), encoding="utf-8")
+    initial_state = _state()
+    final_state = _state(2.0)
+    captured: dict[str, object] = {"projection_ids": []}
+
+    class Tokenizer:
+        all_special_ids = (0,)
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            return [1]
+
+    class Model:
+        def get_input_embeddings(self):
+            return SimpleNamespace(weight=torch.eye(5))
+
+    monkeypatch.setattr(
+        module,
+        "load_smoke_model",
+        lambda *args, **kwargs: (
+            SimpleNamespace(
+                path=model,
+                revision="local-sha256:fixture",
+                tokenizer_hash="a" * 64,
+                chat_template_hash="b" * 64,
+            ),
+            SimpleNamespace(model=Model(), tokenizer=Tokenizer(), close=lambda: None),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "tokenize_editable_prompt",
+        lambda *args, **kwargs: SimpleNamespace(
+            editable_positions=(1,),
+            frozen_positions=(0,),
+            boundary_expansions=((),),
+            token_offsets=((0, 1), (1, 2)),
+            base_token_ids=torch.tensor([[9, 8]], dtype=torch.long),
+            gather_editable_ids=lambda: torch.tensor([[3]], dtype=torch.long),
+        ),
+    )
+    monkeypatch.setattr(module, "_anchor_ids", lambda *args, **kwargs: (torch.tensor([1]),))
+    monkeypatch.setattr(
+        module,
+        "PaperV2TransformerObjective",
+        lambda *args, **kwargs: SimpleNamespace(build_editable_state=lambda prefix_ids: initial_state),
+    )
+    monkeypatch.setattr(
+        module,
+        "initialize_prefix_token_ids",
+        lambda *args, **kwargs: torch.tensor([[1]], dtype=torch.long),
+    )
+
+    def build_projection_vocabulary(tokenizer, vocabulary_size, policy, **kwargs):
+        captured["projection_build"] = {
+            "policy": policy,
+            "z_token_ids": kwargs["z_token_ids"],
+            "u_token_ids": kwargs["u_token_ids"],
+        }
+        return SimpleNamespace(
+            policy="english_common_positioned",
+            allowed_token_ids=(1, 4),
+            z_position_masks=(SimpleNamespace(allowed_token_ids=(1, 4)),),
+            u_position_masks=(SimpleNamespace(allowed_token_ids=(3,)),),
+            position_mask_manifest_sha256="m" * 64,
+            evidence=lambda: {
+                "policy": "english_common_positioned",
+                "position_mask_manifest_sha256": "m" * 64,
+            },
+        )
+
+    monkeypatch.setattr(module, "build_projection_vocabulary", build_projection_vocabulary)
+    monkeypatch.setattr(module, "validate_initial_editable_ids", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "generate_one",
+        lambda *args, **kwargs: SimpleNamespace(
+            response="baseline",
+            input_tokens=3,
+            generated_tokens=2,
+            used_system_fallback=False,
+        ),
+    )
+    snapshots = [
+        SimpleNamespace(
+            checkpoint=0,
+            maximize=0.1,
+            attack_loss=1.0,
+            internal_margin=0.1,
+            fol=0.1,
+            updates=0,
+            branch_updates={},
+            forward_passes=0,
+            backward_passes=0,
+            hvp_calls=0,
+            state=initial_state,
+            selection_branch="jailbound_o_minus",
+        ),
+        SimpleNamespace(
+            checkpoint=1,
+            maximize=0.2,
+            attack_loss=0.9,
+            internal_margin=0.2,
+            fol=0.2,
+            updates=1,
+            branch_updates={},
+            forward_passes=1,
+            backward_passes=1,
+            hvp_calls=0,
+            state=final_state,
+            selection_branch="jailbound_o_minus",
+        ),
+    ]
+    monkeypatch.setattr(module, "run_branch_pools", lambda **kwargs: {branch: list(snapshots) for branch in module.BRANCHES})
+    monkeypatch.setattr(module, "select_best_snapshot", lambda branch_snapshots: branch_snapshots[-1])
+    monkeypatch.setattr(module, "report_checkpoint_snapshots", lambda pools, checkpoints: {branch: [pools[branch][-1]] for branch in module.BRANCHES})
+    monkeypatch.setattr(
+        module,
+        "serialize_trajectory_pools",
+        lambda pools, **kwargs: captured["projection_ids"].append(id(kwargs["projection_arguments"])) or [],
+    )
+
+    def branch_materialization(**kwargs):
+        captured["projection_ids"].append(id(kwargs["projection_arguments"]))
+        return {
+            "branch": kwargs["branch"],
+            "step": kwargs["snapshot"].checkpoint,
+            "selected_step": kwargs["snapshot"].checkpoint,
+            "selected_maximize": kwargs["snapshot"].maximize,
+            "selected_attack_loss": kwargs["snapshot"].attack_loss,
+            "selected_fol": kwargs["snapshot"].fol,
+            "selected_margin": kwargs["snapshot"].internal_margin,
+            "materialized_text": "materialized prompt",
+            "materialized_response": "safe refusal",
+            "continuous_response": "unsafe answer",
+            "continuous_input_tokens": 3,
+            "continuous_generated_tokens": 2,
+            "materialized_input_tokens": 3,
+            "materialized_generated_tokens": 2,
+            "omega_s": [1],
+            "frozen_positions": [0],
+            "char_spans": [],
+            "span_to_token_mappings": [],
+            "boundary_expansions": [[]],
+            "base_token_ids": [9, 8],
+            "initial_z_token_ids": [1],
+            "initial_u_token_ids": [3],
+            "final_z_token_ids": [4],
+            "final_u_token_ids": [3],
+            "final_z_text": "prefix",
+            "final_u_text": "request",
+            "reconstructed_base_token_ids": [9, 8],
+            "complete_token_ids": [9, 8],
+            "projection_cosines": {"z": 0.9, "u": 0.8},
+            "one_pass_decode": {"call_count": 1, "calls": []},
+            "decoded_retokenization_audit": {"retokenized_ids": [9, 8], "exact_match": True},
+            "frozen_positions_unchanged": True,
+            "initial_norms": {"z": 1.0, "u": 1.0},
+            "final_norms": {"z": 1.0, "u": 1.0},
+            "projected_token_changes": {"z": 1, "u": 1, "total": 2},
+            "projected_z_changes_vs_step_0": 1,
+            "projected_u_changes_vs_step_0": 1,
+        }
+
+    monkeypatch.setattr(module, "_branch_materialization", branch_materialization)
+    monkeypatch.setattr(module, "finalize_artifacts", lambda **kwargs: {})
+
+    result = module.optimize_sample(
+        annotation_path=annotation,
+        output_root=output,
+        model_path=model,
+        steps=1,
+        checkpoints=(0, 1),
+        prefix_tokens=1,
+        prefix_init_text="prefix",
+        seed=17,
+        learning_rate=0.001,
+        lambda_fol=0.1,
+        epsilon=0.1,
+        gamma_z=0.01,
+        gamma_u=0.01,
+        grad_clip=1.0,
+        answer_anchors=("Sure, here is",),
+        refusal_anchors=("I cannot help",),
+        max_new_tokens=16,
+        attention_backend="eager",
+        activation_checkpointing=False,
+        include_continuous_checkpoints=False,
+        finite_difference_fol=False,
+        finite_difference_radius=1e-3,
+        checkpoint_early_stop=False,
+        projection_token_policy="english_common_positioned",
+        judge_endpoint=None,
+        judge_model=None,
+        judge_threshold=0.5,
+        manual_rejection_ledger=None,
+        command=("python", "runner.py", "optimize"),
+    )
+
+    assert captured["projection_build"] == {
+        "policy": "english_common_positioned",
+        "z_token_ids": (1,),
+        "u_token_ids": (3,),
+    }
+    assert len(set(captured["projection_ids"])) == 1
+    assert result["configuration"]["manual_rejection_ledger"] == {
+        "path": None,
+        "sha256": None,
+        "entries": [],
+    }
+    assert result["configuration"]["projection_vocabulary"]["position_mask_manifest_sha256"] == "m" * 64
+    assert result["safety_judge_called"] is False
+    assert all(
+        row["position_mask_manifest_sha256"] == "m" * 64
+        for rows in result["checkpoint_evidence"].values()
+        for row in rows
+    )
+    assert all(
+        result["branches"][branch]["position_mask_manifest_sha256"] == "m" * 64
+        for branch in module.BRANCHES
+    )
+
+
+def test_optimize_sample_reuses_one_projection_arguments_object_with_early_stop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_script()
+    annotation = tmp_path / "annotation.json"
+    model = tmp_path / "model"
+    output = tmp_path / "output"
+    ledger = tmp_path / "manual_rejections.jsonl"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    annotation.write_text(json.dumps(_annotation_artifact(module)), encoding="utf-8")
+    _write_manual_rejection_ledger(ledger, [{
+        "branch": "jailbound_o_minus",
+        "step": 10,
+        "state_sha256": "b" * 64,
+        "reason": "Readable ASCII but code-like English",
+    }])
+    initial_state = _state()
+    final_state = _state(2.0)
+    captured: dict[str, object] = {"projection_ids": []}
+
+    class Tokenizer:
+        all_special_ids = (0,)
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            return [1]
+
+    class Model:
+        def get_input_embeddings(self):
+            return SimpleNamespace(weight=torch.eye(5))
+
+    monkeypatch.setattr(
+        module,
+        "load_smoke_model",
+        lambda *args, **kwargs: (
+            SimpleNamespace(
+                path=model,
+                revision="local-sha256:fixture",
+                tokenizer_hash="a" * 64,
+                chat_template_hash="b" * 64,
+            ),
+            SimpleNamespace(model=Model(), tokenizer=Tokenizer(), close=lambda: None),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "tokenize_editable_prompt",
+        lambda *args, **kwargs: SimpleNamespace(
+            editable_positions=(1,),
+            frozen_positions=(0,),
+            boundary_expansions=((),),
+            token_offsets=((0, 1), (1, 2)),
+            base_token_ids=torch.tensor([[9, 8]], dtype=torch.long),
+            gather_editable_ids=lambda: torch.tensor([[3]], dtype=torch.long),
+        ),
+    )
+    monkeypatch.setattr(module, "_anchor_ids", lambda *args, **kwargs: (torch.tensor([1]),))
+    monkeypatch.setattr(
+        module,
+        "PaperV2TransformerObjective",
+        lambda *args, **kwargs: SimpleNamespace(build_editable_state=lambda prefix_ids: initial_state),
+    )
+    monkeypatch.setattr(
+        module,
+        "initialize_prefix_token_ids",
+        lambda *args, **kwargs: torch.tensor([[1]], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_projection_vocabulary",
+        lambda tokenizer, vocabulary_size, policy, **kwargs: SimpleNamespace(
+            policy="english_common_positioned",
+            allowed_token_ids=(1, 4),
+            z_position_masks=(SimpleNamespace(allowed_token_ids=(1, 4)),),
+            u_position_masks=(SimpleNamespace(allowed_token_ids=(3,)),),
+            position_mask_manifest_sha256="m" * 64,
+            evidence=lambda: {
+                "policy": "english_common_positioned",
+                "position_mask_manifest_sha256": "m" * 64,
+            },
+        ),
+    )
+    monkeypatch.setattr(module, "validate_initial_editable_ids", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "generate_one",
+        lambda *args, **kwargs: SimpleNamespace(
+            response="baseline",
+            input_tokens=3,
+            generated_tokens=2,
+            used_system_fallback=False,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "serialize_trajectory_pools",
+        lambda pools, **kwargs: captured["projection_ids"].append(id(kwargs["projection_arguments"])) or [],
+    )
+    monkeypatch.setattr(
+        module,
+        "_checkpoint_projection_probe",
+        lambda **kwargs: captured["projection_ids"].append(id(kwargs["projection_arguments"])) or {
+            "branch": kwargs["branch"],
+            "step": kwargs["snapshot"].checkpoint,
+            "projected_token_changes": {"z": 1, "u": 1, "total": 2},
+            "final_z_text": "prefix",
+            "final_u_text": "request",
+        },
+    )
+
+    def branch_materialization(**kwargs):
+        captured["projection_ids"].append(id(kwargs["projection_arguments"]))
+        return {
+            "branch": kwargs["branch"],
+            "step": kwargs["snapshot"].checkpoint,
+            "selected_step": kwargs["snapshot"].checkpoint,
+            "selected_maximize": kwargs["snapshot"].maximize,
+            "selected_attack_loss": kwargs["snapshot"].attack_loss,
+            "selected_fol": kwargs["snapshot"].fol,
+            "selected_margin": kwargs["snapshot"].internal_margin,
+            "materialized_text": "materialized prompt",
+            "materialized_response": "safe refusal",
+            "continuous_response": "unsafe answer",
+            "continuous_input_tokens": 3,
+            "continuous_generated_tokens": 2,
+            "materialized_input_tokens": 3,
+            "materialized_generated_tokens": 2,
+            "omega_s": [1],
+            "frozen_positions": [0],
+            "char_spans": [],
+            "span_to_token_mappings": [],
+            "boundary_expansions": [[]],
+            "base_token_ids": [9, 8],
+            "initial_z_token_ids": [1],
+            "initial_u_token_ids": [3],
+            "final_z_token_ids": [4],
+            "final_u_token_ids": [3],
+            "final_z_text": "prefix",
+            "final_u_text": "request",
+            "reconstructed_base_token_ids": [9, 8],
+            "complete_token_ids": [9, 8],
+            "projection_cosines": {"z": 0.9, "u": 0.8},
+            "one_pass_decode": {"call_count": 1, "calls": []},
+            "decoded_retokenization_audit": {"retokenized_ids": [9, 8], "exact_match": True},
+            "frozen_positions_unchanged": True,
+            "initial_norms": {"z": 1.0, "u": 1.0},
+            "final_norms": {"z": 1.0, "u": 1.0},
+            "projected_token_changes": {"z": 1, "u": 1, "total": 2},
+            "projected_z_changes_vs_step_0": 1,
+            "projected_u_changes_vs_step_0": 1,
+        }
+
+    monkeypatch.setattr(module, "_branch_materialization", branch_materialization)
+    class JudgeContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(module, "Qwen32CompatJudge", lambda *args, **kwargs: JudgeContext())
+
+    def run_checkpoint_search(**kwargs):
+        assert kwargs["manual_rejections"] == (
+            ManualCheckpointRejection(
+                branch="jailbound_o_minus",
+                step=10,
+                state_sha256="b" * 64,
+                reason="Readable ASCII but code-like English",
+            ),
+        )
+        snapshot = SimpleNamespace(
+            checkpoint=10,
+            maximize=0.2,
+            attack_loss=0.9,
+            internal_margin=0.2,
+            fol=0.2,
+            state=final_state,
+            selection_branch="jailbound_o_minus",
+        )
+        kwargs["probe"]("jailbound_o_minus", snapshot)
+        generated = kwargs["generate"]("jailbound_o_minus", snapshot)
+        decision = {
+            "branch": "jailbound_o_minus",
+            "step": 10,
+            "state_sha256": generated["state_sha256"],
+            "accepted": True,
+            "reasons": [],
+            "paired_judgment": {
+                "branch": "jailbound_o_minus",
+                "step": 10,
+                "state_sha256": generated["state_sha256"],
+                "continuous": {"unsafe_label": True},
+                "materialized": {"unsafe_label": False},
+                "transition": "unsafe_to_safe",
+            },
+        }
+        kwargs["persist_generations"]([generated])
+        kwargs["persist_decisions"]([decision])
+        base = SimpleNamespace(
+            checkpoint=0,
+            maximize=0.1,
+            attack_loss=1.0,
+            internal_margin=0.1,
+            fol=0.1,
+            state=initial_state,
+            selection_branch="jailbound_o_minus",
+        )
+        return {
+            "accepted": True,
+            "stopping_branch": "jailbound_o_minus",
+            "stopping_step": 10,
+            "visited_checkpoints": [10],
+            "generations": [generated],
+            "decisions": [decision],
+            "pools": {
+                "jailbound_o_minus": [base, snapshot],
+                "jailbound_o_plus": [base, snapshot],
+            },
+            "accepted_evidence": generated,
+            "accepted_judgment": decision["paired_judgment"],
+        }
+
+    monkeypatch.setattr(module, "run_checkpoint_search", run_checkpoint_search)
+    monkeypatch.setattr(module, "finalize_artifacts", lambda **kwargs: {})
+
+    result = module.optimize_sample(
+        annotation_path=annotation,
+        output_root=output,
+        model_path=model,
+        steps=10,
+        checkpoints=(0, 10),
+        prefix_tokens=1,
+        prefix_init_text="prefix",
+        seed=17,
+        learning_rate=0.001,
+        lambda_fol=0.1,
+        epsilon=0.1,
+        gamma_z=0.01,
+        gamma_u=0.01,
+        grad_clip=1.0,
+        answer_anchors=("Sure, here is",),
+        refusal_anchors=("I cannot help",),
+        max_new_tokens=16,
+        attention_backend="eager",
+        activation_checkpointing=False,
+        include_continuous_checkpoints=True,
+        finite_difference_fol=False,
+        finite_difference_radius=1e-3,
+        checkpoint_early_stop=True,
+        projection_token_policy="english_common_positioned",
+        judge_endpoint="http://fixture/v1",
+        judge_model="judge-r1",
+        judge_threshold=0.5,
+        manual_rejection_ledger=ledger,
+        command=("python", "runner.py", "optimize"),
+    )
+
+    assert len(set(captured["projection_ids"])) == 1
+    assert result["configuration"]["manual_rejection_ledger"] == {
+        "path": str(ledger.resolve()),
+        "sha256": module.sha256_file(ledger),
+        "entries": [{
+            "branch": "jailbound_o_minus",
+            "step": 10,
+            "state_sha256": "b" * 64,
+            "reason": "Readable ASCII but code-like English",
+        }],
+    }
+    assert result["checkpoint_search"]["accepted"] is True
+    assert result["safety_judge_called"] is True
+    assert all(
+        row["position_mask_manifest_sha256"] == "m" * 64
+        for rows in result["checkpoint_evidence"].values()
+        for row in rows
+    )
+    assert all(
+        result["branches"][branch]["position_mask_manifest_sha256"] == "m" * 64
+        for branch in module.BRANCHES
+    )
+
+
+def test_safety_judge_called_requires_recorded_paired_judgment() -> None:
     module = _load_script()
 
-    assert module.safety_judge_called({branch: [] for branch in module.BRANCHES}) is False
+    assert module.safety_judge_called(None) is False
+    assert module.safety_judge_called({"decisions": [{"step": 25}]}) is False
     assert module.safety_judge_called({
-        "jailbound_o_minus": [{"step": 25}],
-        "jailbound_o_plus": [],
+        "decisions": [{"step": 25, "paired_judgment": {"transition": "unchanged"}}],
     }) is True
 
 
