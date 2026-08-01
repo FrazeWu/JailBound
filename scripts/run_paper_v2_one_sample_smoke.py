@@ -97,8 +97,8 @@ class ProjectionArguments:
     prefix_allowed_token_ids_by_position: tuple[tuple[int, ...], ...] | None
     seed_allowed_token_ids_by_position: tuple[tuple[int, ...], ...] | None
     position_mask_manifest: tuple[
-        tuple[tuple[int, tuple[int, ...]], ...],
-        tuple[tuple[int, tuple[int, ...]], ...],
+        tuple[tuple[int, str, tuple[int, ...]], ...],
+        tuple[tuple[int, str, tuple[int, ...]], ...],
     ] | None = None
     position_mask_manifest_sha256: str | None = None
 
@@ -111,9 +111,9 @@ class ProjectionArguments:
                 raise ValueError("positioned projection has inconsistent manifest arguments")
             prefix_manifest, seed_manifest = self.position_mask_manifest
             if (
-                tuple(row[1] for row in prefix_manifest)
+                tuple(row[2] for row in prefix_manifest)
                 != self.prefix_allowed_token_ids_by_position
-                or tuple(row[1] for row in seed_manifest)
+                or tuple(row[2] for row in seed_manifest)
                 != self.seed_allowed_token_ids_by_position
             ):
                 raise ValueError("position mask manifest differs from projection masks")
@@ -970,19 +970,22 @@ def _validate_optimization_settings(
 
 def _position_mask_manifest_payload(
     manifest: tuple[
-        tuple[tuple[int, tuple[int, ...]], ...],
-        tuple[tuple[int, tuple[int, ...]], ...],
+        tuple[tuple[int, str, tuple[int, ...]], ...],
+        tuple[tuple[int, str, tuple[int, ...]], ...],
     ],
 ) -> dict[str, list[dict[str, object]]]:
     prefix_manifest, seed_manifest = manifest
 
-    def rows(values: tuple[tuple[int, tuple[int, ...]], ...]) -> list[dict[str, object]]:
+    def rows(
+        values: tuple[tuple[int, str, tuple[int, ...]], ...],
+    ) -> list[dict[str, object]]:
         return [
             {
                 "original_token_id": original_token_id,
+                "position_class": position_class,
                 "allowed_token_ids": list(allowed_token_ids),
             }
-            for original_token_id, allowed_token_ids in values
+            for original_token_id, position_class, allowed_token_ids in values
         ]
 
     return {
@@ -1005,6 +1008,7 @@ def _projection_arguments_from_vocabulary(vocabulary: Any) -> ProjectionArgument
         prefix_manifest = tuple(
             (
                 int(mask.original_token_id),
+                str(mask.position_class),
                 tuple(int(token_id) for token_id in mask.allowed_token_ids),
             )
             for mask in getattr(vocabulary, "z_position_masks", ())
@@ -1012,6 +1016,7 @@ def _projection_arguments_from_vocabulary(vocabulary: Any) -> ProjectionArgument
         seed_manifest = tuple(
             (
                 int(mask.original_token_id),
+                str(mask.position_class),
                 tuple(int(token_id) for token_id in mask.allowed_token_ids),
             )
             for mask in getattr(vocabulary, "u_position_masks", ())
@@ -1025,8 +1030,8 @@ def _projection_arguments_from_vocabulary(vocabulary: Any) -> ProjectionArgument
             raise ValueError("position mask manifest SHA-256 differs from the exact projection masks")
         return ProjectionArguments(
             allowed_token_ids=None,
-            prefix_allowed_token_ids_by_position=tuple(row[1] for row in prefix_manifest),
-            seed_allowed_token_ids_by_position=tuple(row[1] for row in seed_manifest),
+            prefix_allowed_token_ids_by_position=tuple(row[2] for row in prefix_manifest),
+            seed_allowed_token_ids_by_position=tuple(row[2] for row in seed_manifest),
             position_mask_manifest=manifest,
             position_mask_manifest_sha256=expected_sha256,
         )

@@ -1183,18 +1183,65 @@ def test_checkpoint_search_fails_closed_when_manual_rejection_never_passes_machi
 
 def _positioned_vocabulary(module: ModuleType, *, digest: str | None = None) -> SimpleNamespace:
     manifest = {
-        "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 3]}],
-        "u_position_masks": [{"original_token_id": 2, "allowed_token_ids": [2, 4]}],
+        "z_position_masks": [{
+            "original_token_id": 1,
+            "position_class": "word_start",
+            "allowed_token_ids": [1, 3],
+        }],
+        "u_position_masks": [{
+            "original_token_id": 2,
+            "position_class": "word_start",
+            "allowed_token_ids": [2, 4],
+        }],
     }
     return SimpleNamespace(
         policy="english_common_positioned",
         allowed_token_ids=(1, 2, 3, 4),
-        z_position_masks=(SimpleNamespace(original_token_id=1, allowed_token_ids=(1, 3)),),
-        u_position_masks=(SimpleNamespace(original_token_id=2, allowed_token_ids=(2, 4)),),
+        z_position_masks=(SimpleNamespace(
+            original_token_id=1,
+            position_class="word_start",
+            allowed_token_ids=(1, 3),
+        ),),
+        u_position_masks=(SimpleNamespace(
+            original_token_id=2,
+            position_class="word_start",
+            allowed_token_ids=(2, 4),
+        ),),
         position_mask_manifest_sha256=(
             module.canonical_hash(manifest) if digest is None else digest
         ),
     )
+
+
+def test_projection_arguments_accept_the_real_builder_manifest_schema() -> None:
+    module = _load_script()
+
+    class Tokenizer:
+        all_special_ids = (0,)
+        pieces = {
+            0: "<special>",
+            1: " hello",
+            2: "Hello",
+            3: "ello",
+            4: ",",
+        }
+
+        def decode(self, token_ids, **kwargs):
+            return "".join(self.pieces.get(token_id, "x") for token_id in token_ids)
+
+    vocabulary = module.build_projection_vocabulary(
+        Tokenizer(),
+        5,
+        "english_common_positioned",
+        z_token_ids=(2, 1, 3),
+        u_token_ids=(1, 4),
+        zipf_frequency=lambda word, language: 4.0 if word == "hello" else 0.0,
+        wordfreq_version="3.1.1",
+    )
+
+    arguments = module._projection_arguments_from_vocabulary(vocabulary)
+
+    assert arguments.position_mask_manifest_sha256 == vocabulary.position_mask_manifest_sha256
 
 
 def test_projection_arguments_cryptographically_bind_the_exact_position_manifest() -> None:
@@ -1203,12 +1250,20 @@ def test_projection_arguments_cryptographically_bind_the_exact_position_manifest
     arguments = module._projection_arguments_from_vocabulary(_positioned_vocabulary(module))
 
     assert arguments.position_mask_manifest == (
-        ((1, (1, 3)),),
-        ((2, (2, 4)),),
+        ((1, "word_start", (1, 3)),),
+        ((2, "word_start", (2, 4)),),
     )
     assert arguments.position_mask_manifest_sha256 == module.canonical_hash({
-        "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 3]}],
-        "u_position_masks": [{"original_token_id": 2, "allowed_token_ids": [2, 4]}],
+        "z_position_masks": [{
+            "original_token_id": 1,
+            "position_class": "word_start",
+            "allowed_token_ids": [1, 3],
+        }],
+        "u_position_masks": [{
+            "original_token_id": 2,
+            "position_class": "word_start",
+            "allowed_token_ids": [2, 4],
+        }],
     })
 
 
@@ -1313,10 +1368,21 @@ def test_positioned_projection_helpers_share_exact_mask_tuples_without_global_al
         allowed_token_ids=None,
         prefix_allowed_token_ids_by_position=((1, 3),),
         seed_allowed_token_ids_by_position=((2, 4),),
-        position_mask_manifest=(((1, (1, 3)),), ((2, (2, 4)),)),
+        position_mask_manifest=(
+            ((1, "word_start", (1, 3)),),
+            ((2, "word_start", (2, 4)),),
+        ),
         position_mask_manifest_sha256=module.canonical_hash({
-            "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 3]}],
-            "u_position_masks": [{"original_token_id": 2, "allowed_token_ids": [2, 4]}],
+            "z_position_masks": [{
+                "original_token_id": 1,
+                "position_class": "word_start",
+                "allowed_token_ids": [1, 3],
+            }],
+            "u_position_masks": [{
+                "original_token_id": 2,
+                "position_class": "word_start",
+                "allowed_token_ids": [2, 4],
+            }],
         }),
     )
     monkeypatch.setattr(module, "materialize_continuous_state", project)
@@ -1421,10 +1487,21 @@ def test_branch_materialization_rejects_projection_ids_outside_position_masks(mo
         allowed_token_ids=None,
         prefix_allowed_token_ids_by_position=((1,),),
         seed_allowed_token_ids_by_position=((2,),),
-        position_mask_manifest=(((1, (1,)),), ((2, (2,)),)),
+        position_mask_manifest=(
+            ((1, "word_start", (1,)),),
+            ((2, "word_start", (2,)),),
+        ),
         position_mask_manifest_sha256=module.canonical_hash({
-            "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1]}],
-            "u_position_masks": [{"original_token_id": 2, "allowed_token_ids": [2]}],
+            "z_position_masks": [{
+                "original_token_id": 1,
+                "position_class": "word_start",
+                "allowed_token_ids": [1],
+            }],
+            "u_position_masks": [{
+                "original_token_id": 2,
+                "position_class": "word_start",
+                "allowed_token_ids": [2],
+            }],
         }),
     )
     monkeypatch.setattr(
@@ -1482,8 +1559,16 @@ def test_optimize_sample_reuses_one_projection_arguments_object_without_early_st
     final_state = _state(2.0)
     captured: dict[str, object] = {"projection_ids": []}
     manifest_sha256 = module.canonical_hash({
-        "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 4]}],
-        "u_position_masks": [{"original_token_id": 3, "allowed_token_ids": [3]}],
+        "z_position_masks": [{
+            "original_token_id": 1,
+            "position_class": "word_start",
+            "allowed_token_ids": [1, 4],
+        }],
+        "u_position_masks": [{
+            "original_token_id": 3,
+            "position_class": "word_start",
+            "allowed_token_ids": [3],
+        }],
     })
 
     class Tokenizer:
@@ -1542,8 +1627,16 @@ def test_optimize_sample_reuses_one_projection_arguments_object_without_early_st
         return SimpleNamespace(
             policy="english_common_positioned",
             allowed_token_ids=(1, 4),
-            z_position_masks=(SimpleNamespace(original_token_id=1, allowed_token_ids=(1, 4)),),
-            u_position_masks=(SimpleNamespace(original_token_id=3, allowed_token_ids=(3,)),),
+            z_position_masks=(SimpleNamespace(
+                original_token_id=1,
+                position_class="word_start",
+                allowed_token_ids=(1, 4),
+            ),),
+            u_position_masks=(SimpleNamespace(
+                original_token_id=3,
+                position_class="word_start",
+                allowed_token_ids=(3,),
+            ),),
             position_mask_manifest_sha256=manifest_sha256,
             evidence=lambda: {
                 "policy": "english_common_positioned",
@@ -1728,8 +1821,16 @@ def test_optimize_sample_reuses_one_projection_arguments_object_with_early_stop(
     final_state = _state(2.0)
     captured: dict[str, object] = {"projection_ids": []}
     manifest_sha256 = module.canonical_hash({
-        "z_position_masks": [{"original_token_id": 1, "allowed_token_ids": [1, 4]}],
-        "u_position_masks": [{"original_token_id": 3, "allowed_token_ids": [3]}],
+        "z_position_masks": [{
+            "original_token_id": 1,
+            "position_class": "word_start",
+            "allowed_token_ids": [1, 4],
+        }],
+        "u_position_masks": [{
+            "original_token_id": 3,
+            "position_class": "word_start",
+            "allowed_token_ids": [3],
+        }],
     })
 
     class Tokenizer:
@@ -1784,8 +1885,16 @@ def test_optimize_sample_reuses_one_projection_arguments_object_with_early_stop(
         lambda tokenizer, vocabulary_size, policy, **kwargs: SimpleNamespace(
             policy="english_common_positioned",
             allowed_token_ids=(1, 4),
-            z_position_masks=(SimpleNamespace(original_token_id=1, allowed_token_ids=(1, 4)),),
-            u_position_masks=(SimpleNamespace(original_token_id=3, allowed_token_ids=(3,)),),
+            z_position_masks=(SimpleNamespace(
+                original_token_id=1,
+                position_class="word_start",
+                allowed_token_ids=(1, 4),
+            ),),
+            u_position_masks=(SimpleNamespace(
+                original_token_id=3,
+                position_class="word_start",
+                allowed_token_ids=(3,),
+            ),),
             position_mask_manifest_sha256=manifest_sha256,
             evidence=lambda: {
                 "policy": "english_common_positioned",
