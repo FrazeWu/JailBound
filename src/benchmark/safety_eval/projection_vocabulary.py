@@ -19,6 +19,7 @@ COMMON_TOKEN_ID_CEILING = 50_000
 PROJECTION_TOKEN_POLICIES = (
     "special_only",
     "ascii_printable",
+    "ascii_printable_positioned",
     "english_common_positioned",
 )
 
@@ -75,6 +76,12 @@ class ProjectionVocabulary:
                 "common_token_id_ceiling": self.common_token_id_ceiling,
                 "common_english_token_count": self.common_english_token_count,
                 "common_english_token_ids_sha256": self.common_english_token_ids_sha256,
+            })
+        if self.policy in {
+            "ascii_printable_positioned",
+            "english_common_positioned",
+        }:
+            evidence.update({
                 "z_position_masks": [mask.evidence() for mask in self.z_position_masks],
                 "u_position_masks": [mask.evidence() for mask in self.u_position_masks],
                 "position_mask_manifest_sha256": self.position_mask_manifest_sha256,
@@ -96,19 +103,49 @@ def classify_projection_piece(piece: str) -> str:
     return "other"
 
 
-def _ascii_printable_piece(text: str) -> bool:
-    return bool(text) and "\ufffd" not in text and all(
-        32 <= ord(character) <= 126 or character in "\t\n\r"
-        for character in text
-    )
-
-
 def _decode_piece(tokenizer: Any, token_id: int) -> str:
     return str(tokenizer.decode(
         [token_id],
         skip_special_tokens=False,
         clean_up_tokenization_spaces=False,
     ))
+
+
+def _tokenizer_special_ids(tokenizer: Any, vocabulary_size: int) -> set[int]:
+    return {
+        int(token_id)
+        for token_id in getattr(tokenizer, "all_special_ids", ())
+        if isinstance(token_id, int) and 0 <= token_id < vocabulary_size
+    }
+
+
+def ascii_printable_token_id_allowed(
+    tokenizer: Any,
+    token_id: int,
+    *,
+    special_ids: set[int],
+) -> bool:
+    """Return whether one token ID passes the standard GCG vocabulary filter."""
+    if token_id in special_ids:
+        return False
+    text = _decode_piece(tokenizer, token_id)
+    return bool(text) and text.isascii() and text.isprintable()
+
+
+def _ascii_printable_token_ids(
+    tokenizer: Any,
+    vocabulary_size: int,
+    special_ids: set[int],
+) -> tuple[int, ...]:
+    return tuple(
+        token_id
+        for token_id in range(vocabulary_size)
+        if ascii_printable_token_id_allowed(
+            tokenizer,
+            token_id,
+            special_ids=special_ids,
+        )
+    )
 
 
 def _resolve_word_frequency(
@@ -141,11 +178,10 @@ def _editable_token_ids(
     *,
     block: str,
     vocabulary_size: int,
+    policy: str,
 ) -> tuple[int, ...]:
     if values is None:
-        raise ValueError(
-            f"{block}_token_ids are required for english_common_positioned"
-        )
+        raise ValueError(f"{block}_token_ids are required for {policy}")
     ordered = tuple(values)
     if any(
         isinstance(token_id, bool)
@@ -181,6 +217,24 @@ def _position_mask(
     )
 
 
+def _ascii_position_mask(
+    original_token_id: int,
+    allowed_token_ids: tuple[int, ...],
+) -> PositionProjectionMask:
+    replacements = tuple(
+        token_id
+        for token_id in allowed_token_ids
+        if token_id != original_token_id
+    )
+    return PositionProjectionMask(
+        original_token_id=original_token_id,
+        position_class="gcg_ascii_without_initial",
+        allowed_token_ids=replacements,
+        allowed_token_count=len(replacements),
+        allowed_token_ids_sha256=canonical_hash(list(replacements)),
+    )
+
+
 def _full_position_manifest(
     z_position_masks: tuple[PositionProjectionMask, ...],
     u_position_masks: tuple[PositionProjectionMask, ...],
@@ -212,11 +266,13 @@ def _build_english_common_vocabulary(
         z_token_ids,
         block="z",
         vocabulary_size=vocabulary_size,
+        policy="english_common_positioned",
     )
     u_ids = _editable_token_ids(
         u_token_ids,
         block="u",
         vocabulary_size=vocabulary_size,
+        policy="english_common_positioned",
     )
     frequency, resolved_version = _resolve_word_frequency(
         zipf_frequency,
@@ -258,6 +314,56 @@ def _build_english_common_vocabulary(
     )
 
 
+def _build_ascii_positioned_vocabulary(
+    tokenizer: Any,
+    vocabulary_size: int,
+    special_ids: set[int],
+    *,
+    z_token_ids: Iterable[int] | None,
+    u_token_ids: Iterable[int] | None,
+) -> ProjectionVocabulary:
+    z_ids = _editable_token_ids(
+        z_token_ids,
+        block="z",
+        vocabulary_size=vocabulary_size,
+        policy="ascii_printable_positioned",
+    )
+    u_ids = _editable_token_ids(
+        u_token_ids,
+        block="u",
+        vocabulary_size=vocabulary_size,
+        policy="ascii_printable_positioned",
+    )
+    allowed_token_ids = _ascii_printable_token_ids(
+        tokenizer,
+        vocabulary_size,
+        special_ids,
+    )
+    if not allowed_token_ids:
+        raise ValueError("projection token policy leaves no allowed tokens")
+
+    z_masks = tuple(
+        _ascii_position_mask(token_id, allowed_token_ids)
+        for token_id in z_ids
+    )
+    u_masks = tuple(
+        _ascii_position_mask(token_id, allowed_token_ids)
+        for token_id in u_ids
+    )
+    manifest = _full_position_manifest(z_masks, u_masks)
+    return ProjectionVocabulary(
+        policy="ascii_printable_positioned",
+        vocabulary_size=vocabulary_size,
+        allowed_token_ids=allowed_token_ids,
+        allowed_token_count=len(allowed_token_ids),
+        excluded_token_count=vocabulary_size - len(allowed_token_ids),
+        allowed_token_ids_sha256=canonical_hash(list(allowed_token_ids)),
+        z_position_masks=z_masks,
+        u_position_masks=u_masks,
+        position_mask_manifest_sha256=canonical_hash(manifest),
+    )
+
+
 def build_projection_vocabulary(
     tokenizer: Any,
     vocabulary_size: int,
@@ -273,7 +379,7 @@ def build_projection_vocabulary(
     if isinstance(vocabulary_size, bool) or not isinstance(vocabulary_size, int) or vocabulary_size < 1:
         raise ValueError("projection vocabulary size must be a positive integer")
 
-    special_ids = {int(value) for value in getattr(tokenizer, "all_special_ids", ())}
+    special_ids = _tokenizer_special_ids(tokenizer, vocabulary_size)
     if policy == "english_common_positioned":
         return _build_english_common_vocabulary(
             tokenizer,
@@ -284,20 +390,30 @@ def build_projection_vocabulary(
             zipf_frequency=zipf_frequency,
             wordfreq_version=wordfreq_version,
         )
+    if policy == "ascii_printable_positioned":
+        return _build_ascii_positioned_vocabulary(
+            tokenizer,
+            vocabulary_size,
+            special_ids,
+            z_token_ids=z_token_ids,
+            u_token_ids=u_token_ids,
+        )
 
-    allowed: list[int] = []
-    for token_id in range(vocabulary_size):
-        if token_id in special_ids:
-            continue
-        if policy == "ascii_printable":
-            piece = _decode_piece(tokenizer, token_id)
-            if not _ascii_printable_piece(piece):
-                continue
-        allowed.append(token_id)
+    if policy == "ascii_printable":
+        ordered = _ascii_printable_token_ids(
+            tokenizer,
+            vocabulary_size,
+            special_ids,
+        )
+    else:
+        ordered = tuple(
+            token_id
+            for token_id in range(vocabulary_size)
+            if token_id not in special_ids
+        )
 
-    if not allowed:
+    if not ordered:
         raise ValueError("projection token policy leaves no allowed tokens")
-    ordered = tuple(allowed)
     return ProjectionVocabulary(
         policy=policy,
         vocabulary_size=vocabulary_size,
@@ -314,8 +430,44 @@ def validate_initial_editable_ids(
     z_token_ids: Iterable[int],
     u_token_ids: Iterable[int],
 ) -> None:
-    z_ids = tuple(int(value) for value in z_token_ids)
-    u_ids = tuple(int(value) for value in u_token_ids)
+    raw_z_ids = tuple(z_token_ids)
+    raw_u_ids = tuple(u_token_ids)
+    if vocabulary.policy == "ascii_printable_positioned":
+        if any(
+            isinstance(token_id, bool) or not isinstance(token_id, int)
+            for token_id in raw_z_ids + raw_u_ids
+        ):
+            raise ValueError("projection policy excludes an initial editable token")
+        z_ids = raw_z_ids
+        u_ids = raw_u_ids
+    else:
+        z_ids = tuple(int(value) for value in raw_z_ids)
+        u_ids = tuple(int(value) for value in raw_u_ids)
+
+    if vocabulary.policy == "ascii_printable_positioned":
+        globally_allowed = set(vocabulary.allowed_token_ids)
+
+        def matches_position_masks(
+            token_ids: tuple[int, ...],
+            masks: tuple[PositionProjectionMask, ...],
+        ) -> bool:
+            return len(token_ids) == len(masks) and all(
+                token_id in globally_allowed
+                and token_id == mask.original_token_id
+                and token_id not in mask.allowed_token_ids
+                for token_id, mask in zip(token_ids, masks, strict=True)
+            )
+
+        if not matches_position_masks(
+            z_ids,
+            vocabulary.z_position_masks,
+        ) or not matches_position_masks(
+            u_ids,
+            vocabulary.u_position_masks,
+        ):
+            raise ValueError("projection policy excludes an initial editable token")
+        return
+
     if vocabulary.policy == "english_common_positioned":
         def matches_position_masks(
             token_ids: tuple[int, ...],

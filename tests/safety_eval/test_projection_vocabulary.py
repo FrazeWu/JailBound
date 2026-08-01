@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -10,6 +10,7 @@ from benchmark.safety_eval.projection_vocabulary import (
     ENGLISH_LANGUAGE,
     MIN_ENGLISH_ZIPF,
     WORDFREQ_VERSION,
+    PositionProjectionMask,
     build_projection_vocabulary,
     classify_projection_piece,
     validate_initial_editable_ids,
@@ -26,6 +27,8 @@ class Tokenizer:
         4: "\ufffd",
         5: "\u4e2d\u6587",
         6: "",
+        7: "\t",
+        8: "\r",
     }
 
     def decode(
@@ -41,20 +44,139 @@ class Tokenizer:
 
 
 def test_ascii_policy_is_deterministic_and_excludes_invalid_pieces() -> None:
-    first = build_projection_vocabulary(Tokenizer(), 7, "ascii_printable")
-    second = build_projection_vocabulary(Tokenizer(), 7, "ascii_printable")
+    first = build_projection_vocabulary(Tokenizer(), 9, "ascii_printable")
+    second = build_projection_vocabulary(Tokenizer(), 9, "ascii_printable")
 
-    assert first.allowed_token_ids == (1, 2, 3)
+    assert first.allowed_token_ids == (1, 2)
     assert first.allowed_token_ids_sha256 == second.allowed_token_ids_sha256
-    assert first.allowed_token_count == 3
-    assert first.excluded_token_count == 4
+    assert first.allowed_token_count == 2
+    assert first.excluded_token_count == 7
     assert first.evidence() == {
         "policy": "ascii_printable",
-        "vocabulary_size": 7,
-        "allowed_token_count": 3,
-        "excluded_token_count": 4,
+        "vocabulary_size": 9,
+        "allowed_token_count": 2,
+        "excluded_token_count": 7,
         "allowed_token_ids_sha256": first.allowed_token_ids_sha256,
     }
+
+
+def test_ascii_positioned_policy_builds_exact_local_replacement_manifests() -> None:
+    kwargs = {
+        "z_token_ids": (1,),
+        "u_token_ids": (2,),
+    }
+
+    first = build_projection_vocabulary(
+        Tokenizer(),
+        9,
+        "ascii_printable_positioned",
+        **kwargs,
+    )
+    second = build_projection_vocabulary(
+        Tokenizer(),
+        9,
+        "ascii_printable_positioned",
+        **kwargs,
+    )
+
+    assert first.allowed_token_ids == (1, 2)
+    assert first.z_position_masks[0].allowed_token_ids == (2,)
+    assert first.u_position_masks[0].allowed_token_ids == (1,)
+    assert 1 not in first.z_position_masks[0].allowed_token_ids
+    assert 1 in first.u_position_masks[0].allowed_token_ids
+    assert 2 in first.z_position_masks[0].allowed_token_ids
+    assert 2 not in first.u_position_masks[0].allowed_token_ids
+    assert {
+        mask.position_class
+        for mask in first.z_position_masks + first.u_position_masks
+    } == {"gcg_ascii_without_initial"}
+    for mask in first.z_position_masks + first.u_position_masks:
+        assert mask.allowed_token_ids_sha256 == canonical_hash(
+            list(mask.allowed_token_ids)
+        )
+    assert first.position_mask_manifest_sha256 == canonical_hash(
+        _full_position_manifest(first)
+    )
+    assert second.position_mask_manifest_sha256 == first.position_mask_manifest_sha256
+    assert first.evidence() == {
+        "policy": "ascii_printable_positioned",
+        "vocabulary_size": 9,
+        "allowed_token_count": 2,
+        "excluded_token_count": 7,
+        "allowed_token_ids_sha256": first.allowed_token_ids_sha256,
+        "z_position_masks": [mask.evidence() for mask in first.z_position_masks],
+        "u_position_masks": [mask.evidence() for mask in first.u_position_masks],
+        "position_mask_manifest_sha256": first.position_mask_manifest_sha256,
+    }
+    assert "wordfreq_version" not in first.evidence()
+
+    with pytest.raises(FrozenInstanceError):
+        first.z_position_masks[0].position_class = "other"
+
+
+@pytest.mark.parametrize(
+    ("z_token_ids", "u_token_ids", "message"),
+    [
+        (None, (2,), "z_token_ids are required"),
+        ((1,), None, "u_token_ids are required"),
+        ((True,), (2,), "z_token_ids contain an invalid token ID"),
+        ((1,), (9,), "u_token_ids contain an invalid token ID"),
+    ],
+)
+def test_ascii_positioned_policy_requires_valid_initial_id_shapes(
+    z_token_ids: tuple[int, ...] | None,
+    u_token_ids: tuple[int, ...] | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_projection_vocabulary(
+            FailOnDecodeTokenizer(),
+            9,
+            "ascii_printable_positioned",
+            z_token_ids=z_token_ids,
+            u_token_ids=u_token_ids,
+        )
+
+
+def test_ascii_positioned_validation_fails_closed_for_invalid_manifest_state() -> None:
+    result = build_projection_vocabulary(
+        Tokenizer(),
+        9,
+        "ascii_printable_positioned",
+        z_token_ids=(1,),
+        u_token_ids=(2,),
+    )
+
+    validate_initial_editable_ids(result, z_token_ids=(1,), u_token_ids=(2,))
+
+    invalid_cases = (
+        (result, (), (2,)),
+        (result, (0,), (2,)),
+        (result, (2,), (2,)),
+        (
+            replace(
+                result,
+                z_position_masks=(
+                    PositionProjectionMask(
+                        original_token_id=1,
+                        position_class="gcg_ascii_without_initial",
+                        allowed_token_ids=(1, 2),
+                        allowed_token_count=2,
+                        allowed_token_ids_sha256=canonical_hash([1, 2]),
+                    ),
+                ),
+            ),
+            (1,),
+            (2,),
+        ),
+    )
+    for vocabulary, z_ids, u_ids in invalid_cases:
+        with pytest.raises(ValueError, match="initial editable token"):
+            validate_initial_editable_ids(
+                vocabulary,
+                z_token_ids=z_ids,
+                u_token_ids=u_ids,
+            )
 
 
 def test_special_only_policy_preserves_previous_candidate_set() -> None:
