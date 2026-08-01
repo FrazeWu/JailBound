@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Mapping
@@ -200,12 +201,20 @@ class JailboundOptimizer:
         ledger: BudgetLedger,
         emitter: CheckpointEmitter,
     ) -> list[OptimizerSnapshot]:
+        return list(self.iter_checkpoints(objective, initial_state, ledger, emitter))
+
+    def iter_checkpoints(
+        self,
+        objective: AttackObjective,
+        initial_state: EditableState,
+        ledger: BudgetLedger,
+        emitter: CheckpointEmitter,
+    ) -> Iterator[OptimizerSnapshot]:
         state = _clone_live_state(initial_state)
         optimizer = torch.optim.Adam((state.z, state.u), lr=self.learning_rate)
-        snapshots: list[OptimizerSnapshot] = []
 
         if emitter.due(0):
-            snapshots.append(self._snapshot(0, objective, state, ledger))
+            yield self._snapshot(0, objective, state, ledger)
         for step in range(1, ledger.update_limit + 1):
             ledger.consume_update()
             optimizer.zero_grad(set_to_none=True)
@@ -225,8 +234,7 @@ class JailboundOptimizer:
             torch.nn.utils.clip_grad_norm_((state.z, state.u), self.max_grad_norm)
             optimizer.step()
             if emitter.due(step):
-                snapshots.append(self._snapshot(step, objective, state, ledger))
-        return snapshots
+                yield self._snapshot(step, objective, state, ledger)
 
     def _snapshot(
         self,

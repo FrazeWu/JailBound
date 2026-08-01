@@ -110,6 +110,47 @@ def test_single_branch_honors_exact_budget_checkpoint_timing_and_objective_sign(
     assert not torch.equal(first.state.z, last.state.z)
 
 
+def test_single_branch_checkpoint_iterator_suspends_without_resetting_adam() -> None:
+    optimizer = build_jailbound_optimizer("zol", learning_rate=0.05)
+    ledger = BudgetLedger(update_limit=3, candidate_limit=9)
+    checkpoints = optimizer.iter_checkpoints(
+        _objective(), _state(), ledger, CheckpointEmitter([0, 1, 3])
+    )
+
+    assert ledger.updates == 0
+    zero = next(checkpoints)
+    assert zero.checkpoint == 0
+    assert ledger.updates == 0
+
+    one = next(checkpoints)
+    assert one.checkpoint == 1
+    assert ledger.updates == 1
+
+    three = next(checkpoints)
+    assert three.checkpoint == 3
+    assert ledger.updates == 3
+    with pytest.raises(StopIteration):
+        next(checkpoints)
+
+    eager_ledger = BudgetLedger(update_limit=3, candidate_limit=9)
+    eager = optimizer.run(
+        _objective(), _state(), eager_ledger, CheckpointEmitter([0, 1, 3])
+    )
+    assert torch.equal(three.state.z, eager[-1].state.z)
+    assert torch.equal(three.state.u, eager[-1].state.u)
+    assert (
+        ledger.updates,
+        ledger.forward_passes,
+        ledger.backward_passes,
+        ledger.hvp_calls,
+    ) == (
+        eager_ledger.updates,
+        eager_ledger.forward_passes,
+        eager_ledger.backward_passes,
+        eager_ledger.hvp_calls,
+    )
+
+
 def test_dual_branch_alternates_exactly_and_breaks_initial_tie_toward_o_minus() -> None:
     initial = _state()
     ledger = BudgetLedger(
