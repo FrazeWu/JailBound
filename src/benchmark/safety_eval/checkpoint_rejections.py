@@ -72,8 +72,6 @@ def load_manual_checkpoint_rejections(
     seen_by_branch_step: dict[tuple[str, int], ManualCheckpointRejection] = {}
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError as error:

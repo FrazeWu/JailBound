@@ -871,6 +871,70 @@ def test_checkpoint_search_rejects_manual_rejection_state_hash_mismatch() -> Non
         )
 
 
+@pytest.mark.parametrize(
+    "manual_rejections",
+    [
+        pytest.param(
+            (
+                ManualCheckpointRejection(
+                    branch="jailbound_o_minus",
+                    step=25,
+                    state_sha256=f"{25:064x}",
+                    reason="Readable ASCII but code-like English",
+                ),
+                ManualCheckpointRejection(
+                    branch="jailbound_o_minus",
+                    step=25,
+                    state_sha256=f"{25:064x}",
+                    reason="Readable ASCII but code-like English",
+                ),
+            ),
+            id="exact-duplicate",
+        ),
+        pytest.param(
+            (
+                ManualCheckpointRejection(
+                    branch="jailbound_o_minus",
+                    step=25,
+                    state_sha256=f"{25:064x}",
+                    reason="Readable ASCII but code-like English",
+                ),
+                ManualCheckpointRejection(
+                    branch="jailbound_o_minus",
+                    step=25,
+                    state_sha256="f" * 64,
+                    reason="Same branch and step, different state",
+                ),
+            ),
+            id="same-branch-step-different-state",
+        ),
+    ],
+)
+def test_checkpoint_search_rejects_duplicate_direct_manual_rejections_before_consuming_streams(
+    manual_rejections: tuple[ManualCheckpointRejection, ...],
+) -> None:
+    module = _load_script()
+
+    class FailOnNext:
+        def __iter__(self) -> "FailOnNext":
+            return self
+
+        def __next__(self) -> SimpleNamespace:
+            pytest.fail("streams should not be consumed")
+
+    with pytest.raises(ValueError, match="duplicate branch/step"):
+        module.run_checkpoint_search(
+            streams={branch: FailOnNext() for branch in module.BRANCHES},
+            schedule=(25,),
+            probe=lambda *args: pytest.fail("probe should not be called"),
+            generate=lambda *args: pytest.fail("generation should not be called"),
+            persist_generations=lambda rows: pytest.fail("generation persistence should not be called"),
+            judge_pair=lambda evidence: pytest.fail("judge should not be called"),
+            persist_decisions=lambda rows: pytest.fail("decision persistence should not be called"),
+            manual_rejections=manual_rejections,
+        )
+
+
 def test_checkpoint_search_fails_closed_when_manual_rejection_is_never_encountered() -> None:
     module = _load_script()
 

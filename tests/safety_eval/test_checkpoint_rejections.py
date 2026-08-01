@@ -178,6 +178,25 @@ def test_load_manual_checkpoint_rejections_rejects_duplicate_identity(tmp_path: 
         load_manual_checkpoint_rejections(ledger)
 
 
+def test_load_manual_checkpoint_rejections_rejects_blank_line_with_correct_line_number(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "manual_rejections.jsonl"
+    _write_jsonl(
+        ledger,
+        {
+            "branch": "jailbound_o_plus",
+            "step": 225,
+            "state_sha256": "a" * 64,
+            "reason": "Readable ASCII but code-like English",
+        },
+        "   \n",
+    )
+
+    with pytest.raises(ValueError, match=r"line 2 contains malformed JSON"):
+        load_manual_checkpoint_rejections(ledger)
+
+
 def test_load_manual_checkpoint_rejections_rejects_duplicate_branch_step_with_different_hash(
     tmp_path: Path,
 ) -> None:

@@ -502,9 +502,11 @@ def run_checkpoint_search(
     manual_rejections: Sequence[ManualCheckpointRejection] = (),
 ) -> dict[str, object]:
     """Advance synchronized branch streams until one checkpoint passes every gate."""
-    rejection_by_branch_step = {
-        rejection.branch_step: rejection for rejection in manual_rejections
-    }
+    rejection_by_branch_step: dict[tuple[str, int], ManualCheckpointRejection] = {}
+    for rejection in manual_rejections:
+        if rejection.branch_step in rejection_by_branch_step:
+            raise ValueError("duplicate branch/step")
+        rejection_by_branch_step[rejection.branch_step] = rejection
     encountered_rejections: set[tuple[str, int]] = set()
 
     def ensure_all_rejections_encountered() -> None:
