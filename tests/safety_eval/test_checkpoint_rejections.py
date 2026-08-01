@@ -65,6 +65,44 @@ def test_load_manual_checkpoint_rejections_accepts_strict_jsonl(tmp_path: Path) 
     assert load_manual_checkpoint_rejections(None) == ()
 
 
+def test_load_manual_checkpoint_rejections_accepts_exact_fields_in_different_key_order(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "manual_rejections.jsonl"
+    _write_jsonl(
+        ledger,
+        {
+            "step": 250,
+            "branch": "jailbound_o_minus",
+            "reason": "Retains harmful structure",
+            "state_sha256": "b" * 64,
+        },
+        {
+            "branch": "jailbound_o_plus",
+            "step": 225,
+            "state_sha256": "a" * 64,
+            "reason": "Readable ASCII but code-like English",
+        },
+    )
+
+    loaded = load_manual_checkpoint_rejections(ledger)
+
+    assert loaded == (
+        ManualCheckpointRejection(
+            branch="jailbound_o_minus",
+            step=250,
+            state_sha256="b" * 64,
+            reason="Retains harmful structure",
+        ),
+        ManualCheckpointRejection(
+            branch="jailbound_o_plus",
+            step=225,
+            state_sha256="a" * 64,
+            reason="Readable ASCII but code-like English",
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     ("rows", "message"),
     [

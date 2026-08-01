@@ -38,10 +38,8 @@ class ManualCheckpointRejection:
 def _validate_row(payload: object, *, line_number: int) -> ManualCheckpointRejection:
     if not isinstance(payload, dict):
         raise ValueError(f"line {line_number} must contain a JSON object")
-    if tuple(payload.keys()) != _EXPECTED_FIELDS:
-        if set(payload.keys()) != set(_EXPECTED_FIELDS) or len(payload) != len(_EXPECTED_FIELDS):
-            raise ValueError(f"line {line_number} must contain exactly four fields")
-        raise ValueError(f"line {line_number} fields must be ordered as {_EXPECTED_FIELDS!r}")
+    if set(payload.keys()) != set(_EXPECTED_FIELDS) or len(payload) != len(_EXPECTED_FIELDS):
+        raise ValueError(f"line {line_number} must contain exactly four fields")
 
     branch = payload["branch"]
     step = payload["step"]
