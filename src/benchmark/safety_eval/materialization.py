@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
@@ -285,14 +285,96 @@ def _project_block(
     return tuple(int(token_id) for token_id in token_ids), float(maxima.mean().cpu())
 
 
+def _validate_position_masks(
+    vocabulary_embeddings: torch.Tensor,
+    forbidden_token_ids: Iterable[int],
+    masks: Sequence[Sequence[int]],
+    *,
+    position_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    canonical_masks = tuple(tuple(int(token_id) for token_id in mask) for mask in masks)
+    if len(canonical_masks) != position_count:
+        raise ValueError("position mask count must match editable position count")
+    for mask in canonical_masks:
+        _allowed_vocabulary(vocabulary_embeddings, forbidden_token_ids, mask)
+    return canonical_masks
+
+
+def _project_block_by_position(
+    block: torch.Tensor,
+    vocabulary_embeddings: torch.Tensor,
+    forbidden_token_ids: Iterable[int],
+    masks: Sequence[tuple[int, ...]],
+) -> tuple[tuple[int, ...], float]:
+    positions = block.detach().reshape(-1, block.shape[-1])
+    grouped_positions: dict[tuple[int, ...], list[int]] = {}
+    for position, mask in enumerate(masks):
+        grouped_positions.setdefault(mask, []).append(position)
+
+    projected_ids = [0] * len(masks)
+    cosine_sum = 0.0
+    for mask, position_indices in grouped_positions.items():
+        indices = torch.tensor(position_indices, device=block.device, dtype=torch.long)
+        allowed_ids, allowed_embeddings = _allowed_vocabulary(
+            vocabulary_embeddings, forbidden_token_ids, mask
+        )
+        group_ids, group_cosine = _project_block(
+            positions.index_select(0, indices), allowed_ids, allowed_embeddings
+        )
+        for position, token_id in zip(position_indices, group_ids, strict=True):
+            projected_ids[position] = token_id
+        cosine_sum += group_cosine * len(position_indices)
+
+    return tuple(projected_ids), cosine_sum / len(masks)
+
+
 def materialize_continuous_state(
     state: EditableState,
     vocabulary_embeddings: torch.Tensor,
     *,
     forbidden_token_ids: Iterable[int] = (),
     allowed_token_ids: Iterable[int] | None = None,
+    prefix_allowed_token_ids_by_position: Sequence[Sequence[int]] | None = None,
+    seed_allowed_token_ids_by_position: Sequence[Sequence[int]] | None = None,
 ) -> ContinuousMaterialization:
     """Project *both* ``z`` and ``u`` against one masked vocabulary."""
+    has_prefix_position_masks = prefix_allowed_token_ids_by_position is not None
+    has_seed_position_masks = seed_allowed_token_ids_by_position is not None
+    if allowed_token_ids is not None and (
+        has_prefix_position_masks or has_seed_position_masks
+    ):
+        raise ValueError("global and position-specific allowed token masks conflict")
+    if has_prefix_position_masks != has_seed_position_masks:
+        raise ValueError("position masks are required for both prefix and seed blocks")
+    if has_prefix_position_masks:
+        forbidden = tuple(forbidden_token_ids)
+        prefix_position_count = state.z.numel() // state.z.shape[-1]
+        seed_position_count = state.u.numel() // state.u.shape[-1]
+        prefix_masks = _validate_position_masks(
+            vocabulary_embeddings,
+            forbidden,
+            prefix_allowed_token_ids_by_position,
+            position_count=prefix_position_count,
+        )
+        seed_masks = _validate_position_masks(
+            vocabulary_embeddings,
+            forbidden,
+            seed_allowed_token_ids_by_position,
+            position_count=seed_position_count,
+        )
+        prefix_ids, prefix_cosine = _project_block_by_position(
+            state.z, vocabulary_embeddings, forbidden, prefix_masks
+        )
+        seed_ids, seed_cosine = _project_block_by_position(
+            state.u, vocabulary_embeddings, forbidden, seed_masks
+        )
+        return ContinuousMaterialization(
+            prefix_token_ids=prefix_ids,
+            seed_token_ids=seed_ids,
+            prefix_projection_cosine=prefix_cosine,
+            seed_projection_cosine=seed_cosine,
+        )
+
     allowed_ids, allowed_embeddings = _allowed_vocabulary(
         vocabulary_embeddings, forbidden_token_ids, allowed_token_ids
     )

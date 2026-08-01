@@ -73,6 +73,108 @@ def test_materializer_rejects_invalid_explicit_allowed_token_ids(
         )
 
 
+def test_materializer_projects_distinct_position_masks_for_both_blocks() -> None:
+    vocabulary = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+    )
+    state = EditableState(
+        z=torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]]),
+        u=torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]]),
+        z0=torch.zeros(1, 2, 2),
+        u0=torch.zeros(1, 2, 2),
+    )
+
+    materialization = materialize_continuous_state(
+        state,
+        vocabulary,
+        prefix_allowed_token_ids_by_position=((1,), (2, 3)),
+        seed_allowed_token_ids_by_position=((0, 1), (3,)),
+    )
+
+    assert materialization.prefix_token_ids == (1, 2)
+    assert materialization.seed_token_ids == (0, 3)
+
+
+@pytest.mark.parametrize(
+    "position_masks",
+    [
+        {"prefix_allowed_token_ids_by_position": ((0,),)},
+        {"seed_allowed_token_ids_by_position": ((1,),)},
+    ],
+)
+def test_materializer_rejects_global_and_position_mask_conflicts(
+    position_masks: dict[str, tuple[tuple[int, ...], ...]],
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match="global and position"):
+        materialize_continuous_state(
+            _state(), vocabulary, allowed_token_ids=(0, 1), **position_masks
+        )
+
+
+@pytest.mark.parametrize(
+    "position_masks",
+    [
+        {"prefix_allowed_token_ids_by_position": ((0,),)},
+        {"seed_allowed_token_ids_by_position": ((1,),)},
+    ],
+)
+def test_materializer_requires_position_masks_for_both_blocks(
+    position_masks: dict[str, tuple[tuple[int, ...], ...]],
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match="both prefix and seed"):
+        materialize_continuous_state(_state(), vocabulary, **position_masks)
+
+
+@pytest.mark.parametrize(
+    "position_masks",
+    [
+        {
+            "prefix_allowed_token_ids_by_position": ((0,), (1,)),
+            "seed_allowed_token_ids_by_position": ((1,),),
+        },
+        {
+            "prefix_allowed_token_ids_by_position": ((0,),),
+            "seed_allowed_token_ids_by_position": ((1,), (0,)),
+        },
+    ],
+)
+def test_materializer_rejects_wrong_position_mask_count(
+    position_masks: dict[str, tuple[tuple[int, ...], ...]],
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match="position mask count"):
+        materialize_continuous_state(_state(), vocabulary, **position_masks)
+
+
+@pytest.mark.parametrize(
+    ("invalid_mask", "error"),
+    [
+        ((), "must not be empty"),
+        ((0, 0), "must be unique"),
+        ((2,), "must be in range"),
+        ((1,), "must not be forbidden"),
+    ],
+)
+def test_materializer_rejects_invalid_position_masks(
+    invalid_mask: tuple[int, ...], error: str
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match=error):
+        materialize_continuous_state(
+            _state(),
+            vocabulary,
+            forbidden_token_ids=(1,),
+            prefix_allowed_token_ids_by_position=(invalid_mask,),
+            seed_allowed_token_ids_by_position=((0,),),
+        )
+
+
 def test_discrete_candidate_builds_a_complete_strict_materialization_record() -> None:
     record = build_materialization_record(
         schema_version="reviewer_eval.v1",
