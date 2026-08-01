@@ -494,6 +494,50 @@ def test_optimize_main_forwards_continuous_checkpoints_pairing(tmp_path: Path, m
     assert captured["include_continuous_checkpoints"] is True
 
 
+def test_optimize_dry_run_reports_projection_token_policy(
+    tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_script()
+    annotation = tmp_path / "annotation.json"
+    model = tmp_path / "model"
+    output = tmp_path / "output"
+    model.mkdir()
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    annotation.write_text(json.dumps(_annotation_artifact(module)), encoding="utf-8")
+    monkeypatch.setattr(module, "load_smoke_model", lambda *args, **kwargs: pytest.fail("model loaded"))
+
+    assert module.main([
+        "optimize", "--annotation", str(annotation), "--output-root", str(output),
+        "--model-path", str(model), "--prefix-init-text", "prefix", "--seed", "17",
+        "--projection-token-policy", "ascii_printable", "--dry-run",
+    ]) == 0
+
+    assert json.loads(capsys.readouterr().out)["projection_token_policy"] == "ascii_printable"
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [([], "special_only"), (["--projection-token-policy", "ascii_printable"], "ascii_printable")],
+)
+def test_optimize_main_forwards_projection_token_policy(
+    tmp_path: Path,
+    monkeypatch,
+    extra_args: list[str],
+    expected: str,
+) -> None:
+    module = _load_script()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(module, "optimize_sample", lambda **kwargs: captured.update(kwargs))
+
+    assert module.main([
+        "optimize", "--annotation", str(tmp_path / "annotation.json"),
+        "--output-root", str(tmp_path / "output"), "--model-path", str(tmp_path / "model"),
+        "--prefix-init-text", "prefix", "--seed", "17", *extra_args,
+    ]) == 0
+
+    assert captured["projection_token_policy"] == expected
+
+
 def test_checkpoint_early_stop_dry_run_reports_schedule_without_side_effects(
     tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -664,6 +708,58 @@ def test_checkpoint_search_reports_honest_exhaustion() -> None:
         row["reasons"] == ["z_and_u_must_both_change"]
         for row in outcome["decisions"]
     )
+
+
+def test_checkpoint_and_trajectory_projection_share_explicit_allowed_ids(monkeypatch) -> None:
+    module = _load_script()
+    seen: list[tuple[int, ...]] = []
+
+    def project(*args, **kwargs):
+        seen.append(tuple(kwargs["allowed_token_ids"]))
+        return SimpleNamespace(
+            prefix_token_ids=(1,),
+            seed_token_ids=(2,),
+            prefix_projection_cosine=0.9,
+            seed_projection_cosine=0.8,
+        )
+
+    class Tokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            return "text"
+
+    snapshot = SimpleNamespace(
+        checkpoint=25,
+        maximize=1.0,
+        attack_loss=0.5,
+        internal_margin=0.25,
+        fol=0.1,
+        updates=1,
+        branch_updates={},
+        forward_passes=2,
+        backward_passes=1,
+        hvp_calls=0,
+        state=_state(),
+    )
+    monkeypatch.setattr(module, "materialize_continuous_state", project)
+
+    module._checkpoint_projection_probe(
+        branch="jailbound_o_minus",
+        snapshot=snapshot,
+        initial_state=_state(),
+        vocabulary=torch.eye(3),
+        tokenizer=Tokenizer(),
+        forbidden_ids=(0,),
+        allowed_token_ids=(1, 2),
+    )
+    module.serialize_trajectory_pools(
+        {branch: [snapshot] for branch in module.BRANCHES},
+        vocabulary_embeddings=torch.eye(3),
+        tokenizer=Tokenizer(),
+        forbidden_token_ids=(0,),
+        allowed_token_ids=(1, 2),
+    )
+
+    assert seen == [(1, 2), (1, 2), (1, 2), (1, 2)]
 
 
 def test_safety_judge_called_requires_generated_checkpoint_evidence() -> None:

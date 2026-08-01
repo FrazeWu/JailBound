@@ -50,6 +50,11 @@ from benchmark.safety_eval.optimizers.jailbound import build_jailbound_optimizer
 from benchmark.safety_eval.paper_v2_ablation import build_paper_v2_continuous_chat_input
 from benchmark.safety_eval.paper_v2_objective import PaperV2TransformerObjective
 from benchmark.safety_eval.prompt_contract import TokenizedEditablePrompt, tokenize_editable_prompt
+from benchmark.safety_eval.projection_vocabulary import (
+    PROJECTION_TOKEN_POLICIES,
+    build_projection_vocabulary,
+    validate_initial_editable_ids,
+)
 from benchmark.safety_eval.runtime import ResolvedModel, validate_model_assets
 from benchmark.safety_eval.schema import EditableSpan, V2BenchmarkExample
 from benchmark.safety_eval.span_annotation import SpanAnnotator, SpanAnnotationSettings
@@ -654,6 +659,7 @@ def serialize_trajectory_pools(
     vocabulary_embeddings: torch.Tensor,
     tokenizer: Any,
     forbidden_token_ids: Sequence[int],
+    allowed_token_ids: Sequence[int] | None = None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for branch in BRANCHES:
@@ -664,6 +670,7 @@ def serialize_trajectory_pools(
                 snapshot.state,
                 vocabulary_embeddings,
                 forbidden_token_ids=forbidden_token_ids,
+                allowed_token_ids=allowed_token_ids,
             )
             identities = (projected.prefix_token_ids, projected.seed_token_ids)
             if initial_projection is None:
@@ -870,12 +877,19 @@ def _checkpoint_projection_probe(
     vocabulary: torch.Tensor,
     tokenizer: Any,
     forbidden_ids: Sequence[int],
+    allowed_token_ids: Sequence[int],
 ) -> dict[str, object]:
     initial = materialize_continuous_state(
-        initial_state, vocabulary, forbidden_token_ids=forbidden_ids
+        initial_state,
+        vocabulary,
+        forbidden_token_ids=forbidden_ids,
+        allowed_token_ids=allowed_token_ids,
     )
     projected = materialize_continuous_state(
-        snapshot.state, vocabulary, forbidden_token_ids=forbidden_ids
+        snapshot.state,
+        vocabulary,
+        forbidden_token_ids=forbidden_ids,
+        allowed_token_ids=allowed_token_ids,
     )
     z_changes = sum(
         left != right for left, right in zip(projected.prefix_token_ids, initial.prefix_token_ids)
@@ -911,16 +925,23 @@ def _branch_materialization(
     tokenizer: Any,
     vocabulary: torch.Tensor,
     forbidden_ids: Sequence[int],
+    allowed_token_ids: Sequence[int],
     max_new_tokens: int,
     include_continuous_response: bool = True,
 ) -> dict[str, object]:
     if snapshot.state.u.shape[1] != len(prompt.editable_positions):
         raise ValueError("selected state has the wrong U length")
     initial_projection = materialize_continuous_state(
-        initial_state, vocabulary, forbidden_token_ids=forbidden_ids
+        initial_state,
+        vocabulary,
+        forbidden_token_ids=forbidden_ids,
+        allowed_token_ids=allowed_token_ids,
     )
     projection = materialize_continuous_state(
-        snapshot.state, vocabulary, forbidden_token_ids=forbidden_ids
+        snapshot.state,
+        vocabulary,
+        forbidden_token_ids=forbidden_ids,
+        allowed_token_ids=allowed_token_ids,
     )
     recorder = _DecodeRecorder(tokenizer)
     materialized = materialize_v2_candidate(
@@ -1846,6 +1867,7 @@ def optimize_sample(
     finite_difference_fol: bool,
     finite_difference_radius: float,
     checkpoint_early_stop: bool,
+    projection_token_policy: str,
     judge_endpoint: str | None,
     judge_model: str | None,
     judge_threshold: float,
@@ -1929,6 +1951,17 @@ def optimize_sample(
         initial_state = objective.build_editable_state(prefix_ids)
         if initial_state.u.shape[1] != len(prompt.editable_positions):
             raise ValueError("initial U length does not match Omega_s")
+        projection_vocabulary = build_projection_vocabulary(
+            tokenizer,
+            int(vocabulary.shape[0]),
+            projection_token_policy,
+        )
+        validate_initial_editable_ids(
+            projection_vocabulary,
+            z_token_ids=prefix_ids.detach().reshape(-1).cpu().tolist(),
+            u_token_ids=prompt.gather_editable_ids().detach().reshape(-1).cpu().tolist(),
+        )
+        allowed_projection_ids = projection_vocabulary.allowed_token_ids
         annotation_sha = sha256_file(annotation_path)
         configuration = {
             "steps": steps,
@@ -1944,6 +1977,7 @@ def optimize_sample(
                 "token_ids": prefix_ids[0].detach().cpu().tolist(),
                 "embedding_sha256": canonical_hash(initial_state.z.detach().cpu().float().tolist()),
             },
+            "projection_vocabulary": projection_vocabulary.evidence(),
             "learning_rate": learning_rate,
             "lambda_fol": lambda_fol,
             "epsilon": epsilon,
@@ -2048,6 +2082,7 @@ def optimize_sample(
                     vocabulary=vocabulary.detach(),
                     tokenizer=tokenizer,
                     forbidden_ids=forbidden_ids,
+                    allowed_token_ids=allowed_projection_ids,
                 )
 
             def generate_callback(branch: str, snapshot: Any) -> dict[str, object]:
@@ -2061,6 +2096,7 @@ def optimize_sample(
                     tokenizer=tokenizer,
                     vocabulary=vocabulary.detach(),
                     forbidden_ids=forbidden_ids,
+                    allowed_token_ids=allowed_projection_ids,
                     max_new_tokens=max_new_tokens,
                     include_continuous_response=True,
                 )
@@ -2154,6 +2190,7 @@ def optimize_sample(
             vocabulary_embeddings=vocabulary.detach(),
             tokenizer=tokenizer,
             forbidden_token_ids=forbidden_ids,
+            allowed_token_ids=allowed_projection_ids,
         )
         events.append(_event(phase, "complete", phase_started))
         phase = "checkpoint_materialization_and_generation"
@@ -2172,6 +2209,7 @@ def optimize_sample(
                         tokenizer=tokenizer,
                         vocabulary=vocabulary.detach(),
                         forbidden_ids=forbidden_ids,
+                        allowed_token_ids=allowed_projection_ids,
                         max_new_tokens=max_new_tokens,
                         include_continuous_response=include_continuous_checkpoints,
                     )
@@ -2216,6 +2254,7 @@ def optimize_sample(
                     tokenizer=tokenizer,
                     vocabulary=vocabulary.detach(),
                     forbidden_ids=forbidden_ids,
+                    allowed_token_ids=allowed_projection_ids,
                     max_new_tokens=max_new_tokens,
                 )
             branch_result.update({
@@ -2504,6 +2543,11 @@ def _parser() -> argparse.ArgumentParser:
     optimize.add_argument("--finite-difference-fol", action="store_true")
     optimize.add_argument("--finite-difference-radius", type=float, default=1e-3)
     optimize.add_argument("--checkpoint-early-stop", action="store_true")
+    optimize.add_argument(
+        "--projection-token-policy",
+        choices=PROJECTION_TOKEN_POLICIES,
+        default="special_only",
+    )
     optimize.add_argument("--judge-endpoint")
     optimize.add_argument("--judge-model")
     optimize.add_argument("--judge-threshold", type=float, default=0.5)
@@ -2585,6 +2629,7 @@ def _dry_optimize_summary(args: argparse.Namespace) -> dict[str, object]:
         "finite_difference_fol": args.finite_difference_fol,
         "finite_difference_radius": args.finite_difference_radius,
         "checkpoint_early_stop": args.checkpoint_early_stop,
+        "projection_token_policy": args.projection_token_policy,
         "checkpoint_schedule": list(search_schedule),
         "would_contact_endpoint": False,
         "would_load_model": False,
@@ -2704,6 +2749,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         finite_difference_fol=args.finite_difference_fol,
         finite_difference_radius=args.finite_difference_radius,
         checkpoint_early_stop=args.checkpoint_early_stop,
+        projection_token_policy=args.projection_token_policy,
         judge_endpoint=args.judge_endpoint,
         judge_model=args.judge_model,
         judge_threshold=args.judge_threshold,
