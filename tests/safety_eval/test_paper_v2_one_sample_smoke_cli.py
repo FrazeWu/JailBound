@@ -666,6 +666,16 @@ def test_checkpoint_search_reports_honest_exhaustion() -> None:
     )
 
 
+def test_safety_judge_called_requires_generated_checkpoint_evidence() -> None:
+    module = _load_script()
+
+    assert module.safety_judge_called({branch: [] for branch in module.BRANCHES}) is False
+    assert module.safety_judge_called({
+        "jailbound_o_minus": [{"step": 25}],
+        "jailbound_o_plus": [],
+    }) is True
+
+
 def test_optimize_dry_run_rejects_non_finite_hyperparameters_before_model_load(
     tmp_path: Path, monkeypatch
 ) -> None:

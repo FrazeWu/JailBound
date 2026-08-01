@@ -480,6 +480,10 @@ def run_branch_pools(
     return pools
 
 
+def safety_judge_called(checkpoint_evidence: Mapping[str, Sequence[object]]) -> bool:
+    return any(bool(checkpoint_evidence.get(branch)) for branch in BRANCHES)
+
+
 def run_checkpoint_search(
     *,
     streams: Mapping[str, Iterator[Any]],
@@ -2316,7 +2320,7 @@ def optimize_sample(
                 if not branch_results[branch]["decoded_retokenization_audit"]["exact_match"]
             ],
             "scope_note": "One fixed English qualitative example pending author approval; not aggregate evidence.",
-            "safety_judge_called": checkpoint_early_stop,
+            "safety_judge_called": safety_judge_called(checkpoint_evidence),
             "batch_work_launched": False,
         }
         report_payload = copy.deepcopy(result)
