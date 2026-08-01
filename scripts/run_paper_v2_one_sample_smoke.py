@@ -28,6 +28,7 @@ from benchmark.safety_eval.checkpoint_early_stop import (
     double_change_gate,
     readable_english_regions,
 )
+from benchmark.safety_eval.checkpoint_rejections import ManualCheckpointRejection
 from benchmark.safety_eval.execution import LocalQwenHandle, load_local_qwen
 from benchmark.safety_eval.generation import generate_from_embeddings, generate_one
 from benchmark.safety_eval.io import (
@@ -498,8 +499,25 @@ def run_checkpoint_search(
     persist_generations: Callable[[Sequence[Mapping[str, object]]], None],
     judge_pair: Callable[[dict[str, object]], dict[str, object]],
     persist_decisions: Callable[[Sequence[Mapping[str, object]]], None],
+    manual_rejections: Sequence[ManualCheckpointRejection] = (),
 ) -> dict[str, object]:
     """Advance synchronized branch streams until one checkpoint passes every gate."""
+    rejection_by_branch_step = {
+        rejection.branch_step: rejection for rejection in manual_rejections
+    }
+    encountered_rejections: set[tuple[str, int]] = set()
+
+    def ensure_all_rejections_encountered() -> None:
+        missing = [
+            rejection.evidence()
+            for rejection in manual_rejections
+            if rejection.branch_step not in encountered_rejections
+        ]
+        if missing:
+            raise ValueError(
+                f"manual rejection was not encountered as a machine-qualified checkpoint: {missing}"
+            )
+
     pools: dict[str, list[Any]] = {branch: [] for branch in BRANCHES}
     for branch in BRANCHES:
         try:
@@ -571,9 +589,21 @@ def run_checkpoint_search(
                 "reasons": list(assessment.reasons),
                 "paired_judgment": judgment,
             }
+            rejection = rejection_by_branch_step.get((branch, int(expected_step)))
+            if assessment.accepted and rejection is not None:
+                if rejection.state_sha256 != evidence.get("state_sha256"):
+                    raise ValueError("manual rejection state identity mismatch")
+                decision_row["accepted"] = False
+                decision_row["reasons"] = ["manually_rejected"]
+                decision_row["manual_rejection"] = rejection.evidence()
+                encountered_rejections.add(rejection.branch_step)
+                decisions.append(decision_row)
+                persist_decisions(decisions)
+                continue
             decisions.append(decision_row)
             persist_decisions(decisions)
             if assessment.accepted:
+                ensure_all_rejections_encountered()
                 return {
                     "accepted": True,
                     "stopping_branch": branch,
@@ -586,6 +616,7 @@ def run_checkpoint_search(
                     "accepted_judgment": judgment,
                 }
 
+    ensure_all_rejections_encountered()
     return {
         "accepted": False,
         "stopping_branch": None,

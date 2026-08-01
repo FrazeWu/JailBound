@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from benchmark.safety_eval.checkpoint_rejections import ManualCheckpointRejection
 from benchmark.safety_eval.objective import EditableState
 
 
@@ -727,6 +728,235 @@ def test_checkpoint_search_reports_honest_exhaustion() -> None:
         row["reasons"] == ["z_and_u_must_both_change"]
         for row in outcome["decisions"]
     )
+
+
+def test_checkpoint_search_replays_manual_rejection_then_stops_at_later_checkpoint() -> None:
+    module = _load_script()
+
+    def stream(branch: str):
+        for step in (0, 25, 50, 75):
+            yield SimpleNamespace(checkpoint=step, branch=branch)
+
+    def probe(branch: str, snapshot: SimpleNamespace) -> dict[str, object]:
+        both_changed = branch == "jailbound_o_minus" and snapshot.checkpoint in {25, 50}
+        return {
+            "branch": branch,
+            "step": snapshot.checkpoint,
+            "projected_token_changes": {
+                "z": int(both_changed),
+                "u": int(both_changed),
+                "total": 2 * int(both_changed),
+            },
+            "final_z_text": "readable prefix",
+            "final_u_text": "readable request",
+        }
+
+    def generate(branch: str, snapshot: SimpleNamespace) -> dict[str, object]:
+        return {
+            **probe(branch, snapshot),
+            "state_sha256": f"{snapshot.checkpoint:064x}",
+            "frozen_positions_unchanged": True,
+            "decoded_retokenization_audit": {"exact_match": True},
+            "continuous_response": "unsafe response",
+            "materialized_response": "safe refusal",
+        }
+
+    def judge(evidence: dict[str, object]) -> dict[str, object]:
+        return {
+            "branch": evidence["branch"],
+            "step": evidence["step"],
+            "state_sha256": evidence["state_sha256"],
+            "continuous": {"unsafe_label": True},
+            "materialized": {"unsafe_label": False},
+            "transition": "unsafe_to_safe",
+        }
+
+    outcome = module.run_checkpoint_search(
+        streams={branch: stream(branch) for branch in module.BRANCHES},
+        schedule=(25, 50, 75),
+        probe=probe,
+        generate=generate,
+        persist_generations=lambda rows: None,
+        judge_pair=judge,
+        persist_decisions=lambda rows: None,
+        manual_rejections=(
+            ManualCheckpointRejection(
+                branch="jailbound_o_minus",
+                step=25,
+                state_sha256=f"{25:064x}",
+                reason="Readable ASCII but code-like English",
+            ),
+        ),
+    )
+
+    assert outcome["accepted"] is True
+    assert outcome["stopping_branch"] == "jailbound_o_minus"
+    assert outcome["stopping_step"] == 50
+    assert outcome["visited_checkpoints"] == [25, 50]
+    assert outcome["decisions"][0] == {
+        "branch": "jailbound_o_minus",
+        "step": 25,
+        "state_sha256": f"{25:064x}",
+        "accepted": False,
+        "reasons": ["manually_rejected"],
+        "paired_judgment": {
+            "branch": "jailbound_o_minus",
+            "step": 25,
+            "state_sha256": f"{25:064x}",
+            "continuous": {"unsafe_label": True},
+            "materialized": {"unsafe_label": False},
+            "transition": "unsafe_to_safe",
+        },
+        "manual_rejection": {
+            "branch": "jailbound_o_minus",
+            "step": 25,
+            "state_sha256": f"{25:064x}",
+            "reason": "Readable ASCII but code-like English",
+        },
+    }
+    assert outcome["decisions"][-1]["accepted"] is True
+
+
+def test_checkpoint_search_rejects_manual_rejection_state_hash_mismatch() -> None:
+    module = _load_script()
+
+    def stream(branch: str):
+        for step in (0, 25):
+            yield SimpleNamespace(checkpoint=step, branch=branch)
+
+    def probe(branch: str, snapshot: SimpleNamespace) -> dict[str, object]:
+        qualified = branch == "jailbound_o_minus" and snapshot.checkpoint == 25
+        return {
+            "branch": branch,
+            "step": snapshot.checkpoint,
+            "projected_token_changes": {"z": int(qualified), "u": int(qualified), "total": 2 * int(qualified)},
+            "final_z_text": "readable prefix",
+            "final_u_text": "readable request",
+        }
+
+    def generate(branch: str, snapshot: SimpleNamespace) -> dict[str, object]:
+        return {
+            **probe(branch, snapshot),
+            "state_sha256": f"{snapshot.checkpoint:064x}",
+            "frozen_positions_unchanged": True,
+            "decoded_retokenization_audit": {"exact_match": True},
+            "continuous_response": "unsafe response",
+            "materialized_response": "safe refusal",
+        }
+
+    with pytest.raises(ValueError, match="manual rejection state identity mismatch"):
+        module.run_checkpoint_search(
+            streams={branch: stream(branch) for branch in module.BRANCHES},
+            schedule=(25,),
+            probe=probe,
+            generate=generate,
+            persist_generations=lambda rows: None,
+            judge_pair=lambda evidence: {
+                "branch": evidence["branch"],
+                "step": evidence["step"],
+                "state_sha256": evidence["state_sha256"],
+                "continuous": {"unsafe_label": True},
+                "materialized": {"unsafe_label": False},
+                "transition": "unsafe_to_safe",
+            },
+            persist_decisions=lambda rows: None,
+            manual_rejections=(
+                ManualCheckpointRejection(
+                    branch="jailbound_o_minus",
+                    step=25,
+                    state_sha256="f" * 64,
+                    reason="Readable ASCII but code-like English",
+                ),
+            ),
+        )
+
+
+def test_checkpoint_search_fails_closed_when_manual_rejection_is_never_encountered() -> None:
+    module = _load_script()
+
+    def stream(branch: str):
+        for step in (0, 25):
+            yield SimpleNamespace(checkpoint=step, branch=branch)
+
+    with pytest.raises(ValueError, match="manual rejection was not encountered"):
+        module.run_checkpoint_search(
+            streams={branch: stream(branch) for branch in module.BRANCHES},
+            schedule=(25,),
+            probe=lambda branch, snapshot: {
+                "branch": branch,
+                "step": snapshot.checkpoint,
+                "projected_token_changes": {"z": 1, "u": 1, "total": 2},
+                "final_z_text": "readable prefix",
+                "final_u_text": "readable request",
+            },
+            generate=lambda branch, snapshot: {
+                "branch": branch,
+                "step": snapshot.checkpoint,
+                "state_sha256": f"{snapshot.checkpoint:064x}",
+                "projected_token_changes": {"z": 1, "u": 1, "total": 2},
+                "frozen_positions_unchanged": True,
+                "decoded_retokenization_audit": {"exact_match": True},
+                "continuous_response": "unsafe response",
+                "materialized_response": "safe refusal",
+                "final_z_text": "readable prefix",
+                "final_u_text": "readable request",
+            },
+            persist_generations=lambda rows: None,
+            judge_pair=lambda evidence: {
+                "branch": evidence["branch"],
+                "step": evidence["step"],
+                "state_sha256": evidence["state_sha256"],
+                "continuous": {"unsafe_label": evidence["branch"] == "jailbound_o_minus"},
+                "materialized": {"unsafe_label": False},
+                "transition": "unsafe_to_safe" if evidence["branch"] == "jailbound_o_minus" else "unchanged",
+            },
+            persist_decisions=lambda rows: None,
+            manual_rejections=(
+                ManualCheckpointRejection(
+                    branch="jailbound_o_plus",
+                    step=25,
+                    state_sha256=f"{25:064x}",
+                    reason="Readable ASCII but code-like English",
+                ),
+            ),
+        )
+
+
+def test_checkpoint_search_fails_closed_when_manual_rejection_never_passes_machine_gates() -> None:
+    module = _load_script()
+
+    def stream(branch: str):
+        for step in (0, 25):
+            yield SimpleNamespace(checkpoint=step, branch=branch)
+
+    with pytest.raises(ValueError, match="manual rejection was not encountered"):
+        module.run_checkpoint_search(
+            streams={branch: stream(branch) for branch in module.BRANCHES},
+            schedule=(25,),
+            probe=lambda branch, snapshot: {
+                "branch": branch,
+                "step": snapshot.checkpoint,
+                "projected_token_changes": {
+                    "z": 0,
+                    "u": 0,
+                    "total": 0,
+                },
+                "final_z_text": "readable prefix",
+                "final_u_text": "readable request",
+            },
+            generate=lambda *args: pytest.fail("generation should be skipped"),
+            persist_generations=lambda rows: None,
+            judge_pair=lambda evidence: pytest.fail("judge should be skipped"),
+            persist_decisions=lambda rows: None,
+            manual_rejections=(
+                ManualCheckpointRejection(
+                    branch="jailbound_o_minus",
+                    step=25,
+                    state_sha256=f"{25:064x}",
+                    reason="Readable ASCII but code-like English",
+                ),
+            ),
+        )
 
 
 def test_checkpoint_and_trajectory_projection_share_explicit_allowed_ids(monkeypatch) -> None:
