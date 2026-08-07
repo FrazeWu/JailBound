@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import benchmark.safety_eval.generation as generation_module
 from benchmark.safety_eval.generation import (
     embedding_state_hash,
     generate_from_embeddings,
@@ -15,7 +16,9 @@ from benchmark.safety_eval.generation import (
     generate_response_record,
     shard_ids,
 )
-from benchmark.safety_eval.schema import MaterializationRecord, RecordStatus
+from benchmark.safety_eval.schema import MaterializationRecord, RecordStatus, TransportType, V2MaterializationRecord
+from benchmark.safety_eval.io import canonical_hash
+from benchmark.safety_eval.runtime import ResolvedModel
 
 
 class FakeTokenizer:
@@ -99,6 +102,10 @@ class EmbeddingModel:
         self.inputs_embeds: torch.Tensor | None = None
         self.attention_mask: torch.Tensor | None = None
         self.generate_kwargs: dict[str, object] | None = None
+        self.embedding = torch.nn.Embedding(128, 3)
+
+    def get_input_embeddings(self) -> torch.nn.Embedding:
+        return self.embedding
 
     def generate(
         self,
@@ -111,6 +118,13 @@ class EmbeddingModel:
         self.attention_mask = attention_mask
         self.generate_kwargs = kwargs
         return [[91, 92] for _ in range(inputs_embeds.shape[0])]
+
+
+class V2TokenModel(FakeModel):
+    def generate(self, input_ids: torch.Tensor, **kwargs: object) -> list[list[int]]:  # type: ignore[override]
+        self.input_ids = input_ids.tolist()
+        self.generate_kwargs = kwargs
+        return [input_ids[0].tolist() + [91, 92]]
 
 
 def test_shard_ids_is_deterministic_and_covers_each_input_once() -> None:
@@ -263,6 +277,38 @@ def test_generate_embedding_response_record_preserves_identity_and_state_hash() 
     assert record.generated_tokens == 2
 
 
+def test_generate_embedding_response_record_rejects_v2_before_model_generation() -> None:
+    """Continuous states are not a valid reviewer-v2 transport."""
+    model = EmbeddingModel()
+
+    with pytest.raises(ValueError, match="does not support reviewer_eval.v2"):
+        generate_embedding_response_record(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            schema_version="reviewer_eval.v2",
+            run_id="run:fixture",
+            config_hash="a" * 64,
+            sample_id="fixture:embedding:001",
+            source="fixture",
+            method="fol_boundary",
+            checkpoint=0,
+            target_key="target",
+            target_revision="local:fixture",
+            inputs_embeds=torch.zeros((1, 2, 3)),
+            attention_mask=torch.ones((1, 2), dtype=torch.long),
+            max_new_tokens=7,
+        )
+
+    assert model.inputs_embeds is None
+    assert model.attention_mask is None
+    assert model.generate_kwargs is None
+
+
+def test_v2_token_generation_helper_is_not_a_public_entrypoint() -> None:
+    """Only the materialization-record boundary may execute v2 token IDs."""
+    assert not hasattr(generation_module, "generate_from_token_ids")
+
+
 def _materialization() -> MaterializationRecord:
     return MaterializationRecord(
         schema_version="reviewer_eval.v1",
@@ -309,3 +355,152 @@ def test_generate_response_record_carries_materialization_identity() -> None:
     assert record.input_tokens == 3
     assert record.generated_tokens == 2
     assert len(record.prompt_hash) == 64
+
+
+def test_generate_response_record_rejects_v2_before_model_execution() -> None:
+    payload = {
+        "schema_version": "reviewer_eval.v2", "run_id": "run:fixture", "config_hash": "a" * 64,
+        "sample_id": "s:1", "source": "s", "method": "method", "branch": "method", "step": 100,
+        "transport": TransportType.text, "state_sha256": "b" * 64, "surrogate_tokenizer_sha256": "c" * 64, "surrogate_embedding_sha256": "d" * 64,
+        "editable_positions": (1,), "original_token_ids": (3, 4), "projected_z_token_ids": (7,),
+        "projected_u_token_ids": (8,), "reconstructed_base_token_ids": (3, 8), "complete_token_ids": (7, 3, 8),
+        "frozen_positions_unchanged": True, "span_boundary_expansions": ((0, 1),),
+        "full_prompt_similarity": 0.5, "editable_span_similarity": 0.0, "flat_prompt": "not executed",
+        "status": RecordStatus.complete, "failure_kind": None, "failure_reason": None,
+    }
+    materialization = V2MaterializationRecord.model_validate(
+        {**payload, "materialization_sha256": canonical_hash(payload)}
+    )
+    model, tokenizer = V2TokenModel(), FakeTokenizer()
+
+    with pytest.raises(ValueError, match="local-assets stage"):
+        generate_response_record(
+            model=model, tokenizer=tokenizer, materialization=materialization,
+            target_key="t", target_revision="r", max_new_tokens=2,
+        )
+    assert model.input_ids is None
+
+
+def test_generate_response_record_rejects_v2_without_explicit_smoke_authorization_before_model() -> None:
+    payload = {
+        "schema_version": "reviewer_eval.v2", "run_id": "run:fixture", "config_hash": "a" * 64,
+        "sample_id": "s:1", "source": "s", "method": "method", "branch": "method", "step": 100,
+        "transport": TransportType.text, "state_sha256": "b" * 64, "surrogate_tokenizer_sha256": "c" * 64, "surrogate_embedding_sha256": "d" * 64,
+        "editable_positions": (1,), "original_token_ids": (3, 4), "projected_z_token_ids": (7,),
+        "projected_u_token_ids": (8,), "reconstructed_base_token_ids": (3, 8), "complete_token_ids": (7, 3, 8),
+        "frozen_positions_unchanged": True, "span_boundary_expansions": ((0, 1),),
+        "full_prompt_similarity": 0.5, "editable_span_similarity": 0.0, "flat_prompt": "not executed",
+        "status": RecordStatus.complete, "failure_kind": None, "failure_reason": None,
+    }
+    materialization = V2MaterializationRecord.model_validate(
+        {**payload, "materialization_sha256": canonical_hash(payload)}
+    )
+    model = V2TokenModel()
+
+    with pytest.raises(ValueError, match="local-assets stage"):
+        generate_response_record(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            materialization=materialization,
+            target_key="t",
+            target_revision="r",
+            max_new_tokens=2,
+        )
+
+    assert model.input_ids is None
+
+
+def test_generate_response_record_rejects_v2_without_provenance_resolver_before_model() -> None:
+    """A valid-looking in-memory record is not execution authority for v2."""
+    payload = {
+        "schema_version": "reviewer_eval.v2", "run_id": "run:fixture", "config_hash": "a" * 64,
+        "sample_id": "s:1", "source": "s", "method": "method", "branch": "method", "step": 100,
+        "transport": TransportType.text, "state_sha256": "b" * 64, "surrogate_tokenizer_sha256": "c" * 64, "surrogate_embedding_sha256": "d" * 64,
+        "editable_positions": (1,), "original_token_ids": (3, 4), "projected_z_token_ids": (7,),
+        "projected_u_token_ids": (8,), "reconstructed_base_token_ids": (3, 8), "complete_token_ids": (7, 3, 8),
+        "frozen_positions_unchanged": True, "span_boundary_expansions": ((0, 1),),
+        "full_prompt_similarity": 0.5, "editable_span_similarity": 0.0, "flat_prompt": "not executed",
+        "status": RecordStatus.complete, "failure_kind": None, "failure_reason": None,
+    }
+    materialization = V2MaterializationRecord.model_validate(
+        {**payload, "materialization_sha256": canonical_hash(payload)}
+    )
+    model = V2TokenModel()
+
+    with pytest.raises(ValueError, match="local-assets stage"):
+        generate_response_record(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            materialization=materialization,
+            target_key="t",
+            target_revision="r",
+            max_new_tokens=2,
+        )
+
+    assert model.input_ids is None
+
+
+def test_generate_response_record_rejects_a_v2_verified_target_tokenizer_mismatch_before_generation() -> None:
+    payload = {
+        "schema_version": "reviewer_eval.v2", "run_id": "run:fixture", "config_hash": "a" * 64,
+        "sample_id": "s:1", "source": "s", "method": "method", "branch": "method", "step": 100,
+        "transport": TransportType.text, "state_sha256": "b" * 64, "surrogate_tokenizer_sha256": "c" * 64, "surrogate_embedding_sha256": "d" * 64,
+        "editable_positions": (1,), "original_token_ids": (3, 4), "projected_z_token_ids": (7,),
+        "projected_u_token_ids": (8,), "reconstructed_base_token_ids": (3, 8), "complete_token_ids": (7, 3, 8),
+        "frozen_positions_unchanged": True, "span_boundary_expansions": ((0, 1),),
+        "full_prompt_similarity": 0.5, "editable_span_similarity": 0.0, "flat_prompt": "not executed",
+        "status": RecordStatus.complete, "failure_kind": None, "failure_reason": None,
+    }
+    materialization = V2MaterializationRecord.model_validate(
+        {**payload, "materialization_sha256": canonical_hash(payload)}
+    )
+    model = V2TokenModel()
+
+    with pytest.raises(ValueError, match="local-assets stage"):
+        generate_response_record(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            materialization=materialization,
+            target_key="t",
+            target_revision="r",
+            max_new_tokens=2,
+        )
+
+    assert model.input_ids is None
+
+
+def test_generate_response_record_rejects_v2_even_with_forged_runtime_and_verifier() -> None:
+    """Only the local-assets v2 stage may authorize projected token execution."""
+    payload = {
+        "schema_version": "reviewer_eval.v2", "run_id": "run:fixture", "config_hash": "a" * 64,
+        "sample_id": "s:1", "source": "s", "method": "method", "branch": "method", "step": 100,
+        "transport": TransportType.text, "state_sha256": "b" * 64, "surrogate_tokenizer_sha256": "c" * 64, "surrogate_embedding_sha256": "d" * 64,
+        "editable_positions": (1,), "original_token_ids": (3, 4), "projected_z_token_ids": (7,),
+        "projected_u_token_ids": (8,), "reconstructed_base_token_ids": (3, 8), "complete_token_ids": (7, 3, 8),
+        "frozen_positions_unchanged": True, "span_boundary_expansions": ((0, 1),),
+        "full_prompt_similarity": 0.5, "editable_span_similarity": 0.0, "flat_prompt": "not executed",
+        "status": RecordStatus.complete, "failure_kind": None, "failure_reason": None,
+    }
+    materialization = V2MaterializationRecord.model_validate(
+        {**payload, "materialization_sha256": canonical_hash(payload)}
+    )
+    model, tokenizer = V2TokenModel(), FakeTokenizer()
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'target_runtime'"):
+        generate_response_record(
+            model=model,
+            tokenizer=tokenizer,
+            materialization=materialization,
+            target_key="t",
+            target_revision="r",
+            **{
+                "target_runtime": ResolvedModel(
+                    path=__import__("pathlib").Path("/fixture"), revision="r",
+                    tokenizer_hash="c" * 64, chat_template_hash=None,
+                ),
+                "target_tokenizer_verifier": lambda value, identity: value is tokenizer,
+            },
+            max_new_tokens=2,
+        )
+
+    assert model.input_ids is None

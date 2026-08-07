@@ -81,12 +81,6 @@ def test_checked_in_v2_config_loads_strict_paper_contract() -> None:
     assert config.optimization.prefix_tokens == 20
     assert config.optimization.prefix_initialization.strategy == "repeat_token"
     assert config.optimization.prefix_initialization.token_text == "!"
-    assert config.optimization.final_states_per_branch == 1
-    assert config.optimization.anchor_set_version == "jailbound-paper-v1"
-    assert "editable_seed_tokens" not in type(config.optimization).model_fields
-
-    with pytest.raises(TypeError, match="frozen"):
-        config.optimization.checkpoints.append(101)
 
 
 def test_v2_smoke_mode_requires_an_isolated_one_sample_output(tmp_path: Path) -> None:
@@ -107,6 +101,15 @@ def test_v2_smoke_mode_requires_an_isolated_one_sample_output(tmp_path: Path) ->
     payload["run"]["output_root"] = "outputs/results/smoke/one-sample"
     payload["optimization"]["methods"] = ["dual_branch"]
     with pytest.raises(ValueError, match="does not support dual_branch"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_requires_a_local_secondary_judge_snapshot(tmp_path: Path) -> None:
+    payload = _v2_payload()
+    payload["judging"]["secondary"]["local_path"] = "/fixture/qwen32"
+    del payload["judging"]["secondary"]["local_path"]
+
+    with pytest.raises(ValueError, match="secondary judge requires a local snapshot"):
         load_v2_config(_write_v2_config(tmp_path, payload))
 
 

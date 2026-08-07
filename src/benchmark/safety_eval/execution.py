@@ -20,6 +20,7 @@ from .optimizers.gcg import GCGOptimizer
 from .optimizers.jailbound import DualBranchOptimizer, InitOptimizer, build_jailbound_optimizer
 from .optimizers.pez import PEZOptimizer
 from .optimizers.random_mutation import RandomMutationOptimizer
+from .materialization import vocabulary_embedding_sha256
 from .objective import EditableState
 from .runtime import ResolvedModel, validate_model_assets, validate_v2_output_root
 from .runner import OptimizationJob, OptimizationRunner, OptimizationSnapshot
@@ -226,6 +227,8 @@ def local_qwen_init_executor(
     checkpoints: tuple[int, ...],
 ) -> Iterable[OptimizationSnapshot]:
     """Embed one record locally and return the immutable Init checkpoint only."""
+    if isinstance(record, V2BenchmarkExample):
+        raise ExecutionError("local Qwen init executor supports v1 manifests only")
     if job.method != "init":
         raise ExecutionError("local Qwen smoke executor supports only method 'init'")
     if checkpoints != (0,):
@@ -319,18 +322,26 @@ def _baseline_optimizer(
     embedding: torch.Tensor,
     z_ids: torch.Tensor,
     u_ids: torch.Tensor,
+    forbidden_token_ids: tuple[int, ...],
 ) -> Any:
     if method == "pez":
-        return PEZOptimizer(embedding, learning_rate=settings.learning_rate, max_grad_norm=settings.grad_clip)
+        return PEZOptimizer(
+            embedding,
+            forbidden_token_ids=forbidden_token_ids,
+            learning_rate=settings.learning_rate,
+            max_grad_norm=settings.grad_clip,
+        )
     if method == "gbda":
         return GBDAOptimizer(
             embedding,
+            forbidden_token_ids=forbidden_token_ids,
             learning_rate=settings.gbda_learning_rate or settings.learning_rate,
             max_grad_norm=settings.grad_clip,
         )
     if method == "gcg":
         return GCGOptimizer(
             embedding,
+            forbidden_token_ids=forbidden_token_ids,
             search_width=settings.gcg_search_width,
             top_k=settings.gcg_search_width,
             initial_z_token_ids=z_ids,
@@ -353,7 +364,10 @@ def _prompt_state_contract(
 
 
 def _checkpoint_state(
-    snapshot: Any, prompt: Any, record: V2BenchmarkExample
+    snapshot: Any,
+    prompt: Any,
+    record: V2BenchmarkExample,
+    input_embeddings: torch.Tensor,
 ) -> dict[str, Any]:
     state = getattr(snapshot, "state", None)
     if state is None:
@@ -365,6 +379,7 @@ def _checkpoint_state(
         "u": state.u.detach().to(device="cpu"),
         "z_token_ids": z_token_ids.detach().to(device="cpu", dtype=torch.long),
         "u_token_ids": u_token_ids.detach().to(device="cpu", dtype=torch.long),
+        "input_embedding_sha256": vocabulary_embedding_sha256(input_embeddings),
         **_prompt_state_contract(prompt, record),
     }
 
@@ -396,6 +411,7 @@ def _random_mutation_snapshots(
     prompt_tokens: int,
     prompt: Any,
     record: V2BenchmarkExample,
+    input_embeddings: torch.Tensor,
 ) -> list[OptimizationSnapshot]:
     """Run a deterministic, semantic-proxy constrained vector mutation baseline."""
     generator = torch.Generator()
@@ -444,6 +460,7 @@ def _random_mutation_snapshots(
                 "u": snapshot.candidate.u.detach().to(device="cpu"),
                 "z_token_ids": torch.empty((0, 0), dtype=torch.long),
                 "u_token_ids": torch.empty((0, 0), dtype=torch.long),
+                "input_embedding_sha256": vocabulary_embedding_sha256(input_embeddings),
                 **_prompt_state_contract(prompt, record),
             },
         )
@@ -514,9 +531,17 @@ def _run_local_qwen_tensor(
             prompt_tokens=prompt_tokens,
             prompt=prompt,
             record=record,
+            input_embeddings=embedding,
         )
     optimizer = (
-        _baseline_optimizer(method, settings, embedding, z_ids, u_ids)
+        _baseline_optimizer(
+            method,
+            settings,
+            embedding,
+            z_ids,
+            u_ids,
+            tuple(loaded.tokenizer.all_special_ids),
+        )
         if method in {"pez", "gbda", "gcg"}
         else _tensor_optimizer(method, settings)
     )
@@ -553,7 +578,7 @@ def _run_local_qwen_tensor(
                 candidates_accepted=getattr(snapshot, "candidates_accepted", 0),
                 prompt_tokens=prompt_tokens,
             ),
-            state=_checkpoint_state(snapshot, prompt, record),
+            state=_checkpoint_state(snapshot, prompt, record, embedding),
             branch_pool=branch_pool if index == 0 else (),
         )
         for index, snapshot in enumerate(result)

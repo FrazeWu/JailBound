@@ -36,15 +36,18 @@ def test_tensor_recovery_sdpa_method_resolves_to_o_plus() -> None:
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_rebalanced") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_fd") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_fd_sdpa") == "jailbound_o_plus"
-from benchmark.safety_eval.io import read_jsonl
+from benchmark.safety_eval.io import read_jsonl, sha256_file
+from benchmark.safety_eval.materialization import vocabulary_embedding_sha256
 from benchmark.safety_eval.manifest import write_controlled_manifest, write_v2_controlled_manifest
-from benchmark.safety_eval.runner import OptimizationJob, OptimizationSnapshot
+from benchmark.safety_eval.runner import OptimizationJob, OptimizationRunner, OptimizationSnapshot
 from benchmark.safety_eval.runtime import ResolvedModel
+from benchmark.safety_eval.runtime import PreflightError
 from benchmark.safety_eval.objective import EditableState
 from benchmark.safety_eval.schema import (
     BenchmarkExample,
     ComputeCounters,
     FailureKind,
+    OptimizationRecord,
     RecordStatus,
     V2BenchmarkExample,
 )
@@ -118,6 +121,31 @@ def _v2_request(tmp_path: Path) -> ExecutionRequest:
         config_hash="b" * 64,
     )
     return replace(request, schema_version="reviewer_eval.v2")
+
+
+def test_direct_v2_run_execution_rejects_a_mixed_legacy_optimization_ledger(
+    tmp_path: Path,
+) -> None:
+    request = _v2_request(tmp_path)
+    records = request.output_root / "optimization" / "fixture" / "fixture_method" / "records.jsonl"
+    records.parent.mkdir(parents=True)
+    valid = OptimizationRecord(
+        schema_version="reviewer_eval.v2", run_id="run:fixture", config_hash="b" * 64,
+        git_revision="fixture", cell_id="cell:fixture", sample_id="fixture:001",
+        source="fixture", method="fixture_method", checkpoint=0, random_seed=1,
+        status=RecordStatus.failed, failure_kind=FailureKind.compatibility,
+        failure_reason="fixture", state_path=None, state_sha256=None,
+        representation="unavailable", attack_loss=None, fol=None, internal_margin=None,
+        materialized_prompt=None, counters=ComputeCounters(),
+    )
+    records.write_text(
+        json.dumps(valid.model_dump(mode="json")) + "\n"
+        '{"schema_version":"reviewer_eval.v1"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PreflightError, match="schema-v1 artifact"):
+        run_execution(request, mode=ExecutionMode.dry_run)
 
 
 def test_dry_run_validates_offline_assets_and_selects_locked_manifest_without_loading_model(tmp_path: Path) -> None:
@@ -575,6 +603,8 @@ def test_smoke_closes_loaded_local_qwen_handle_after_runner_writes_records(tmp_p
 
 
 class _TensorTokenizer:
+    all_special_ids = [0, 6, 7]
+
     def __call__(self, text: str, **kwargs: object) -> dict[str, torch.Tensor | list[tuple[int, int]]]:
         if kwargs == {"return_offsets_mapping": True}:
             assert text == "aa PAYLOAD zz"
@@ -672,6 +702,39 @@ def test_tensor_executor_uses_annotated_middle_span_and_full_anchor_sequences(
     assert tuple(ids.tolist() for ids in observed["refusal_anchor_ids"]) == ([51, 52],)
 
 
+@pytest.mark.parametrize("method", ("pez", "gbda", "gcg"))
+def test_tensor_baseline_optimizers_receive_all_tokenizer_special_ids(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    observed: list[tuple[str, tuple[int, ...]]] = []
+
+    class RecordingOptimizer:
+        def run(self, *_args: object) -> list[object]:
+            return []
+
+    def build_recording_optimizer(
+        selected_method: str,
+        _settings: TensorOptimizationSettings,
+        _embedding: torch.Tensor,
+        _z_ids: torch.Tensor,
+        _u_ids: torch.Tensor,
+        forbidden_token_ids: tuple[int, ...],
+    ) -> RecordingOptimizer:
+        observed.append((selected_method, forbidden_token_ids))
+        return RecordingOptimizer()
+
+    monkeypatch.setattr(execution, "_baseline_optimizer", build_recording_optimizer)
+    handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
+    job = OptimizationJob("fixture", method, "cell:fixture", "fixture:001", 1)
+
+    assert list(
+        execution._run_local_qwen_tensor(
+            handle, _v2_example_with_middle_span(), job, (0, 1, 2), _tensor_settings()
+        )
+    ) == []
+    assert observed == [(method, (0, 6, 7))]
+
+
 class _TinyTensorCausalModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -753,6 +816,9 @@ def test_tensor_smoke_zol_maps_optimizer_snapshots_to_runner_records_and_closes_
 def test_tensor_smoke_persists_content_free_checkpoint_state(tmp_path: Path) -> None:
     request = replace(_v2_request(tmp_path), method="pez", checkpoints=(0, 1, 2))
     handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
+    expected_embedding_sha256 = vocabulary_embedding_sha256(
+        handle.model.get_input_embeddings().weight
+    )
 
     run_execution(
         request,
@@ -768,13 +834,15 @@ def test_tensor_smoke_persists_content_free_checkpoint_state(tmp_path: Path) -> 
     assert set(payload) == {
         "base_token_ids",
         "editable_positions",
-        "editable_span_hashes",
-        "tokenizer_revision",
+            "editable_span_hashes",
+            "input_embedding_sha256",
+            "tokenizer_revision",
         "u",
         "u_token_ids",
         "z",
         "z_token_ids",
     }
+    assert payload["input_embedding_sha256"] == expected_embedding_sha256
     assert payload["base_token_ids"].tolist() == [[1, 2, 3, 4]]
     assert payload["editable_positions"].tolist() == [1, 2]
     assert payload["tokenizer_revision"] == "local-tokenizer"
@@ -782,6 +850,71 @@ def test_tensor_smoke_persists_content_free_checkpoint_state(tmp_path: Path) -> 
     assert payload["z"].ndim == 3
     assert payload["u"].ndim == 3
     assert payload["z_token_ids"].ndim == payload["u_token_ids"].ndim == 2
+
+
+def test_run_execution_rejects_v2_success_snapshot_without_persisted_embedding_state(tmp_path: Path) -> None:
+    request = replace(_v2_request(tmp_path), checkpoints=(0,), method="init")
+
+    summary = run_execution(
+        request,
+        mode=ExecutionMode.smoke,
+        model_loader=lambda _: object(),
+        executor=lambda *_: [OptimizationSnapshot(
+            checkpoint=0,
+            representation="fixture",
+            attack_loss=None,
+            counters=ComputeCounters(),
+        )],
+    )
+
+    rows = read_jsonl(request.output_root / "optimization" / "fixture" / "init" / "records.jsonl")
+    assert summary.completed_records == 0
+    assert summary.failed_records == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["state_path"] is None
+
+
+def test_local_qwen_init_executor_rejects_v2_examples() -> None:
+    job = OptimizationJob(
+        source="fixture", method="init", cell_id="cell:fixture", sample_id="fixture:001", random_seed=1,
+    )
+    with pytest.raises(ExecutionError, match="v1 manifests only"):
+        list(local_qwen_init_executor(LocalQwenHandle(tokenizer=object(), model=object()), _v2_example_with_middle_span(), job, (0,)))
+
+
+def test_runner_records_sha256_of_persisted_state(tmp_path: Path) -> None:
+    runner = OptimizationRunner(
+        tmp_path,
+        config_hash="a" * 64,
+        run_id="run:fixture",
+        git_revision="fixture-revision",
+        schema_version="reviewer_eval.v2",
+    )
+    job = OptimizationJob(
+        source="fixture",
+        method="pez",
+        cell_id="cell:fixture",
+        sample_id="fixture:001",
+        random_seed=1,
+    )
+
+    def snapshots(_: tuple[int, ...]):
+        yield OptimizationSnapshot(
+            checkpoint=0,
+            representation="tensor_embeddings:pez",
+            attack_loss=0.0,
+            counters=ComputeCounters(),
+                state={
+                    "z": torch.zeros((1, 1, 2)),
+                    "u": torch.zeros((1, 1, 2)),
+                    "input_embedding_sha256": "b" * 64,
+                },
+        )
+
+    record = runner.run(job, checkpoints=(0,), snapshot_factory=snapshots)[0]
+
+    assert record.state_path is not None
+    assert record.state_sha256 == sha256_file(record.state_path)
 
 
 def test_tensor_smoke_supports_budgeted_random_mutation_without_text_output() -> None:

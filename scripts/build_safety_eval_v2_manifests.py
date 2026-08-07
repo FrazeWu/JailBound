@@ -447,8 +447,13 @@ def build_manifests(
                 semantic_model.path,
                 revision=semantic_model.revision,
             )
-            vectors = encoder.encode(descriptions)
-            loaded_semantic_model = validate_model_assets(semantic_model.path)
+            try:
+                vectors = encoder.encode(descriptions)
+                loaded_semantic_model = validate_model_assets(semantic_model.path)
+            finally:
+                close = getattr(encoder, "close", None)
+                if callable(close):
+                    close()
             if loaded_semantic_model.revision != semantic_model.revision:
                 raise ValueError("semantic encoder snapshot changed while loading")
             embeddings = dict(zip(labels, vectors, strict=True))

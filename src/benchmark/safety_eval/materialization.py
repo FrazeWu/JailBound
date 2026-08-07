@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Any, Iterable, Mapping
 
 import torch
 
 from .objective import EditableState
+from .io import canonical_hash
 from .prompt_contract import TokenizedEditablePrompt
 from .schema import FailureKind, MaterializationRecord, RecordStatus, TransportType, V2MaterializationRecord
 
@@ -49,6 +51,18 @@ class V2CandidateMaterialization:
     complete_token_ids: tuple[int, ...]
     flat_prompt: str
     frozen_positions_unchanged: bool
+
+
+def vocabulary_embedding_sha256(vocabulary_embeddings: torch.Tensor) -> str:
+    """Fingerprint the exact input-embedding row-to-token-ID mapping."""
+    if vocabulary_embeddings.ndim != 2:
+        raise ValueError("vocabulary embeddings must have shape [vocabulary, hidden]")
+    normalized = vocabulary_embeddings.detach().to(device="cpu").contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tuple(normalized.shape)).encode("ascii"))
+    digest.update(str(normalized.dtype).encode("ascii"))
+    digest.update(normalized.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def meets_semantic_threshold(similarity: float, *, threshold: float) -> bool:
@@ -113,35 +127,55 @@ def build_v2_materialization_record(
     method: str,
     branch: str,
     step: int,
+    state_sha256: str,
+    surrogate_tokenizer_sha256: str,
+    surrogate_embedding_sha256: str,
     transport: TransportType = TransportType.text,
-    full_prompt_similarity: float = 1.0,
-    editable_span_similarity: float = 1.0,
+    full_prompt_similarity: float | None = None,
+    editable_span_similarity: float | None = None,
 ) -> V2MaterializationRecord:
     """Turn one v2 reconstruction into a strict materialization ledger row."""
+    if transport is not TransportType.text:
+        raise ValueError("v2 materialization supports text transport only")
+    original = tuple(int(value) for value in prompt.base_token_ids[0].tolist())
+    if full_prompt_similarity is None:
+        full_prompt_similarity = sum(left == right for left, right in zip(original, result.reconstructed_base_token_ids)) / len(original)
+    if editable_span_similarity is None:
+        editable_span_similarity = sum(
+            original[position] == token_id
+            for position, token_id in zip(prompt.editable_positions, result.projected_u_token_ids)
+        ) / len(prompt.editable_positions)
+    payload = {
+        "schema_version": "reviewer_eval.v2",
+        "run_id": run_id,
+        "config_hash": config_hash,
+        "sample_id": sample_id,
+        "source": source,
+        "method": method,
+        "branch": branch,
+        "step": step,
+        "transport": transport,
+        "state_sha256": state_sha256,
+        "surrogate_tokenizer_sha256": surrogate_tokenizer_sha256,
+        "surrogate_embedding_sha256": surrogate_embedding_sha256,
+        "editable_positions": prompt.editable_positions,
+        "original_token_ids": original,
+        "projected_z_token_ids": result.projected_z_token_ids,
+        "projected_u_token_ids": result.projected_u_token_ids,
+        "reconstructed_base_token_ids": result.reconstructed_base_token_ids,
+        "complete_token_ids": result.complete_token_ids,
+        "frozen_positions_unchanged": result.frozen_positions_unchanged,
+        "span_boundary_expansions": prompt.boundary_expansions,
+        "full_prompt_similarity": full_prompt_similarity,
+        "editable_span_similarity": editable_span_similarity,
+        "flat_prompt": result.flat_prompt,
+        "status": RecordStatus.complete,
+        "failure_kind": None,
+        "failure_reason": None,
+    }
     return V2MaterializationRecord(
-        schema_version="reviewer_eval.v2",
-        run_id=run_id,
-        config_hash=config_hash,
-        sample_id=sample_id,
-        source=source,
-        method=method,
-        branch=branch,
-        step=step,
-        transport=transport,
-        editable_positions=prompt.editable_positions,
-        original_token_ids=tuple(int(value) for value in prompt.base_token_ids[0].tolist()),
-        projected_z_token_ids=result.projected_z_token_ids,
-        projected_u_token_ids=result.projected_u_token_ids,
-        reconstructed_base_token_ids=result.reconstructed_base_token_ids,
-        complete_token_ids=result.complete_token_ids,
-        frozen_positions_unchanged=result.frozen_positions_unchanged,
-        span_boundary_expansions=prompt.boundary_expansions,
-        full_prompt_similarity=full_prompt_similarity,
-        editable_span_similarity=editable_span_similarity,
-        flat_prompt=result.flat_prompt,
-        status=RecordStatus.complete,
-        failure_kind=None,
-        failure_reason=None,
+        **payload,
+        materialization_sha256=canonical_hash(payload),
     )
 
 
@@ -362,6 +396,14 @@ def _project_block(
     allowed_ids: torch.Tensor,
     allowed_embeddings: torch.Tensor,
 ) -> tuple[tuple[int, ...], float]:
+    if block.ndim != 3 or block.shape[0] != 1:
+        raise ValueError("projection state must have batch size 1")
+    if block.shape[-1] != allowed_embeddings.shape[-1]:
+        raise ValueError("projection state hidden size must match vocabulary")
+    if not block.is_floating_point() or not torch.isfinite(block).all().item():
+        raise ValueError("projection state must contain finite floating-point values")
+    if torch.any(torch.linalg.vector_norm(block, dim=-1) == 0).item():
+        raise ValueError("projection state must not contain zero-norm vectors")
     positions = block.detach().reshape(-1, block.shape[-1]).float()
     vocabulary = allowed_embeddings.detach().float()
     positions = torch.nn.functional.normalize(positions, dim=-1)
@@ -379,6 +421,8 @@ def materialize_continuous_state(
     forbidden_token_ids: Iterable[int] = (),
 ) -> ContinuousMaterialization:
     """Project *both* ``z`` and ``u`` against one masked vocabulary."""
+    if not vocabulary_embeddings.is_floating_point() or not torch.isfinite(vocabulary_embeddings).all().item():
+        raise ValueError("vocabulary embeddings must contain finite floating-point values")
     allowed_ids, allowed_embeddings = _allowed_vocabulary(
         vocabulary_embeddings, forbidden_token_ids
     )

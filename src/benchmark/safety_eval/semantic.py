@@ -378,6 +378,23 @@ class QwenHiddenMeanEncoder:
             vectors.extend(pooled.cpu().numpy())
         return np.asarray(vectors, dtype=np.float32)
 
+    def close(self) -> None:
+        """Release the local model so subsequent single-GPU stages can load."""
+        model, self._model = self._model, None
+        self._tokenizer = None
+        if model is not None:
+            to = getattr(model, "to", None)
+            if callable(to):
+                to("cpu")
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
     def _model_device(self) -> Any:
         if self._model is None:
             raise RuntimeError("semantic encoder model is unavailable")

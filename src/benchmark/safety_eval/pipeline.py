@@ -12,7 +12,12 @@ import torch
 
 from .io import JsonlLedger, read_jsonl
 from .materialization import materialize_checkpoint
-from .generation import generate_response_record
+from .generation import _generate_v2_response_record, generate_response_record
+from .runtime import (
+    require_v2_materialization_ledger_membership,
+    validate_model_assets,
+    validate_v2_provenance_ledgers,
+)
 from .schema import (
     BenchmarkExample,
     FailureKind,
@@ -245,8 +250,12 @@ def generate_materialized_records(
     target_revision: str,
     max_new_tokens: int,
 ) -> StageSummary:
-    """Generate one greedy response per final materialization, resumably."""
+    """Generate v1 greedy responses per final materialization, resumably."""
 
+    rows = tuple(rows)
+    has_v2_rows = any(row.get("schema_version") == "reviewer_eval.v2" for row in rows)
+    if has_v2_rows:
+        raise ValueError("generate_materialized_records supports reviewer_eval.v1 only")
     selected = written = failed = 0
     ledgers: dict[tuple[str, str], JsonlLedger] = {}
     for row in rows:
@@ -266,29 +275,100 @@ def generate_materialized_records(
                 / materialization.source
                 / materialization.method
                 / "records.jsonl",
-                key_fields=("sample_id", "checkpoint", "branch", "transport")
-                if isinstance(materialization, V2MaterializationRecord)
-                else ("sample_id", "checkpoint"),
+                key_fields=("sample_id", "checkpoint"),
             ),
         )
         if ledger.contains_key(
             {
                 "sample_id": materialization.sample_id,
-                "checkpoint": materialization.step if isinstance(materialization, V2MaterializationRecord) else materialization.checkpoint,
-                **({"branch": materialization.branch, "transport": materialization.transport.value}
-                   if isinstance(materialization, V2MaterializationRecord) else {}),
+                "checkpoint": materialization.checkpoint,
             }
         ):
             continue
         response = generate_response_record(
             model=model, tokenizer=tokenizer, materialization=materialization,
-            target_key=target_key, target_revision=target_revision, max_new_tokens=max_new_tokens,
+            target_key=target_key, target_revision=target_revision,
+            max_new_tokens=max_new_tokens,
         )
         if response.status is RecordStatus.failed:
             failed += 1
         if ledger.append_once(response.model_dump(mode="json")):
             written += 1
     return StageSummary(selected, written, failed)
+
+
+def generate_v2_materialized_records_from_local_assets(
+    output_root: str | Path,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    target_model_path: str | Path,
+    target_key: str,
+    max_new_tokens: int,
+    attention_backend: str = "eager",
+) -> StageSummary:
+    """Generate v2 records through the only target-authority boundary.
+
+    The target model snapshot is validated and loaded here, rather than being
+    passed in as a caller-constructed runtime, model, tokenizer, or verifier.
+    This makes the target tokenizer identity an observed property of the exact
+    local snapshot that executes the projected token IDs.
+    """
+    records = tuple(V2MaterializationRecord.model_validate(row) for row in rows)
+    root = Path(output_root)
+    validate_v2_provenance_ledgers(root)
+    resolved = validate_model_assets(target_model_path)
+    from .execution import load_local_qwen
+
+    loaded = load_local_qwen(resolved, attention_backend=attention_backend)
+    try:
+        if loaded.model is None or loaded.tokenizer is None:
+            raise ValueError("v2 local target loader returned an empty handle")
+        # Close the validation/load race before the snapshot identity reaches a
+        # response ledger.  A changed directory must be rerun from a fresh
+        # local-assets stage, never attributed to the earlier revision.
+        if validate_model_assets(target_model_path) != resolved:
+            raise ValueError("v2 target model snapshot changed while loading")
+        selected = written = failed = 0
+        ledgers: dict[tuple[str, str], JsonlLedger] = {}
+        for materialization in records:
+            selected += 1
+            require_v2_materialization_ledger_membership(root, materialization)
+            key = (materialization.source, materialization.method)
+            ledger = ledgers.setdefault(
+                key,
+                JsonlLedger(
+                    root / "responses" / _path_component(target_key, field="target_key")
+                    / materialization.source / materialization.method / "records.jsonl",
+                    key_fields=(
+                        "sample_id", "checkpoint", "branch", "transport",
+                        "materialization_sha256", "target_revision",
+                        "target_tokenizer_sha256",
+                    ),
+                ),
+            )
+            resume_key = {
+                "sample_id": materialization.sample_id, "checkpoint": materialization.step,
+                "branch": materialization.branch, "transport": materialization.transport.value,
+                "materialization_sha256": materialization.materialization_sha256,
+                "target_revision": resolved.revision,
+                "target_tokenizer_sha256": resolved.tokenizer_hash,
+            }
+            if ledger.contains_key(resume_key):
+                continue
+            response = _generate_v2_response_record(
+                model=loaded.model, tokenizer=loaded.tokenizer,
+                materialization=materialization, target_key=target_key,
+                target_revision=resolved.revision,
+                target_tokenizer_sha256=resolved.tokenizer_hash,
+                max_new_tokens=max_new_tokens,
+            )
+            if response.status is RecordStatus.failed:
+                failed += 1
+            if ledger.append_once(response.model_dump(mode="json")):
+                written += 1
+        return StageSummary(selected, written, failed)
+    finally:
+        loaded.close()
 
 
 def judge_response_records(
@@ -300,10 +380,14 @@ def judge_response_records(
 ) -> StageSummary:
     """Persist one terminal judgment per response and threshold."""
 
+    raw_rows = tuple(rows)
+    if any(row.get("schema_version") == "reviewer_eval.v2" for row in raw_rows):
+        validate_v2_provenance_ledgers(output_root)
     selected = written = failed = 0
     judge_key = _path_component(str(getattr(judge, "key")), field="judge_key")
+    judge_revision = str(getattr(judge, "revision"))
     ledgers: dict[tuple[str, str, str], JsonlLedger] = {}
-    for row in rows:
+    for row in raw_rows:
         selected += 1
         response = (
             V2ResponseRecord.model_validate(row)
@@ -321,7 +405,11 @@ def judge_response_records(
                 / response.source
                 / response.method
                 / "records.jsonl",
-                key_fields=("sample_id", "checkpoint", "threshold", "branch", "transport")
+                key_fields=(
+                    "sample_id", "checkpoint", "threshold", "branch", "transport",
+                    "materialization_sha256", "target_revision", "target_tokenizer_sha256",
+                    "judge_revision",
+                )
                 if isinstance(response, V2ResponseRecord)
                 else ("sample_id", "checkpoint", "threshold"),
             ),
@@ -331,7 +419,13 @@ def judge_response_records(
                 "sample_id": response.sample_id,
                 "checkpoint": response.checkpoint,
                 "threshold": threshold,
-                **({"branch": response.branch, "transport": response.transport.value}
+                **({
+                    "branch": response.branch, "transport": response.transport.value,
+                    "materialization_sha256": response.materialization_sha256,
+                    "target_revision": response.target_revision,
+                    "target_tokenizer_sha256": response.target_tokenizer_sha256,
+                    "judge_revision": judge_revision,
+                }
                    if isinstance(response, V2ResponseRecord) else {}),
             }
         ):
@@ -339,12 +433,18 @@ def judge_response_records(
         if response.status is RecordStatus.failed:
             record_type = V2JudgmentRecord if isinstance(response, V2ResponseRecord) else JudgmentRecord
             payload = {
-                **({"branch": response.branch, "state_step": response.state_step, "transport": response.transport}
+                **({
+                    "branch": response.branch, "state_step": response.state_step,
+                    "transport": response.transport,
+                    "materialization_sha256": response.materialization_sha256,
+                    "target_revision": response.target_revision,
+                    "target_tokenizer_sha256": response.target_tokenizer_sha256,
+                }
                    if isinstance(response, V2ResponseRecord) else {}),
                 "schema_version": response.schema_version, "run_id": response.run_id, "config_hash": response.config_hash,
                 "sample_id": response.sample_id, "source": response.source, "method": response.method, "checkpoint": response.checkpoint,
                 "target_key": response.target_key, "judge_key": str(getattr(judge, "key")),
-                "judge_revision": str(getattr(judge, "revision")), "unsafe_score": 0.0, "unsafe_label": False,
+                "judge_revision": judge_revision, "unsafe_score": 0.0, "unsafe_label": False,
                 "refusal_label": None, "threshold": threshold, "raw_output": "", "status": RecordStatus.failed,
                 "failure_kind": FailureKind.judge, "failure_reason": "response generation was not executable",
             }
@@ -363,6 +463,9 @@ def judge_response_records(
                     "branch": response.branch,
                     "state_step": response.state_step,
                     "transport": response.transport,
+                    "materialization_sha256": response.materialization_sha256,
+                    "target_revision": response.target_revision,
+                    "target_tokenizer_sha256": response.target_tokenizer_sha256,
                 })
             else:
                 record = JudgmentRecord.model_validate(result)

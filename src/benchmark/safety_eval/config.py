@@ -258,6 +258,7 @@ class JudgeSpec(StrictModel):
     threshold_offsets: list[float]
     model: str | None = None
     endpoint: str | None = None
+    local_path: Path | None = None
     temperature: float = 0.0
 
 
@@ -405,6 +406,8 @@ class V2ExperimentConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_approved_scope(self) -> "V2ExperimentConfig":
+        if self.judging.secondary.local_path is None:
+            raise ValueError("v2 secondary judge requires a local snapshot")
         if self.run.smoke_mode:
             if "smoke" not in self.run.output_root.parts:
                 raise ValueError("smoke output root must contain a smoke path component")

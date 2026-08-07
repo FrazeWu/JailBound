@@ -65,7 +65,7 @@ semantic:
 
 judging:
   primary: {key: octopus_seval_14b, threshold: 0.5, threshold_offsets: [-0.1, 0.0, 0.1], temperature: 0.0}
-  secondary: {key: qwen32_compat, model: qwen3-32b-awq, endpoint: http://localhost:8001/v1, threshold: 0.5, threshold_offsets: [-0.1, 0.0, 0.1], temperature: 0.0}
+  secondary: {key: qwen32_compat, model: qwen3-32b-awq, endpoint: http://localhost:8001/v1, local_path: /home/data1/llm_datasets/qwen/qwen3-32b-awq, threshold: 0.5, threshold_offsets: [-0.1, 0.0, 0.1], temperature: 0.0}
   max_new_tokens: 512
   author_audit_size: 100
 

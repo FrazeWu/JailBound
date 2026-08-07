@@ -16,6 +16,7 @@ from .schema import (
     ResponseRecord,
     V2MaterializationRecord,
     V2ResponseRecord,
+    token_ids_sha256,
 )
 
 
@@ -160,7 +161,18 @@ def generate_embedding_response_record(
     attention_mask: torch.Tensor,
     max_new_tokens: int,
 ) -> ResponseRecord:
-    """Generate one response from an embedding state while preserving record identity."""
+    """Generate a v1 response from a continuous embedding state.
+
+    Reviewer-v2 has a deliberately narrower execution contract: embeddings
+    must first be materialized to audited token IDs, then executed through
+    :func:`generate_response_record`.  Rejecting v2 here prevents a caller
+    from writing a valid-looking v2 response that never traversed projection.
+    """
+    if schema_version == "reviewer_eval.v2":
+        raise ValueError(
+            "continuous embedding generation does not support reviewer_eval.v2; "
+            "materialize token IDs and use generate_response_record"
+        )
     common = {
         "schema_version": schema_version,
         "run_id": run_id,
@@ -243,6 +255,24 @@ def generate_one(
     )
 
 
+def _generate_from_token_ids(
+    model: Any, tokenizer: Any, *, input_ids: torch.Tensor, max_new_tokens: int
+) -> GenerationResult:
+    """Execute exact discrete IDs after the v2 record boundary has authorized them."""
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.dtype != torch.long:
+        raise ValueError("v2 token inputs must have shape [1, tokens] and dtype long")
+    input_ids = move_to_model_input_device(input_ids, model)
+    output_ids = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
+    input_sequence = _first_sequence(input_ids)
+    output_sequence = _first_sequence(output_ids)
+    generated_ids = output_sequence[len(input_sequence) :]
+    return GenerationResult(
+        response=tokenizer.decode(generated_ids, skip_special_tokens=True),
+        input_tokens=len(input_sequence), generated_tokens=len(generated_ids),
+        used_system_fallback=False,
+    )
+
+
 def generate_response_record(
     *,
     model: Any,
@@ -257,8 +287,13 @@ def generate_response_record(
     Failed materializations remain explicit failed response rows rather than
     being silently omitted, preserving matrix denominators for later analysis.
     """
-    prompt_hash = hashlib.sha256(materialization.flat_prompt.encode("utf-8")).hexdigest()
     is_v2 = isinstance(materialization, V2MaterializationRecord)
+    if is_v2:
+        raise ValueError(
+            "v2 token execution requires the local-assets stage; "
+            "the public response API supports reviewer_eval.v1 only"
+        )
+    prompt_hash = hashlib.sha256(materialization.flat_prompt.encode("utf-8")).hexdigest()
     common = {
         "schema_version": materialization.schema_version,
         "run_id": materialization.run_id,
@@ -271,15 +306,8 @@ def generate_response_record(
         "target_revision": target_revision,
         "prompt_hash": prompt_hash,
     }
-    if is_v2:
-        common.update(
-            branch=materialization.branch,
-            state_step=materialization.step,
-            transport=materialization.transport,
-        )
-    response_type = V2ResponseRecord if is_v2 else ResponseRecord
     if materialization.status is not RecordStatus.complete:
-        return response_type(
+        return ResponseRecord(
             **common,
             response="",
             input_tokens=0,
@@ -290,13 +318,10 @@ def generate_response_record(
         )
     try:
         result = generate_one(
-            model,
-            tokenizer,
-            system_prompt="" if is_v2 else materialization.system_prompt,
-            user_prompt=materialization.flat_prompt if is_v2 else materialization.user_prompt,
-            max_new_tokens=max_new_tokens,
+            model, tokenizer, system_prompt=materialization.system_prompt,
+            user_prompt=materialization.user_prompt, max_new_tokens=max_new_tokens,
         )
-        return response_type(
+        return ResponseRecord(
             **common,
             response=result.response,
             input_tokens=result.input_tokens,
@@ -306,12 +331,73 @@ def generate_response_record(
             failure_reason=None,
         )
     except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as error:
-        return response_type(
+        return ResponseRecord(
             **common,
             response="",
             input_tokens=0,
             generated_tokens=0,
             status=RecordStatus.failed,
             failure_kind=FailureKind.generation,
+            failure_reason=f"target generation error: {type(error).__name__}",
+        )
+
+
+def _generate_v2_response_record(
+    *,
+    model: Any,
+    tokenizer: Any,
+    materialization: V2MaterializationRecord,
+    target_key: str,
+    target_revision: str,
+    target_tokenizer_sha256: str,
+    max_new_tokens: int,
+) -> V2ResponseRecord:
+    """Execute an already-authorized v2 materialization from a local runtime.
+
+    This is intentionally private.  The pipeline's local-assets stage owns
+    validation of the checkpoint ledger and target snapshot before reaching it.
+    """
+    if target_tokenizer_sha256 != materialization.surrogate_tokenizer_sha256:
+        raise ValueError("v2 target tokenizer sha256 does not match materialization")
+    prompt_hash = token_ids_sha256(materialization.complete_token_ids)
+    common = {
+        "schema_version": materialization.schema_version,
+        "run_id": materialization.run_id,
+        "config_hash": materialization.config_hash,
+        "sample_id": materialization.sample_id,
+        "source": materialization.source,
+        "method": materialization.method,
+        "checkpoint": materialization.step,
+        "target_key": target_key,
+        "target_revision": target_revision,
+        "prompt_hash": prompt_hash,
+        "branch": materialization.branch,
+        "state_step": materialization.step,
+        "transport": materialization.transport,
+        "materialization_sha256": materialization.materialization_sha256,
+        "target_tokenizer_sha256": target_tokenizer_sha256,
+        "executed_token_ids_sha256": prompt_hash,
+    }
+    if materialization.status is not RecordStatus.complete:
+        return V2ResponseRecord(
+            **common, response="", input_tokens=0, generated_tokens=0,
+            status=RecordStatus.failed, failure_kind=FailureKind.generation,
+            failure_reason="materialization is not executable",
+        )
+    try:
+        result = _generate_from_token_ids(
+            model, tokenizer,
+            input_ids=torch.tensor([materialization.complete_token_ids], dtype=torch.long),
+            max_new_tokens=max_new_tokens,
+        )
+        return V2ResponseRecord(
+            **common, response=result.response, input_tokens=result.input_tokens,
+            generated_tokens=result.generated_tokens, status=RecordStatus.complete,
+            failure_kind=None, failure_reason=None,
+        )
+    except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as error:
+        return V2ResponseRecord(
+            **common, response="", input_tokens=0, generated_tokens=0,
+            status=RecordStatus.failed, failure_kind=FailureKind.generation,
             failure_reason=f"target generation error: {type(error).__name__}",
         )

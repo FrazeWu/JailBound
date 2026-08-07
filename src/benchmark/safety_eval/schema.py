@@ -41,6 +41,13 @@ def stable_id(prefix: str, payload: object) -> str:
     return f"{prefix}:{canonical_hash(payload)[:20]}"
 
 
+def token_ids_sha256(token_ids: tuple[int, ...]) -> str:
+    """Hash the exact v2 discrete-token transport payload."""
+    if any(not isinstance(token_id, int) or token_id < 0 for token_id in token_ids):
+        raise ValueError("token IDs must be non-negative integers")
+    return canonical_hash({"complete_token_ids": token_ids})
+
+
 class StrictRecord(BaseModel):
     """Base contract for persisted records.
 
@@ -213,12 +220,34 @@ class OptimizationRecord(StrictRecord):
     failure_kind: FailureKind | None
     failure_reason: str | None
     state_path: str | None
+    state_sha256: Sha256 | None = None
     representation: str
     attack_loss: float | None
     fol: float | None
     internal_margin: float | None
     materialized_prompt: str | None
     counters: ComputeCounters
+
+    @model_validator(mode="after")
+    def validate_state_reference(self) -> "OptimizationRecord":
+        has_path = self.state_path is not None
+        has_digest = self.state_sha256 is not None
+
+        if self.status is RecordStatus.failed:
+            if has_path or has_digest:
+                raise ValueError("failed optimization records cannot include optimizer state")
+            return self
+
+        if has_path != has_digest:
+            if self.schema_version == "reviewer_eval.v1" and has_path:
+                # V1 may reference an external legacy state snapshot whose bytes
+                # were not managed by this runner.
+                return self
+            raise ValueError("complete optimizer state requires both path and sha256")
+
+        if self.schema_version == "reviewer_eval.v2" and not has_path:
+            raise ValueError("complete v2 optimization records require optimizer state")
+        return self
 
 
 class MaterializationRecord(StrictRecord):
@@ -260,6 +289,10 @@ class V2MaterializationRecord(StrictRecord):
     branch: str
     step: int = Field(ge=0)
     transport: TransportType
+    state_sha256: Sha256
+    surrogate_tokenizer_sha256: Sha256
+    surrogate_embedding_sha256: Sha256
+    materialization_sha256: Sha256
     editable_positions: tuple[int, ...] = Field(min_length=1)
     original_token_ids: tuple[int, ...] = Field(min_length=1)
     projected_z_token_ids: tuple[int, ...] = Field(min_length=1)
@@ -277,14 +310,29 @@ class V2MaterializationRecord(StrictRecord):
 
     @model_validator(mode="after")
     def validate_reconstruction(self) -> "V2MaterializationRecord":
+        if self.transport is not TransportType.text:
+            raise ValueError("v2 materialization supports text transport only")
         if len(self.projected_u_token_ids) != len(self.editable_positions):
             raise ValueError("projected U token count must match editable positions")
         if len(self.reconstructed_base_token_ids) != len(self.original_token_ids):
             raise ValueError("reconstructed base token count must match original tokens")
         if self.complete_token_ids != self.projected_z_token_ids + self.reconstructed_base_token_ids:
             raise ValueError("complete token IDs must prepend projected z to reconstructed base")
+        if self.editable_positions != tuple(sorted(set(self.editable_positions))):
+            raise ValueError("editable positions must be sorted and unique")
+        if any(position < 0 or position >= len(self.original_token_ids) for position in self.editable_positions):
+            raise ValueError("editable positions are outside original token IDs")
+        editable = set(self.editable_positions)
+        for index, (original, reconstructed) in enumerate(zip(self.original_token_ids, self.reconstructed_base_token_ids)):
+            if index not in editable and original != reconstructed:
+                raise ValueError("reconstructed v2 materialization changed a frozen token")
+        if tuple(self.reconstructed_base_token_ids[index] for index in self.editable_positions) != self.projected_u_token_ids:
+            raise ValueError("reconstructed editable tokens must equal projected U token IDs")
         if self.status is RecordStatus.complete and not self.frozen_positions_unchanged:
             raise ValueError("complete v2 materializations must preserve frozen positions")
+        payload = self.model_dump(mode="json", exclude={"materialization_sha256"})
+        if self.materialization_sha256 != canonical_hash(payload):
+            raise ValueError("v2 materialization sha256 does not match record content")
         return self
 
 
@@ -312,6 +360,17 @@ class V2ResponseRecord(ResponseRecord):
     branch: str
     state_step: int = Field(ge=0)
     transport: TransportType
+    materialization_sha256: Sha256
+    target_tokenizer_sha256: Sha256
+    executed_token_ids_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_execution_identity(self) -> "V2ResponseRecord":
+        if self.transport is not TransportType.text:
+            raise ValueError("v2 responses support text transport only")
+        if self.prompt_hash != self.executed_token_ids_sha256:
+            raise ValueError("v2 response prompt hash must equal executed token ID hash")
+        return self
 
 
 class JudgmentRecord(StrictRecord):
@@ -340,3 +399,14 @@ class V2JudgmentRecord(JudgmentRecord):
     branch: str
     state_step: int = Field(ge=0)
     transport: TransportType
+    materialization_sha256: Sha256
+    target_revision: str
+    target_tokenizer_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_execution_identity(self) -> "V2JudgmentRecord":
+        if self.transport is not TransportType.text:
+            raise ValueError("v2 judgments support text transport only")
+        if not self.target_revision:
+            raise ValueError("v2 judgment target revision must be non-empty")
+        return self

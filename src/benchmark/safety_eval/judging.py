@@ -391,13 +391,20 @@ class Qwen32CompatJudge:
         model: str = "qwen3-32b-awq",
         client: httpx.Client | None = None,
         max_new_tokens: int = 512,
+        revision: str | None = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.model = model
         self._owns_client = client is None
         self.client = client if client is not None else httpx.Client(timeout=120.0)
         self.max_new_tokens = max_new_tokens
-        self.revision = f"endpoint:{self.endpoint};model:{self.model};temperature:0"
+        if revision is not None and not revision.strip():
+            raise ValueError("compatibility judge revision must be non-empty")
+        self.revision = (
+            revision
+            if revision is not None
+            else f"endpoint:{self.endpoint};model:{self.model};temperature:0"
+        )
 
     def close(self) -> None:
         if self._owns_client:

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from benchmark.safety_eval.io import read_jsonl
+from benchmark.safety_eval.io import read_jsonl, sha256_file
 from benchmark.safety_eval.runner import OptimizationJob, OptimizationRunner, OptimizationSnapshot, RunConfigMismatch
 from benchmark.safety_eval.schema import ComputeCounters
 from benchmark.safety_eval.objective import EditableState
@@ -95,3 +95,49 @@ def test_runner_persists_branch_pool_separately_and_idempotently(tmp_path) -> No
     rows = read_jsonl(tmp_path / "optimization" / "fixture_source" / "fixture_method" / "branch_pool.jsonl")
     assert [(row["branch"], row["step"]) for row in rows] == [("o_minus", 1), ("o_plus", 2)]
     assert all(Path(row["state_path"]).is_file() for row in rows)
+
+
+def test_runner_rejects_mismatched_preexisting_checkpoint_state(tmp_path) -> None:
+    runner = OptimizationRunner(tmp_path, config_hash="a" * 64, run_id="run:fixture", git_revision="fixture-revision")
+    snapshot = OptimizationSnapshot(
+        checkpoint=0,
+        representation="fixture",
+        attack_loss=0.0,
+        counters=ComputeCounters(),
+        state={"value": torch.tensor([0])},
+    )
+    method_directory = runner.records_path(_job()).parent
+
+    state_path, _ = runner._persist_state(_job(), snapshot, method_directory)
+    assert state_path is not None
+
+    conflicting = OptimizationSnapshot(
+        checkpoint=0,
+        representation="fixture",
+        attack_loss=0.0,
+        counters=ComputeCounters(),
+        state={"value": torch.tensor([1])},
+    )
+    with pytest.raises(ValueError, match="different bytes"):
+        runner._persist_state(_job(), conflicting, method_directory)
+
+
+def test_runner_hashes_existing_state_filename_snapshot(tmp_path) -> None:
+    runner = OptimizationRunner(tmp_path, config_hash="a" * 64, run_id="run:fixture", git_revision="fixture-revision")
+    state_path = runner.records_path(_job()).parent / "external_state.pt"
+    state_path.parent.mkdir(parents=True)
+    torch.save({"value": torch.tensor([1])}, state_path)
+
+    def snapshots(_: tuple[int, ...]) -> Iterable[OptimizationSnapshot]:
+        yield OptimizationSnapshot(
+            checkpoint=0,
+            representation="fixture",
+            attack_loss=0.0,
+            counters=ComputeCounters(),
+            state_filename=state_path.name,
+        )
+
+    record = runner.run(_job(), checkpoints=(0,), snapshot_factory=snapshots)[0]
+
+    assert record.state_path == str(state_path)
+    assert record.state_sha256 == sha256_file(state_path)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import pytest
 
 from benchmark.safety_eval.io import read_jsonl
 from benchmark.safety_eval.pipeline import (
@@ -352,6 +353,23 @@ def test_generate_materialized_records_partitions_by_target(tmp_path: Path) -> N
     summary = generate_materialized_records(tmp_path, (materialization,), model=Model(), tokenizer=Tokenizer(), target_key="qwen", target_revision="local", max_new_tokens=4)
     assert summary == StageSummary(selected_records=1, written_records=1, failed_records=0)
     assert len(read_jsonl(tmp_path / "responses" / "qwen" / "source_a" / "init" / "records.jsonl")) == 1
+
+
+def test_generate_materialized_records_rejects_v2_at_the_v1_public_boundary(tmp_path: Path) -> None:
+    class Model:
+        def generate(self, *_: object, **__: object) -> object:
+            raise AssertionError("model must not be called")
+
+    with pytest.raises(ValueError, match="reviewer_eval.v1 only"):
+        generate_materialized_records(
+            tmp_path,
+            ({"schema_version": "reviewer_eval.v2"},),
+            model=Model(),
+            tokenizer=object(),
+            target_key="target",
+            target_revision="revision",
+            max_new_tokens=1,
+        )
 
 
 def test_generate_materialized_records_skips_already_terminal_response_keys(tmp_path: Path) -> None:
