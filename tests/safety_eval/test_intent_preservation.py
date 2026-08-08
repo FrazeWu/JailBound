@@ -208,6 +208,34 @@ def test_analysis_requires_adjudication_note_for_disagreement_or_any_unsure(tmp_
     assert agreement.adjudications_required == 1
 
 
+def test_analysis_requires_note_when_final_label_overrides_unanimous_annotators(tmp_path: Path) -> None:
+    pair = _pair("a", preserved_by_judge=True)
+    exported = export_blinded_annotations([pair], seed=7, output_dir=tmp_path)
+    annotation_id = exported.annotation_ids[0]
+    raw_path = tmp_path / "raw.csv"
+    final_path = tmp_path / "final.csv"
+    _write_csv(
+        raw_path,
+        ["annotation_id", "annotator_id", "initial_label", "drift_reason", "note"],
+        [
+            {"annotation_id": annotation_id, "annotator_id": annotator, "initial_label": "Preserved",
+             "drift_reason": "", "note": ""}
+            for annotator in ("r1", "r2")
+        ],
+    )
+    _write_csv(
+        final_path,
+        ["annotation_id", "final_label", "drift_reason", "adjudication_note"],
+        [{"annotation_id": annotation_id, "final_label": "Not preserved",
+          "drift_reason": "ACTION_CHANGED", "adjudication_note": ""}],
+    )
+    raw = read_raw_labels(raw_path, exported.mapping_csv, expected_annotators=("r1", "r2"))
+    final = read_final_labels(final_path, exported.mapping_csv)
+
+    with pytest.raises(ValueError, match="override.*adjudication note"):
+        analyze_intent_labels([pair], exported.mapping_csv, raw, final)
+
+
 def test_ipr_contains_all_aggregation_levels_in_deterministic_order(tmp_path: Path) -> None:
     pairs = [
         _pair("h-hv", preserved_by_judge=True, source="harmbench", branch="High-Value"),

@@ -11,6 +11,7 @@ from benchmark.safety_eval.generation import (
     generate_from_embeddings,
     generate_embedding_response_record,
     generate_from_embedding_batch,
+    generate_from_token_ids,
     generate_one,
     generate_response_record,
     shard_ids,
@@ -147,7 +148,14 @@ def test_generate_one_uses_chat_template_and_greedy_decoding() -> None:
         ]
     ]
     assert model.input_ids == [[11, 12, 13]]
-    assert model.generate_kwargs == {"max_new_tokens": 12, "do_sample": False}
+    assert model.generate_kwargs == {
+        "attention_mask": [[1, 1, 1]],
+        "max_new_tokens": 12,
+        "do_sample": False,
+        "temperature": None,
+        "top_p": None,
+        "top_k": None,
+    }
     assert tokenizer.decoded_tokens == [91, 92]
     assert result.response == "response:91,92"
     assert result.input_tokens == 3
@@ -186,6 +194,33 @@ def test_generate_one_moves_chat_tokens_to_embedding_device() -> None:
     assert model.input_ids.moved_to == "target-device"
 
 
+def test_generate_from_token_ids_preserves_exact_input_and_greedy_decoding() -> None:
+    model = FakeModel()
+    tokenizer = FakeTokenizer()
+    input_ids = [[21, 22, 23, 24]]
+
+    result = generate_from_token_ids(
+        model,
+        tokenizer,
+        input_ids=input_ids,
+        max_new_tokens=12,
+    )
+
+    assert model.input_ids == input_ids
+    assert model.generate_kwargs == {
+        "attention_mask": [[1, 1, 1, 1]],
+        "max_new_tokens": 12,
+        "do_sample": False,
+        "temperature": None,
+        "top_p": None,
+        "top_k": None,
+    }
+    assert tokenizer.decoded_tokens == [91, 92]
+    assert result.response == "response:91,92"
+    assert result.input_tokens == 4
+    assert result.generated_tokens == 2
+
+
 def test_generate_from_embeddings_passes_continuous_state_without_prompt_projection() -> None:
     model = EmbeddingModel()
     tokenizer = FakeTokenizer()
@@ -202,7 +237,13 @@ def test_generate_from_embeddings_passes_continuous_state_without_prompt_project
 
     assert torch.equal(model.inputs_embeds, inputs_embeds)
     assert torch.equal(model.attention_mask, attention_mask)
-    assert model.generate_kwargs == {"max_new_tokens": 12, "do_sample": False}
+    assert model.generate_kwargs == {
+        "max_new_tokens": 12,
+        "do_sample": False,
+        "temperature": None,
+        "top_p": None,
+        "top_k": None,
+    }
     assert tokenizer.decoded_tokens == [91, 92]
     assert result.response == "response:91,92"
     assert result.input_tokens == 3

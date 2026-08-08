@@ -5,7 +5,7 @@ import pytest
 
 from benchmark.safety_eval.objective import AttackObjective, EditableState
 from benchmark.safety_eval.optimizers.base import BudgetLedger, CheckpointEmitter
-from benchmark.safety_eval.optimizers.gcg import GCGOptimizer
+from benchmark.safety_eval.optimizers.gcg import GCGOptimizer, _Candidate
 
 
 def _embedding() -> torch.Tensor:
@@ -58,6 +58,25 @@ def test_gcg_masks_forbidden_candidate_ids() -> None:
     assert snapshots[-1].z_token_ids.tolist() == [[3]]
 
 
+def test_gcg_applies_best_replacement_even_when_it_is_worse_than_current_state() -> None:
+    initial_ids = torch.tensor([[1]], dtype=torch.long)
+    initial = EditableState(
+        z=initial_ids,
+        u=initial_ids.clone(),
+        z0=initial_ids.clone(),
+        u0=initial_ids.clone(),
+    )
+    ledger = BudgetLedger(update_limit=1, candidate_limit=1)
+
+    snapshots = GCGOptimizer(_embedding(), search_width=1, top_k=2).run(
+        _objective(), initial, ledger, CheckpointEmitter([0, 1])
+    )
+
+    assert snapshots[-1].z_token_ids.tolist() == [[3]]
+    assert snapshots[-1].attack_loss < snapshots[0].attack_loss
+    assert ledger.candidates_accepted == 1
+
+
 def test_gcg_respects_global_candidate_cap_without_ending_fixed_updates() -> None:
     ledger = BudgetLedger(update_limit=3, candidate_limit=2)
 
@@ -99,3 +118,22 @@ def test_gcg_uses_partial_top_k_selection_instead_of_full_vocabulary_sort(monkey
     )
 
     assert snapshots[-1].z_token_ids.tolist() == [[1]]
+
+
+def test_gcg_search_batch_round_robins_across_z_and_u_coordinates() -> None:
+    candidates = [
+        _Candidate("z", 0, 0, 10, 100.0),
+        _Candidate("z", 0, 0, 11, 99.0),
+        _Candidate("z", 0, 1, 12, 98.0),
+        _Candidate("z", 0, 1, 13, 97.0),
+        _Candidate("u", 0, 0, 14, 1.0),
+        _Candidate("u", 0, 0, 15, 0.5),
+    ]
+
+    selected = GCGOptimizer._balanced_search_batch(candidates, limit=3)
+
+    assert [(item.editable, item.position_index) for item in selected] == [
+        ("z", 0),
+        ("z", 1),
+        ("u", 0),
+    ]

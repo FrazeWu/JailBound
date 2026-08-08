@@ -16,4 +16,16 @@ model:
   hidden_size: 3584
   attention_implementation: eager
 
+judges:
+  primary:
+    key: octopus_seval_14b
+    repo_id: Alibaba-AAIG/Octopus-SEval-14B
+    local_path: /home/data0/llm_datasets/judge_model
+    threshold: 0.5
+  secondary:
+    key: qwen32_compat
+    endpoint: http://localhost:8001/v1
+    model: qwen3-32b-awq
+    threshold: 0.5
+
 max_new_tokens: 512

@@ -9,12 +9,20 @@ from typing import Sequence
 
 from benchmark.safety_eval.materialization_ablation import (
     BinaryPairJudgment,
-    Branch,
     MaterializationPair,
     canonical_pair_key,
     index_pairs,
     write_pair_summaries,
 )
+from benchmark.safety_eval.io import atomic_write_jsonl
+from benchmark.safety_eval.materialization_judging import (
+    MATCHED_JUDGE_THRESHOLDS,
+    PairedJudgmentRecord,
+    paired_judgment_key,
+)
+
+
+EXPECTED_JUDGE_THRESHOLDS = MATCHED_JUDGE_THRESHOLDS
 
 
 def join_judgments(pairs_path: Path, judgments_path: Path, destination: Path) -> tuple[str, ...]:
@@ -24,6 +32,8 @@ def join_judgments(pairs_path: Path, judgments_path: Path, destination: Path) ->
         if line.strip()
     ]
     indexed = index_pairs(pairs)
+    if any(pair.judgments for pair in pairs):
+        raise ValueError("materialization pairs contain pre-existing judgments")
     judgment_lines = [
         (line_number, line)
         for line_number, line in enumerate(judgments_path.read_text(encoding="utf-8").splitlines(), start=1)
@@ -31,33 +41,34 @@ def join_judgments(pairs_path: Path, judgments_path: Path, destination: Path) ->
     ]
     if not judgment_lines:
         raise ValueError("paired judgments are empty")
-    observed: set[tuple[str, str, Branch, int, str]] = set()
+    observed: set[tuple[str, str, object, int, str]] = set()
     judge_keys: set[str] = set()
+    config_hashes: set[str] = set()
+    run_ids: set[str] = set()
+    revisions_by_judge: dict[str, set[str]] = {}
     for line_number, line in judgment_lines:
         try:
             row = json.loads(line)
-            source = row["source"]
-            sample_id = row["sample_id"]
-            branch = Branch(row["branch"])
-            checkpoint = row["optimization_checkpoint"]
-            judge_key = row["judge_key"]
-            if not isinstance(source, str) or not source.strip():
-                raise ValueError("source must be non-empty")
-            if not isinstance(sample_id, str) or not sample_id.strip():
-                raise ValueError("sample ID must be non-empty")
-            if isinstance(checkpoint, bool) or not isinstance(checkpoint, int):
-                raise ValueError("optimization checkpoint must be an integer")
-            labels = BinaryPairJudgment.model_validate({
-                "continuous": row["continuous"],
-                "materialized": row["materialized"],
-            })
+            if row.get("judge_key") == "":
+                raise ValueError("judge key must be non-empty")
+            record = PairedJudgmentRecord.model_validate(row)
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"invalid paired judgment at line {line_number}") from error
-        if not isinstance(judge_key, str) or not judge_key.strip():
-            raise ValueError("judge key must be non-empty")
+            if str(error) == "judge key must be non-empty":
+                raise
+            raise ValueError(f"invalid paired judgment at line {line_number}: {error}") from error
+        if record.status != "complete":
+            raise ValueError(f"paired judgment must be terminal complete at line {line_number}")
+        expected_threshold = EXPECTED_JUDGE_THRESHOLDS.get(record.judge_key)
+        if expected_threshold is None:
+            raise ValueError(f"paired judgment does not use the expected judges: {record.judge_key}")
+        if record.threshold != expected_threshold:
+            raise ValueError(
+                f"paired judgment threshold differs for {record.judge_key}: "
+                f"{record.threshold} != {expected_threshold}"
+            )
 
-        pair_key = source, sample_id, branch, checkpoint
-        record_key = (*pair_key, judge_key)
+        pair_key = record.source, record.sample_id, record.branch, record.optimization_checkpoint
+        record_key = paired_judgment_key(record)
         if record_key in observed:
             raise ValueError(f"duplicate paired judgment: {record_key}")
         observed.add(record_key)
@@ -66,15 +77,34 @@ def join_judgments(pairs_path: Path, judgments_path: Path, destination: Path) ->
             raise ValueError(f"judgment references an unknown pair: {pair_key}")
         if pair.status == "failed":
             raise ValueError(f"failed pair cannot receive a judgment: {pair_key}")
-        pair.judgments[judge_key] = labels
-        judge_keys.add(judge_key)
+        if record.target_key != pair.model_key or record.target_revision != pair.model_revision:
+            raise ValueError(f"judgment target provenance differs from pair: {pair_key}")
+        pair.judgments[record.judge_key] = BinaryPairJudgment(
+            continuous=record.continuous,
+            materialized=record.materialized,
+        )
+        judge_keys.add(record.judge_key)
+        config_hashes.add(record.config_hash)
+        run_ids.add(record.run_id)
+        revisions_by_judge.setdefault(record.judge_key, set()).add(record.judge_revision)
+    if len(config_hashes) != 1:
+        raise ValueError("paired judgments contain multiple config_hash values")
+    if len(run_ids) != 1:
+        raise ValueError("paired judgments contain multiple run_id values")
+    for judge_key, revisions in revisions_by_judge.items():
+        if len(revisions) != 1:
+            raise ValueError(f"paired judgments contain multiple revisions for {judge_key}")
+    if judge_keys != set(EXPECTED_JUDGE_THRESHOLDS):
+        raise ValueError(
+            "paired judgments do not contain the expected judges: "
+            f"{sorted(EXPECTED_JUDGE_THRESHOLDS)}"
+        )
     complete_keys = {canonical_pair_key(pair) for pair in pairs if pair.status == "complete"}
-    for judge_key in judge_keys:
+    for judge_key in EXPECTED_JUDGE_THRESHOLDS:
         labeled = {key[:4] for key in observed if key[4] == judge_key}
         if labeled != complete_keys:
             raise ValueError(f"paired judgments are incomplete for {judge_key}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text("".join(pair.model_dump_json() + "\n" for pair in pairs), encoding="utf-8")
+    atomic_write_jsonl(destination, (pair.model_dump(mode="json") for pair in pairs))
     return tuple(sorted(judge_keys))
 
 

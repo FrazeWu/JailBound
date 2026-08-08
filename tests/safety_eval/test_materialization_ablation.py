@@ -103,6 +103,22 @@ def test_complete_pair_requires_state_hash_but_failed_pair_may_lack_it() -> None
     assert _pair(status="failed", error="state is unavailable").state_sha256 is None
 
 
+def test_direct_token_pair_accepts_empty_decoded_text_and_model_responses() -> None:
+    payload = _pair().model_dump(mode="json")
+    payload.update({
+        "continuous_response": "",
+        "materialized_text": "",
+        "materialized_response": "",
+        "materialized_transport": "direct_projected_token_ids",
+    })
+
+    pair = MaterializationPair.model_validate(payload)
+
+    assert pair.status == "complete"
+    assert pair.continuous_response == ""
+    assert pair.materialized_response == ""
+
+
 def test_pair_rejects_roundtrip_flag_that_disagrees_with_token_ids() -> None:
     payload = _pair().model_dump(mode="json")
     payload["retokenized_token_ids"] = [4, 8, 6]

@@ -319,7 +319,7 @@ def _ready_run_unit(tmp_path: Path, module: ModuleType):
     return locked, unit, model
 
 
-def test_run_unit_uses_one_final_state_for_both_conditions_and_keeps_mismatch_complete(
+def test_run_unit_uses_one_final_state_and_direct_projected_tokens_for_materialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -347,12 +347,12 @@ def test_run_unit_uses_one_final_state_for_both_conditions_and_keeps_mismatch_co
         calls["continuous"] = (model_arg, tokenizer_arg, kwargs)
         return SimpleNamespace(response="continuous response")
 
-    def fake_materialized(model_arg, tokenizer_arg, system_prompt, user_prompt, max_new_tokens):
-        calls["materialized"] = (model_arg, tokenizer_arg, system_prompt, user_prompt, max_new_tokens)
+    def fake_materialized(model_arg, tokenizer_arg, **kwargs):
+        calls["materialized"] = (model_arg, tokenizer_arg, kwargs)
         return SimpleNamespace(response="materialized response")
 
     monkeypatch.setattr(module, "generate_from_embeddings", fake_continuous)
-    monkeypatch.setattr(module, "generate_one", fake_materialized)
+    monkeypatch.setattr(module, "generate_from_token_ids", fake_materialized)
 
     pair = module.run_unit(locked, unit, model=model, tokenizer=tokenizer, projection_chunk_size=32)
 
@@ -363,6 +363,7 @@ def test_run_unit_uses_one_final_state_for_both_conditions_and_keeps_mismatch_co
     assert pair.projected_token_ids == projected_ids
     assert pair.roundtrip_exact_match is False
     assert pair.retokenized_token_ids == projected_ids[:-1]
+    assert pair.materialized_transport == "direct_projected_token_ids"
     assert tokenizer.decode_calls[-1] == (projected_ids, False)
     continuous_kwargs = calls["continuous"][2]
     assert continuous_kwargs["max_new_tokens"] == 512
@@ -375,8 +376,14 @@ def test_run_unit_uses_one_final_state_for_both_conditions_and_keeps_mismatch_co
         continuous_kwargs["inputs_embeds"][:, len("SYS\nUSER:") + 1 + len(content_ids), :],
         torch.tensor([[0.0, 1.0]]),
     )
-    assert calls["materialized"][3] == pair.materialized_text
-    assert calls["materialized"][4] == 512
+    materialized_kwargs = calls["materialized"][2]
+    expected_materialized_ids = (
+        tuple(ord(char) for char in "SYS\nUSER:")
+        + projected_ids
+        + tuple(ord(char) for char in "\nASSISTANT:")
+    )
+    assert tuple(materialized_kwargs["input_ids"].reshape(-1).tolist()) == expected_materialized_ids
+    assert materialized_kwargs["max_new_tokens"] == 512
 
 
 def test_run_unit_converts_generation_exception_to_failed_pair(
@@ -407,9 +414,162 @@ def test_dry_run_reports_locked_units_without_loading_model(tmp_path: Path, caps
     report = json.loads(capsys.readouterr().out)
     assert report == {
         "checkpoint": 100,
+        "existing_units": 0,
         "failed_units": 0,
         "model_key": "qwen2_5_7b",
+        "pending_units": 2,
         "ready_units": 2,
         "sources": ["harmbench"],
         "total_units": 2,
     }
+
+
+def test_select_pending_units_skips_existing_canonical_pair(tmp_path: Path, capsys) -> None:
+    module = _load_script()
+    locked = module.load_locked_inputs(_study(tmp_path))
+    existing_unit = locked.units[0]
+    existing = module._failed_pair(locked, existing_unit, "recorded terminal failure")
+    pairs_path = locked.output_root / "materialization_pairs.jsonl"
+    pairs_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs_path.write_text(existing.model_dump_json() + "\n", encoding="utf-8")
+
+    pending = module.select_pending_units(locked, locked.units)
+
+    assert [unit.branch for unit in pending] == [module.Branch.safety_sensitivity]
+
+    assert module.main(["--config", str(tmp_path / "ablation.yaml"), "--dry-run"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["total_units"] == 2
+    assert report["existing_units"] == 1
+    assert report["pending_units"] == 1
+
+
+def test_select_pending_units_can_explicitly_retry_failed_ready_pair(tmp_path: Path) -> None:
+    module = _load_script()
+    locked = module.load_locked_inputs(_study(tmp_path))
+    existing_unit = locked.units[0]
+    existing = module._failed_pair(locked, existing_unit, "pair generation error: validation")
+    pairs_path = locked.output_root / "materialization_pairs.jsonl"
+    pairs_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs_path.write_text(existing.model_dump_json() + "\n", encoding="utf-8")
+
+    pending = module.select_pending_units(locked, locked.units, retry_failed=True)
+
+    assert [unit.branch for unit in pending] == [
+        module.Branch.high_value,
+        module.Branch.safety_sensitivity,
+    ]
+
+
+def test_replace_failed_pair_preserves_key_and_writes_completed_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    locked, unit, model = _ready_run_unit(tmp_path, module)
+    failed = module._failed_pair(locked, unit, "pair generation error: validation")
+    pairs_path = locked.output_root / "materialization_pairs.jsonl"
+    pairs_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs_path.write_text(failed.model_dump_json() + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "generate_from_embeddings",
+        lambda *args, **kwargs: SimpleNamespace(response=""),
+    )
+    monkeypatch.setattr(
+        module,
+        "generate_from_token_ids",
+        lambda *args, **kwargs: SimpleNamespace(response=""),
+    )
+    completed = module.run_unit(
+        locked,
+        unit,
+        model=model,
+        tokenizer=_CharacterTokenizer(),
+        projection_chunk_size=32,
+    )
+
+    assert completed.status == "complete"
+    assert module.replace_failed_pair(pairs_path, completed) is True
+    rows = [module.MaterializationPair.model_validate(row) for row in module.read_jsonl(pairs_path)]
+    assert rows == [completed]
+
+
+def test_resume_repairs_truncated_ledger_tail_before_selection(tmp_path: Path, capsys) -> None:
+    module = _load_script()
+    config = _study(tmp_path)
+    locked = module.load_locked_inputs(config)
+    existing = module._failed_pair(locked, locked.units[0], "recorded terminal failure")
+    pairs_path = locked.output_root / "materialization_pairs.jsonl"
+    pairs_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs_path.write_bytes(existing.model_dump_json().encode() + b'\n{"source":"truncated"')
+
+    assert module.main(["--config", str(config), "--dry-run"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["existing_units"] == 1
+    assert report["pending_units"] == 1
+    assert pairs_path.with_name("materialization_pairs.jsonl.corrupt").is_file()
+
+
+def test_resume_rejects_existing_state_when_current_state_is_missing(tmp_path: Path) -> None:
+    module = _load_script()
+    config = _study(tmp_path)
+    original = module.load_locked_inputs(config)
+    unit = original.units[0]
+    existing = module._failed_pair(original, unit, "recorded terminal failure")
+    pairs_path = original.output_root / "materialization_pairs.jsonl"
+    pairs_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs_path.write_text(existing.model_dump_json() + "\n", encoding="utf-8")
+    assert unit.final_state_path is not None
+    unit.final_state_path.unlink()
+    current = module.load_locked_inputs(config)
+
+    with pytest.raises(ValueError, match="state differs"):
+        module.select_pending_units(current, current.units)
+
+
+def test_max_pairs_reports_all_pending_and_scheduled_subset(tmp_path: Path, capsys) -> None:
+    module = _load_script()
+    config = _study(tmp_path)
+
+    assert module.main(["--config", str(config), "--max-pairs", "1", "--dry-run"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["total_units"] == 2
+    assert report["existing_units"] == 0
+    assert report["pending_units"] == 2
+    assert report["scheduled_units"] == 1
+
+
+def test_fully_resumed_run_refreshes_manifest_without_loading_model(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    config = _study(tmp_path)
+    locked = module.load_locked_inputs(config)
+    pairs_path = locked.output_root / "materialization_pairs.jsonl"
+    pairs_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs_path.write_text(
+        "".join(
+            module._failed_pair(locked, unit, "recorded terminal failure").model_dump_json() + "\n"
+            for unit in locked.units
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        module,
+        "validate_model_assets",
+        lambda *_: (_ for _ in ()).throw(AssertionError("model must not load")),
+    )
+
+    assert module.main(["--config", str(config)]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    manifest = json.loads((locked.output_root / "run_manifest.json").read_text(encoding="utf-8"))
+    assert report["existing_units"] == manifest["existing_units"] == 2
+    assert report["pending_units"] == manifest["pending_units"] == 0
+    assert manifest["total_units"] == 2
+    assert manifest["written_units"] == 0

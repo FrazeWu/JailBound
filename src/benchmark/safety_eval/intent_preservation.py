@@ -362,8 +362,19 @@ def analyze_intent_labels(
     for annotation_id, labels in raw_by_id.items():
         initial_labels = tuple(label.initial_label for label in labels)
         requires_adjudication = len(set(initial_labels)) != 1 or InitialLabel.unsure in initial_labels
-        if requires_adjudication and not final_by_id[annotation_id].adjudication_note.strip():
+        final = final_by_id[annotation_id]
+        unanimous_override = False
+        if len(set(initial_labels)) == 1 and InitialLabel.unsure not in initial_labels:
+            consensus = (
+                FinalLabel.preserved
+                if initial_labels[0] is InitialLabel.preserved
+                else FinalLabel.not_preserved
+            )
+            unanimous_override = final.final_label is not consensus
+        if requires_adjudication and not final.adjudication_note.strip():
             raise ValueError(f"adjudication note is required for annotation: {annotation_id}")
+        if unanimous_override and not final.adjudication_note.strip():
+            raise ValueError(f"unanimous-label override requires an adjudication note: {annotation_id}")
     joined: list[tuple[AnnotationMapping, MaterializationPair, FinalIntentLabel]] = []
     for annotation_id, mapping in mapping_by_id.items():
         key = mapping.source, mapping.sample_id, mapping.branch, mapping.optimization_checkpoint

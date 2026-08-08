@@ -57,12 +57,35 @@ def _judgment(sample_id: str = "sample:1", **updates: object) -> dict[str, objec
         "sample_id": sample_id,
         "branch": "High-Value",
         "optimization_checkpoint": 100,
-        "judge_key": "octopus",
+        "run_id": "materialization:test",
+        "config_hash": "b" * 64,
+        "target_key": "qwen2_5_7b",
+        "target_revision": "local",
+        "judge_key": "octopus_seval_14b",
+        "judge_revision": "octopus-fixture",
+        "threshold": 0.5,
+        "continuous_score": 0.8,
+        "materialized_score": 0.2,
         "continuous": True,
         "materialized": False,
+        "continuous_raw_output": "unsafe",
+        "materialized_raw_output": "safe",
+        "status": "complete",
+        "error": None,
     }
     row.update(updates)
     return row
+
+
+def _both_judgments(sample_id: str = "sample:1") -> list[dict[str, object]]:
+    return [
+        _judgment(sample_id),
+        _judgment(
+            sample_id,
+            judge_key="qwen32_compat",
+            judge_revision="endpoint:http://localhost:8001/v1;model:qwen3-32b-awq;temperature:0",
+        ),
+    ]
 
 
 def _write_pairs(path: Path, pairs: list[MaterializationPair]) -> None:
@@ -107,9 +130,44 @@ def test_join_judgments_rejects_incomplete_judge_coverage(tmp_path: Path) -> Non
     module = _load_script()
     pairs_path, judgments_path = tmp_path / "pairs.jsonl", tmp_path / "judgments.jsonl"
     _write_pairs(pairs_path, [_pair("sample:1"), _pair("sample:2")])
-    _write_rows(judgments_path, [_judgment("sample:1")])
+    _write_rows(judgments_path, _both_judgments("sample:1"))
 
     with pytest.raises(ValueError, match="incomplete"):
+        module.join_judgments(pairs_path, judgments_path, tmp_path / "joined.jsonl")
+
+
+def test_join_judgments_requires_both_frozen_judges(tmp_path: Path) -> None:
+    module = _load_script()
+    pairs_path, judgments_path = tmp_path / "pairs.jsonl", tmp_path / "judgments.jsonl"
+    _write_pairs(pairs_path, [_pair()])
+    _write_rows(judgments_path, [_judgment()])
+
+    with pytest.raises(ValueError, match="expected judges"):
+        module.join_judgments(pairs_path, judgments_path, tmp_path / "joined.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"judge_revision": ""}, "judge_revision"),
+        ({"threshold": 0.4}, "threshold"),
+        ({"status": "failed", "error": "judge failed", "continuous_score": None,
+          "materialized_score": None, "continuous": None, "materialized": None}, "terminal"),
+    ],
+)
+def test_join_judgments_rejects_unfrozen_or_failed_judgment(
+    tmp_path: Path,
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    module = _load_script()
+    pairs_path, judgments_path = tmp_path / "pairs.jsonl", tmp_path / "judgments.jsonl"
+    _write_pairs(pairs_path, [_pair()])
+    rows = _both_judgments()
+    rows[0].update(updates)
+    _write_rows(judgments_path, rows)
+
+    with pytest.raises(ValueError, match=message):
         module.join_judgments(pairs_path, judgments_path, tmp_path / "joined.jsonl")
 
 
@@ -123,6 +181,19 @@ def test_join_judgments_rejects_empty_judgments(tmp_path: Path) -> None:
         module.join_judgments(pairs_path, judgments_path, tmp_path / "joined.jsonl")
 
 
+def test_join_judgments_rejects_pairs_with_preexisting_labels(tmp_path: Path) -> None:
+    module = _load_script()
+    pairs_path, judgments_path = tmp_path / "pairs.jsonl", tmp_path / "judgments.jsonl"
+    pair = _pair()
+    payload = pair.model_dump(mode="json")
+    payload["judgments"] = {"stale": {"continuous": True, "materialized": True}}
+    _write_pairs(pairs_path, [MaterializationPair.model_validate(payload)])
+    _write_rows(judgments_path, _both_judgments())
+
+    with pytest.raises(ValueError, match="pre-existing judgments"):
+        module.join_judgments(pairs_path, judgments_path, tmp_path / "joined.jsonl")
+
+
 def test_join_judgments_rejects_empty_judge_key(tmp_path: Path) -> None:
     module = _load_script()
     pairs_path, judgments_path = tmp_path / "pairs.jsonl", tmp_path / "judgments.jsonl"
@@ -130,6 +201,44 @@ def test_join_judgments_rejects_empty_judge_key(tmp_path: Path) -> None:
     _write_rows(judgments_path, [_judgment(judge_key="")])
 
     with pytest.raises(ValueError, match="judge key must be non-empty"):
+        module.join_judgments(pairs_path, judgments_path, tmp_path / "joined.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("target_key", "different-target", "target provenance"),
+        ("target_revision", "different-revision", "target provenance"),
+        ("config_hash", "c" * 64, "config_hash"),
+        ("run_id", "materialization:different", "run_id"),
+    ],
+)
+def test_join_judgments_rejects_mixed_pair_or_run_provenance(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    module = _load_script()
+    pairs_path, judgments_path = tmp_path / "pairs.jsonl", tmp_path / "judgments.jsonl"
+    _write_pairs(pairs_path, [_pair()])
+    rows = _both_judgments()
+    rows[1][field] = value
+    _write_rows(judgments_path, rows)
+
+    with pytest.raises(ValueError, match=message):
+        module.join_judgments(pairs_path, judgments_path, tmp_path / "joined.jsonl")
+
+
+def test_join_judgments_rejects_multiple_revisions_for_one_judge(tmp_path: Path) -> None:
+    module = _load_script()
+    pairs_path, judgments_path = tmp_path / "pairs.jsonl", tmp_path / "judgments.jsonl"
+    _write_pairs(pairs_path, [_pair("sample:1"), _pair("sample:2")])
+    rows = _both_judgments("sample:1") + _both_judgments("sample:2")
+    rows[2]["judge_revision"] = "different-octopus-revision"
+    _write_rows(judgments_path, rows)
+
+    with pytest.raises(ValueError, match="multiple revisions"):
         module.join_judgments(pairs_path, judgments_path, tmp_path / "joined.jsonl")
 
 
@@ -160,14 +269,14 @@ def test_join_judgments_exactly_joins_complete_pairs(tmp_path: Path) -> None:
         tmp_path / "joined.jsonl",
     )
     _write_pairs(pairs_path, [_pair("sample:2"), _pair("sample:1"), _pair("failed", status="failed")])
-    _write_rows(judgments_path, [_judgment("sample:1"), _judgment("sample:2")])
+    _write_rows(judgments_path, _both_judgments("sample:1") + _both_judgments("sample:2"))
 
     judge_keys = module.join_judgments(pairs_path, judgments_path, destination)
 
     joined = [MaterializationPair.model_validate_json(line) for line in destination.read_text(encoding="utf-8").splitlines()]
-    assert judge_keys == ("octopus",)
+    assert judge_keys == ("octopus_seval_14b", "qwen32_compat")
     assert [pair.sample_id for pair in joined] == ["sample:2", "sample:1", "failed"]
-    assert joined[0].judgments["octopus"].continuous is True
-    assert joined[0].judgments["octopus"].materialized is False
+    assert joined[0].judgments["octopus_seval_14b"].continuous is True
+    assert joined[0].judgments["octopus_seval_14b"].materialized is False
     assert joined[1].judgments == joined[0].judgments
     assert joined[2].judgments == {}

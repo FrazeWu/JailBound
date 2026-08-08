@@ -12,8 +12,10 @@ from benchmark.safety_eval.materialization import (
     materialize_checkpoint,
     meets_semantic_threshold,
     materialize_continuous_state,
+    materialize_v2_candidate,
 )
 from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.prompt_contract import TokenizedEditablePrompt
 from benchmark.safety_eval.schema import FailureKind, MaterializationRecord, RecordStatus
 
 
@@ -48,6 +50,131 @@ def test_materializer_rejects_forbidden_projection_ids() -> None:
     vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     with pytest.raises(ValueError, match="no allowed vocabulary"):
         materialize_continuous_state(_state(), vocabulary, forbidden_token_ids=(0, 1))
+
+
+def test_materializer_projects_both_blocks_only_into_explicit_allowed_ids() -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
+
+    materialization = materialize_continuous_state(
+        _state(), vocabulary, allowed_token_ids=(1, 3)
+    )
+
+    assert materialization.prefix_token_ids == (1,)
+    assert materialization.seed_token_ids == (3,)
+
+
+@pytest.mark.parametrize("allowed_token_ids", [(), (4,), (1, 1)])
+def test_materializer_rejects_invalid_explicit_allowed_token_ids(
+    allowed_token_ids: tuple[int, ...],
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match="allowed token"):
+        materialize_continuous_state(
+            _state(), vocabulary, allowed_token_ids=allowed_token_ids
+        )
+
+
+def test_materializer_projects_distinct_position_masks_for_both_blocks() -> None:
+    vocabulary = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
+    )
+    state = EditableState(
+        z=torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]]),
+        u=torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]]),
+        z0=torch.zeros(1, 2, 2),
+        u0=torch.zeros(1, 2, 2),
+    )
+
+    materialization = materialize_continuous_state(
+        state,
+        vocabulary,
+        prefix_allowed_token_ids_by_position=((1,), (2, 3)),
+        seed_allowed_token_ids_by_position=((0, 1), (3,)),
+    )
+
+    assert materialization.prefix_token_ids == (1, 2)
+    assert materialization.seed_token_ids == (0, 3)
+
+
+@pytest.mark.parametrize(
+    "position_masks",
+    [
+        {"prefix_allowed_token_ids_by_position": ((0,),)},
+        {"seed_allowed_token_ids_by_position": ((1,),)},
+    ],
+)
+def test_materializer_rejects_global_and_position_mask_conflicts(
+    position_masks: dict[str, tuple[tuple[int, ...], ...]],
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match="global and position"):
+        materialize_continuous_state(
+            _state(), vocabulary, allowed_token_ids=(0, 1), **position_masks
+        )
+
+
+@pytest.mark.parametrize(
+    "position_masks",
+    [
+        {"prefix_allowed_token_ids_by_position": ((0,),)},
+        {"seed_allowed_token_ids_by_position": ((1,),)},
+    ],
+)
+def test_materializer_requires_position_masks_for_both_blocks(
+    position_masks: dict[str, tuple[tuple[int, ...], ...]],
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match="both prefix and seed"):
+        materialize_continuous_state(_state(), vocabulary, **position_masks)
+
+
+@pytest.mark.parametrize(
+    "position_masks",
+    [
+        {
+            "prefix_allowed_token_ids_by_position": ((0,), (1,)),
+            "seed_allowed_token_ids_by_position": ((1,),),
+        },
+        {
+            "prefix_allowed_token_ids_by_position": ((0,),),
+            "seed_allowed_token_ids_by_position": ((1,), (0,)),
+        },
+    ],
+)
+def test_materializer_rejects_wrong_position_mask_count(
+    position_masks: dict[str, tuple[tuple[int, ...], ...]],
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match="position mask count"):
+        materialize_continuous_state(_state(), vocabulary, **position_masks)
+
+
+@pytest.mark.parametrize(
+    ("invalid_mask", "error"),
+    [
+        ((), "must not be empty"),
+        ((0, 0), "must be unique"),
+        ((2,), "must be in range"),
+        ((1,), "must not be forbidden"),
+    ],
+)
+def test_materializer_rejects_invalid_position_masks(
+    invalid_mask: tuple[int, ...], error: str
+) -> None:
+    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    with pytest.raises(ValueError, match=error):
+        materialize_continuous_state(
+            _state(),
+            vocabulary,
+            forbidden_token_ids=(1,),
+            prefix_allowed_token_ids_by_position=(invalid_mask,),
+            seed_allowed_token_ids_by_position=((0,),),
+        )
 
 
 def test_discrete_candidate_builds_a_complete_strict_materialization_record() -> None:
@@ -165,6 +292,45 @@ class _Tokenizer:
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
         assert skip_special_tokens is True
         return " ".join(f"token-{token_id}" for token_id in token_ids if token_id != 0)
+
+
+class _RecordingV2Tokenizer:
+    all_special_ids: list[int] = []
+
+    def __init__(self) -> None:
+        self.decode_calls: list[tuple[int, ...]] = []
+
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        assert skip_special_tokens is False
+        self.decode_calls.append(tuple(token_ids))
+        return "decoded prompt"
+
+
+def test_v2_materialization_replaces_u_in_place_and_decodes_once() -> None:
+    tokenizer = _RecordingV2Tokenizer()
+    prompt = TokenizedEditablePrompt(
+        full_text="fixture",
+        base_token_ids=torch.tensor([[10, 11, 12, 13]]),
+        attention_mask=torch.ones((1, 4), dtype=torch.long),
+        editable_positions=(1, 3),
+        frozen_positions=(0, 2),
+        token_offsets=((0, 1), (1, 2), (2, 3), (3, 4)),
+        boundary_expansions=((1, 2), (3, 4)),
+        tokenizer_revision="fixture-r1",
+    )
+
+    result = materialize_v2_candidate(
+        candidate=DiscreteCandidate(prefix_token_ids=(20, 21), seed_token_ids=(30, 31)),
+        prompt=prompt,
+        tokenizer=tokenizer,
+        special_token_ids=(),
+    )
+
+    assert result.reconstructed_base_token_ids == (10, 30, 12, 31)
+    assert result.complete_token_ids == (20, 21, 10, 30, 12, 31)
+    assert result.frozen_positions_unchanged is True
+    assert result.text == "decoded prompt"
+    assert tokenizer.decode_calls == [(20, 21, 10, 30, 12, 31)]
 
 
 def test_materialize_checkpoint_prefers_discrete_token_ids_and_retains_checkpoint_identity() -> None:

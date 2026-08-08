@@ -17,8 +17,10 @@ from benchmark.safety_eval.schema import (
     BenchmarkExample,
     CellKey,
     ComputeCounters,
+    EditableSpan,
     OptimizationRecord,
     RecordStatus,
+    V2BenchmarkExample,
 )
 
 
@@ -57,6 +59,38 @@ def test_records_reject_invalid_sha256() -> None:
     payload["source_sha256"] = "A" * 64
     with pytest.raises(ValueError):
         BenchmarkExample.model_validate(payload)
+
+
+def test_v2_benchmark_example_requires_exact_auditable_spans() -> None:
+    attack_text = "Start payload end"
+    intent = "unsafe payload"
+    record = V2BenchmarkExample(
+        schema_version="reviewer_eval.v2",
+        **example().model_dump(mode="python", exclude={"intent", "attack_text", "prompt_sha256"}),
+        intent=intent,
+        attack_text=attack_text,
+        prompt_sha256=hashlib.sha256(attack_text.encode()).hexdigest(),
+        intent_sha256=hashlib.sha256(intent.encode()).hexdigest(),
+        editable_spans=(EditableSpan(
+            start=6,
+            end=13,
+            quote="payload",
+            role="harmful_payload",
+            confidence=0.96,
+            rationale="Carries the unsafe request.",
+        ),),
+        annotator_model="de-aligned-fixture",
+        annotator_revision="revision-1",
+        annotation_template_sha256="b" * 64,
+        annotation_response_sha256="c" * 64,
+        annotation_confidence=0.96,
+    )
+    assert record.editable_spans[0].quote == "payload"
+
+    payload = record.model_dump(mode="python")
+    payload["editable_spans"][0]["quote"] = "wrong"
+    with pytest.raises(ValueError, match="quote"):
+        V2BenchmarkExample.model_validate(payload)
 
 
 def test_cell_id_changes_when_any_identity_field_changes() -> None:
