@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Any, Mapping, Self
+import hashlib
+from typing import Annotated, Any, Literal, Mapping, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -30,6 +31,16 @@ class FailureKind(StrEnum):
     judge = "judge"
     source_data = "source_data"
     compatibility = "compatibility"
+    annotation = "annotation"
+    token_mapping = "token_mapping"
+    objective = "objective"
+    transport = "transport"
+
+
+class EditableSpanRole(StrEnum):
+    seed_intent = "seed_intent"
+    harmful_payload = "harmful_payload"
+    attack_instruction = "attack_instruction"
 
 
 def stable_id(prefix: str, payload: object) -> str:
@@ -77,6 +88,23 @@ class StrictRecord(BaseModel):
         return self
 
 
+class EditableSpan(StrictRecord):
+    start: int
+    end: int
+    quote: str
+    role: EditableSpanRole
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "EditableSpan":
+        if self.start < 0 or self.end <= self.start or not self.quote:
+            raise ValueError("editable span requires non-empty ordered bounds")
+        if not self.rationale.strip():
+            raise ValueError("editable span requires a rationale")
+        return self
+
+
 class BenchmarkExample(StrictRecord):
     example_id: str
     source: str
@@ -96,6 +124,38 @@ class BenchmarkExample(StrictRecord):
     selection_seed: int
     prompt_sha256: Sha256
     preprocessing: tuple[str, ...]
+
+
+class V2BenchmarkExample(BenchmarkExample):
+    schema_version: Literal["reviewer_eval.v2"]
+    intent_sha256: Sha256
+    editable_spans: tuple[EditableSpan, ...]
+    annotator_model: str
+    annotator_revision: str
+    annotation_template_sha256: Sha256
+    annotation_response_sha256: Sha256
+    annotation_confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_annotation(self) -> "V2BenchmarkExample":
+        if not self.editable_spans:
+            raise ValueError("v2 examples require editable spans")
+        previous_end = -1
+        for span in self.editable_spans:
+            if span.start < previous_end:
+                raise ValueError("editable spans must be ordered and non-overlapping")
+            if span.end > len(self.attack_text) or self.attack_text[span.start : span.end] != span.quote:
+                raise ValueError("editable span quote does not match attack_text")
+            previous_end = span.end
+        if self.annotation_confidence != min(span.confidence for span in self.editable_spans):
+            raise ValueError("annotation confidence must equal minimum span confidence")
+        if not self.annotator_model.strip() or not self.annotator_revision.strip():
+            raise ValueError("v2 examples require annotator model provenance")
+        if self.prompt_sha256 != hashlib.sha256(self.attack_text.encode("utf-8")).hexdigest():
+            raise ValueError("prompt hash does not match attack_text")
+        if self.intent_sha256 != hashlib.sha256(self.intent.encode("utf-8")).hexdigest():
+            raise ValueError("intent hash does not match intent")
+        return self
 
 
 class ManifestHeader(StrictRecord):

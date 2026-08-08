@@ -55,6 +55,24 @@ def _apply_chat_template(tokenizer: Any, messages: list[dict[str, str]]) -> Any:
     )
 
 
+def _full_attention_mask(input_ids: Any) -> Any:
+    new_ones = getattr(input_ids, "new_ones", None)
+    shape = getattr(input_ids, "shape", None)
+    if callable(new_ones) and shape is not None:
+        return new_ones(shape)
+    return [[1 for _ in sequence] for sequence in input_ids]
+
+
+def _greedy_kwargs(max_new_tokens: int) -> dict[str, object]:
+    return {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+        "temperature": None,
+        "top_p": None,
+        "top_k": None,
+    }
+
+
 def move_to_model_input_device(input_ids: Any, model: Any) -> Any:
     """Place chat tokens with the input embedding layer when supported."""
     try:
@@ -92,14 +110,39 @@ def generate_from_embeddings(
         output_ids = model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
+            **_greedy_kwargs(max_new_tokens),
         )
     generated_ids = _first_sequence(output_ids)
     response = tokenizer.decode(generated_ids, skip_special_tokens=True)
     return GenerationResult(
         response=response,
         input_tokens=int(inputs_embeds.shape[1]),
+        generated_tokens=len(generated_ids),
+        used_system_fallback=False,
+    )
+
+
+def generate_from_token_ids(
+    model: Any,
+    tokenizer: Any,
+    *,
+    input_ids: Any,
+    max_new_tokens: int,
+) -> GenerationResult:
+    """Generate greedily from an already-constructed token sequence."""
+    input_ids = move_to_model_input_device(input_ids, model)
+    output_ids = model.generate(
+        input_ids,
+        attention_mask=_full_attention_mask(input_ids),
+        **_greedy_kwargs(max_new_tokens),
+    )
+    input_sequence = _first_sequence(input_ids)
+    output_sequence = _first_sequence(output_ids)
+    generated_ids = output_sequence[len(input_sequence) :]
+    response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return GenerationResult(
+        response=response,
+        input_tokens=len(input_sequence),
         generated_tokens=len(generated_ids),
         used_system_fallback=False,
     )
@@ -120,8 +163,7 @@ def generate_from_embedding_batch(
         output_ids = model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
+            **_greedy_kwargs(max_new_tokens),
         )
     if len(output_ids) != inputs_embeds.shape[0]:
         raise ValueError("embedding batch generation returned the wrong number of sequences")
@@ -221,8 +263,8 @@ def generate_one(
     input_ids = move_to_model_input_device(input_ids, model)
     output_ids = model.generate(
         input_ids,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
+        attention_mask=_full_attention_mask(input_ids),
+        **_greedy_kwargs(max_new_tokens),
     )
     input_sequence = _first_sequence(input_ids)
     output_sequence = _first_sequence(output_ids)

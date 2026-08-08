@@ -12,8 +12,10 @@ from benchmark.safety_eval.materialization import (
     materialize_checkpoint,
     meets_semantic_threshold,
     materialize_continuous_state,
+    materialize_v2_candidate,
 )
 from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.prompt_contract import TokenizedEditablePrompt
 from benchmark.safety_eval.schema import FailureKind, MaterializationRecord, RecordStatus
 
 
@@ -290,6 +292,45 @@ class _Tokenizer:
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
         assert skip_special_tokens is True
         return " ".join(f"token-{token_id}" for token_id in token_ids if token_id != 0)
+
+
+class _RecordingV2Tokenizer:
+    all_special_ids: list[int] = []
+
+    def __init__(self) -> None:
+        self.decode_calls: list[tuple[int, ...]] = []
+
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        assert skip_special_tokens is False
+        self.decode_calls.append(tuple(token_ids))
+        return "decoded prompt"
+
+
+def test_v2_materialization_replaces_u_in_place_and_decodes_once() -> None:
+    tokenizer = _RecordingV2Tokenizer()
+    prompt = TokenizedEditablePrompt(
+        full_text="fixture",
+        base_token_ids=torch.tensor([[10, 11, 12, 13]]),
+        attention_mask=torch.ones((1, 4), dtype=torch.long),
+        editable_positions=(1, 3),
+        frozen_positions=(0, 2),
+        token_offsets=((0, 1), (1, 2), (2, 3), (3, 4)),
+        boundary_expansions=((1, 2), (3, 4)),
+        tokenizer_revision="fixture-r1",
+    )
+
+    result = materialize_v2_candidate(
+        candidate=DiscreteCandidate(prefix_token_ids=(20, 21), seed_token_ids=(30, 31)),
+        prompt=prompt,
+        tokenizer=tokenizer,
+        special_token_ids=(),
+    )
+
+    assert result.reconstructed_base_token_ids == (10, 30, 12, 31)
+    assert result.complete_token_ids == (20, 21, 10, 30, 12, 31)
+    assert result.frozen_positions_unchanged is True
+    assert result.text == "decoded prompt"
+    assert tokenizer.decode_calls == [(20, 21, 10, 30, 12, 31)]
 
 
 def test_materialize_checkpoint_prefers_discrete_token_ids_and_retains_checkpoint_identity() -> None:

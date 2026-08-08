@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import torch
 
 from .objective import EditableState
+from .prompt_contract import TokenizedEditablePrompt, scatter_editable
 from .schema import FailureKind, MaterializationRecord, RecordStatus
 
 
@@ -36,6 +37,50 @@ class ContinuousCandidate:
     state: EditableState
     vocabulary_embeddings: torch.Tensor
     forbidden_token_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class V2MaterializationEvidence:
+    reconstructed_base_token_ids: tuple[int, ...]
+    complete_token_ids: tuple[int, ...]
+    frozen_positions_unchanged: bool
+    text: str
+
+
+def materialize_v2_candidate(
+    *,
+    candidate: DiscreteCandidate,
+    prompt: TokenizedEditablePrompt,
+    tokenizer: Any,
+    special_token_ids: Iterable[int] = (),
+) -> V2MaterializationEvidence:
+    """Scatter projected U in place, prepend z, and decode the sequence once."""
+    if not candidate.prefix_token_ids or len(candidate.seed_token_ids) != len(prompt.editable_positions):
+        raise ValueError("projected z/U lengths do not match the prompt contract")
+    forbidden = {int(token_id) for token_id in special_token_ids}
+    projected = candidate.prefix_token_ids + candidate.seed_token_ids
+    if any(token_id in forbidden for token_id in projected):
+        raise ValueError("projected z/U contains a forbidden token")
+    base = prompt.base_token_ids
+    u_ids = torch.tensor([candidate.seed_token_ids], dtype=base.dtype, device=base.device)
+    reconstructed = scatter_editable(u_ids, base, prompt.editable_positions)
+    frozen_unchanged = all(
+        int(reconstructed[0, position]) == int(base[0, position])
+        for position in prompt.frozen_positions
+    )
+    if not frozen_unchanged:
+        raise ValueError("materialization changed a frozen token")
+    reconstructed_ids = tuple(int(token_id) for token_id in reconstructed[0].detach().cpu().tolist())
+    complete_ids = candidate.prefix_token_ids + reconstructed_ids
+    text = str(tokenizer.decode(list(complete_ids), skip_special_tokens=False))
+    if not text.strip():
+        raise ValueError("materialization decoded to empty text")
+    return V2MaterializationEvidence(
+        reconstructed_base_token_ids=reconstructed_ids,
+        complete_token_ids=complete_ids,
+        frozen_positions_unchanged=True,
+        text=text,
+    )
 
 
 def meets_semantic_threshold(similarity: float, *, threshold: float) -> bool:

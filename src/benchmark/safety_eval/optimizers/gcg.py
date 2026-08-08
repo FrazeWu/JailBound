@@ -113,21 +113,47 @@ class GCGOptimizer:
             snapshots.append(self._snapshot(0, objective, z_ids, u_ids, baseline, ledger))
         for step in range(1, ledger.update_limit + 1):
             ledger.consume_update()
-            candidates, current_loss = self._coordinate_candidates(objective, z_ids, u_ids, baseline, ledger)
+            candidates, _ = self._coordinate_candidates(objective, z_ids, u_ids, baseline, ledger)
             remaining = ledger.candidate_limit - ledger.candidates_attempted
-            best_z, best_u = z_ids, u_ids
-            best_loss = current_loss
-            selected = candidates[: min(self.search_width, remaining)]
+            selected = self._balanced_search_batch(
+                candidates,
+                limit=min(self.search_width, remaining),
+            )
             scored = self._score_candidates(objective, z_ids, u_ids, selected, baseline, ledger)
-            for candidate, candidate_z, candidate_u, candidate_loss in scored:
-                if candidate_loss > best_loss:
-                    best_z, best_u, best_loss = candidate_z, candidate_u, candidate_loss
-            if best_z is not z_ids or best_u is not u_ids:
+            if scored:
+                best = scored[0]
+                for candidate in scored[1:]:
+                    if candidate[3] > best[3]:
+                        best = candidate
+                _, z_ids, u_ids, _ = best
                 ledger.candidates_accepted += 1
-                z_ids, u_ids = best_z, best_u
             if emitter.due(step):
                 snapshots.append(self._snapshot(step, objective, z_ids, u_ids, baseline, ledger))
         return snapshots
+
+    @staticmethod
+    def _balanced_search_batch(candidates: Sequence[_Candidate], *, limit: int) -> list[_Candidate]:
+        """Round-robin proposals across every editable coordinate."""
+        if limit <= 0:
+            return []
+        grouped: dict[tuple[EditableName, int, int], list[_Candidate]] = {}
+        for candidate in candidates:
+            key = (candidate.editable, candidate.batch_index, candidate.position_index)
+            grouped.setdefault(key, []).append(candidate)
+        selected: list[_Candidate] = []
+        depth = 0
+        while len(selected) < limit:
+            added = False
+            for group in grouped.values():
+                if depth < len(group):
+                    selected.append(group[depth])
+                    added = True
+                    if len(selected) == limit:
+                        break
+            if not added:
+                break
+            depth += 1
+        return selected
 
     def _score_candidates(
         self,

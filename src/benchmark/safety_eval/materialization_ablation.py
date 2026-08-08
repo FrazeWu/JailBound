@@ -51,6 +51,9 @@ class MaterializationPair(BaseModel):
     continuous_response: StrictStr
     materialized_text: StrictStr
     materialized_response: StrictStr
+    materialized_transport: Literal[
+        "decoded_retokenized_text", "direct_projected_token_ids"
+    ] = "decoded_retokenized_text"
     editable_projected_token_ids: tuple[StrictInt, ...]
     projected_token_ids: tuple[StrictInt, ...]
     retokenized_token_ids: tuple[StrictInt, ...]
@@ -94,12 +97,14 @@ class MaterializationPair(BaseModel):
             required_text = (
                 self.initial_discrete_prompt,
                 self.reference_intent,
-                self.continuous_response,
-                self.materialized_text,
-                self.materialized_response,
             )
             if any(not value.strip() for value in required_text):
-                raise ValueError("complete pair requires all text evidence")
+                raise ValueError("complete pair requires prompt and intent evidence")
+            if (
+                self.materialized_transport == "decoded_retokenized_text"
+                and not self.materialized_text.strip()
+            ):
+                raise ValueError("decoded-text materialization requires non-empty text")
             if not self.projected_token_ids or not self.editable_projected_token_ids:
                 raise ValueError("complete pair requires projection evidence")
         return self

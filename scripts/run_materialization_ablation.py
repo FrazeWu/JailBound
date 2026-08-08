@@ -14,9 +14,20 @@ import torch.nn.functional as functional
 from omegaconf import OmegaConf
 
 from benchmark.safety_eval.execution import load_local_qwen
-from benchmark.safety_eval.generation import generate_from_embeddings, generate_one
-from benchmark.safety_eval.io import JsonlLedger, atomic_write_json, canonical_hash, read_jsonl
-from benchmark.safety_eval.materialization_ablation import Branch, MaterializationPair
+from benchmark.safety_eval.generation import generate_from_embeddings, generate_from_token_ids
+from benchmark.safety_eval.io import (
+    JsonlLedger,
+    atomic_write_json,
+    atomic_write_jsonl,
+    canonical_hash,
+    read_jsonl,
+)
+from benchmark.safety_eval.materialization_ablation import (
+    Branch,
+    MaterializationPair,
+    canonical_pair_key,
+    index_pairs,
+)
 from benchmark.safety_eval.runtime import validate_model_assets
 
 
@@ -67,8 +78,10 @@ class ProjectionAudit(NamedTuple):
 class ContinuousChatInput(NamedTuple):
     inputs_embeds: torch.Tensor
     attention_mask: torch.Tensor
+    template_input_ids: torch.Tensor
     content_token_ids: tuple[int, ...]
     content_start: int
+    content_end: int
 
 
 class RoundTripAudit(NamedTuple):
@@ -348,8 +361,10 @@ def build_continuous_chat_input(
     return ContinuousChatInput(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
+        template_input_ids=ids,
         content_token_ids=tuple(int(value) for value in ids[0, first:last].detach().cpu().tolist()),
         content_start=first,
+        content_end=last,
     )
 
 
@@ -376,6 +391,7 @@ def _failed_pair(locked: LockedAblationInputs, unit: AblationUnit, error: str) -
         "continuous_response": "",
         "materialized_text": "",
         "materialized_response": "",
+        "materialized_transport": "direct_projected_token_ids",
         "editable_projected_token_ids": [],
         "projected_token_ids": [],
         "retokenized_token_ids": [],
@@ -424,6 +440,23 @@ def run_unit(
         initial_ids = initial_projection.prefix_token_ids + continuous.content_token_ids + initial_projection.seed_token_ids
         initial_prompt = str(tokenizer.decode(list(initial_ids), skip_special_tokens=True))
         roundtrip = materialized_roundtrip(tokenizer, projected_ids)
+        projected_prefix = torch.tensor(
+            [projection.prefix_token_ids],
+            dtype=continuous.template_input_ids.dtype,
+            device=continuous.template_input_ids.device,
+        )
+        projected_seed = torch.tensor(
+            [projection.seed_token_ids],
+            dtype=continuous.template_input_ids.dtype,
+            device=continuous.template_input_ids.device,
+        )
+        materialized_input_ids = torch.cat((
+            continuous.template_input_ids[:, : continuous.content_start],
+            projected_prefix,
+            continuous.template_input_ids[:, continuous.content_start : continuous.content_end],
+            projected_seed,
+            continuous.template_input_ids[:, continuous.content_end :],
+        ), dim=1)
         continuous_result = generate_from_embeddings(
             model,
             tokenizer,
@@ -431,12 +464,11 @@ def run_unit(
             attention_mask=continuous.attention_mask,
             max_new_tokens=locked.max_new_tokens,
         )
-        materialized_result = generate_one(
+        materialized_result = generate_from_token_ids(
             model,
             tokenizer,
-            "",
-            roundtrip.materialized_text,
-            locked.max_new_tokens,
+            input_ids=materialized_input_ids,
+            max_new_tokens=locked.max_new_tokens,
         )
         return MaterializationPair.model_validate({
             "source": unit.source,
@@ -451,6 +483,7 @@ def run_unit(
             "continuous_response": continuous_result.response,
             "materialized_text": roundtrip.materialized_text,
             "materialized_response": materialized_result.response,
+            "materialized_transport": "direct_projected_token_ids",
             "editable_projected_token_ids": projection.prefix_token_ids + projection.seed_token_ids,
             "projected_token_ids": projected_ids,
             "retokenized_token_ids": roundtrip.retokenized_token_ids,
@@ -473,12 +506,99 @@ def _git_revision() -> str:
     ).stdout.strip()
 
 
+def select_pending_units(
+    locked: LockedAblationInputs,
+    units: Sequence[AblationUnit],
+    *,
+    retry_failed: bool = False,
+) -> tuple[AblationUnit, ...]:
+    """Exclude canonical keys already recorded in the ablation ledger."""
+    pairs_path = locked.output_root / "materialization_pairs.jsonl"
+    JsonlLedger(
+        pairs_path,
+        key_fields=("source", "sample_id", "branch", "optimization_checkpoint"),
+    )
+    existing = tuple(MaterializationPair.model_validate(row) for row in read_jsonl(pairs_path))
+    indexed = index_pairs(existing)
+    for key, pair in indexed.items():
+        if (
+            pair.model_key != locked.model_key
+            or pair.model_revision != locked.model_revision
+            or pair.max_new_tokens != locked.max_new_tokens
+        ):
+            raise ValueError(f"existing materialization pair provenance differs from this run: {key}")
+    pending: list[AblationUnit] = []
+    for unit in units:
+        key = unit.source, unit.sample_id, unit.branch, unit.checkpoint
+        pair = indexed.get(key)
+        if pair is None:
+            pending.append(unit)
+        elif retry_failed and pair.status == "failed" and unit.error is None:
+            pending.append(unit)
+        elif pair.state_sha256 != unit.final_state_sha256:
+            raise ValueError(f"existing materialization pair state differs from this run: {key}")
+    return tuple(pending)
+
+
+def replace_failed_pair(path: Path, pair: MaterializationPair) -> bool:
+    """Atomically replace one failed pair with its completed same-key retry."""
+    if pair.status != "complete":
+        return False
+    existing = tuple(MaterializationPair.model_validate(row) for row in read_jsonl(path))
+    indexed = index_pairs(existing)
+    key = canonical_pair_key(pair)
+    previous = indexed.get(key)
+    if previous is None:
+        raise ValueError(f"cannot replace unknown failed materialization pair: {key}")
+    if previous.status != "failed":
+        if previous == pair:
+            return False
+        raise ValueError(f"cannot replace complete materialization pair: {key}")
+    rows = (pair if canonical_pair_key(record) == key else record for record in existing)
+    atomic_write_jsonl(path, (record.model_dump(mode="json") for record in rows))
+    return True
+
+
+def _write_run_manifest(
+    locked: LockedAblationInputs,
+    *,
+    report: dict[str, object],
+    scheduled_units: int,
+    written_units: int,
+) -> None:
+    path = locked.output_root / "run_manifest.json"
+    repairs: object | None = None
+    if path.exists():
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(previous, dict):
+            raise ValueError("run_manifest.json must contain a JSON object")
+        repairs = previous.get("repairs")
+        if repairs is not None and not isinstance(repairs, list):
+            raise ValueError("run_manifest.json repairs must be a JSON list")
+    payload = {
+        "schema_version": "materialization_ablation.v1",
+        "config_hash": canonical_hash(locked.config_payload),
+        "git_revision": _git_revision(),
+        "source_root": str(locked.source_root),
+        "model_key": locked.model_key,
+        "model_repo_id": locked.model_repo_id,
+        "model_revision": locked.model_revision,
+        **report,
+        "scheduled_units": scheduled_units,
+        "written_units": written_units,
+    }
+    if repairs is not None:
+        payload["repairs"] = repairs
+    atomic_write_json(path, payload)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--source", action="append")
     parser.add_argument("--max-pairs", type=int)
     parser.add_argument("--projection-chunk-size", type=int, default=2048)
+    parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -489,22 +609,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     selected_sources = tuple(args.source or locked.sources)
     if set(selected_sources) - set(locked.sources):
         raise ValueError("requested source is not configured")
-    units = tuple(unit for unit in locked.units if unit.source in selected_sources)
+    selected_units = tuple(unit for unit in locked.units if unit.source in selected_sources)
+    pending_units = select_pending_units(
+        locked,
+        selected_units,
+        retry_failed=args.retry_failed,
+    )
+    existing_units = len(selected_units) - len(pending_units)
+    units = pending_units
     if args.max_pairs is not None:
         if args.max_pairs < 1:
             raise ValueError("max-pairs must be positive")
         units = units[: args.max_pairs]
-    ready = sum(unit.error is None for unit in units)
+    ready = sum(unit.error is None for unit in pending_units)
     report = {
         "checkpoint": locked.checkpoint,
-        "failed_units": len(units) - ready,
+        "existing_units": existing_units,
+        "failed_units": len(pending_units) - ready,
         "model_key": locked.model_key,
+        "pending_units": len(pending_units),
         "ready_units": ready,
         "sources": list(selected_sources),
-        "total_units": len(units),
+        "total_units": len(selected_units),
     }
+    if args.max_pairs is not None:
+        report["scheduled_units"] = len(units)
     if args.dry_run:
         print(json.dumps(report, sort_keys=True))
+        return 0
+
+    if not units:
+        _write_run_manifest(locked, report=report, scheduled_units=0, written_units=0)
+        print(json.dumps({**report, "written_units": 0}, sort_keys=True))
         return 0
 
     resolved = validate_model_assets(locked.model_path)
@@ -512,9 +648,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if handle.model is None or handle.tokenizer is None:
             raise ValueError("Qwen2.5-7B model did not load")
+        pairs_path = locked.output_root / "materialization_pairs.jsonl"
         ledger = JsonlLedger(
-            locked.output_root / "materialization_pairs.jsonl",
+            pairs_path,
             key_fields=("source", "sample_id", "branch", "optimization_checkpoint"),
+        )
+        existing = index_pairs(
+            MaterializationPair.model_validate(row) for row in read_jsonl(pairs_path)
         )
         written = 0
         for unit in units:
@@ -525,22 +665,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tokenizer=handle.tokenizer,
                 projection_chunk_size=args.projection_chunk_size,
             )
-            written += int(ledger.append_once(pair.model_dump(mode="json")))
+            previous = existing.get(canonical_pair_key(pair))
+            if previous is not None and previous.status == "failed":
+                replaced = replace_failed_pair(pairs_path, pair)
+                written += int(replaced)
+                if replaced:
+                    existing[canonical_pair_key(pair)] = pair
+                    ledger = JsonlLedger(
+                        pairs_path,
+                        key_fields=("source", "sample_id", "branch", "optimization_checkpoint"),
+                    )
+            else:
+                appended = ledger.append_once(pair.model_dump(mode="json"))
+                written += int(appended)
+                if appended:
+                    existing[canonical_pair_key(pair)] = pair
     finally:
         handle.close()
-    atomic_write_json(locked.output_root / "run_manifest.json", {
-        "schema_version": "materialization_ablation.v1",
-        "config_hash": canonical_hash(locked.config_payload),
-        "git_revision": _git_revision(),
-        "source_root": str(locked.source_root),
-        "model_key": locked.model_key,
-        "model_repo_id": locked.model_repo_id,
-        "model_revision": locked.model_revision,
-        "checkpoint": locked.checkpoint,
-        "sources": list(selected_sources),
-        "total_units": len(units),
-        "written_units": written,
-    })
+    _write_run_manifest(
+        locked,
+        report=report,
+        scheduled_units=len(units),
+        written_units=written,
+    )
     print(json.dumps({**report, "written_units": written}, sort_keys=True))
     return 0
 
