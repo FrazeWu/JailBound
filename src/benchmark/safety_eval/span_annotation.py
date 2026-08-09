@@ -1,20 +1,28 @@
-"""Deterministic offline annotation of editable prompt spans."""
+"""Offline model annotation of editable prompt spans."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import hashlib
 import json
-import math
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Protocol, runtime_checkable
 
-from .schema import EditableSpan, EditableSpanRole
+from pydantic import Field, model_validator
+
+from .config import AnnotationConfig
+from .io import canonical_json
+from .schema import EditableSpan, EditableSpanRole, Sha256, StrictRecord
 
 
+_SPAN_FIELDS = frozenset(
+    {"start", "end", "quote", "role", "confidence", "rationale"}
+)
+_ROLE_VALUES = tuple(sorted(role.value for role in EditableSpanRole))
+
+
+@runtime_checkable
 class AnnotationTransport(Protocol):
-    """Injected completion interface used by the offline annotator."""
-
     model: str
     revision: str
 
@@ -27,315 +35,272 @@ class AnnotationTransport(Protocol):
 
 
 class SpanAnnotationError(ValueError):
-    """The model did not produce an acceptable editable-span annotation."""
+    """Raised when an annotation cannot satisfy the locked contract."""
 
 
-@dataclass(frozen=True)
-class FrozenSpanAnnotation:
-    spans: tuple[EditableSpan, ...]
-    confidence: float
-    template_sha256: str
-    response_sha256: str
+class LowConfidenceSpanAnnotationError(SpanAnnotationError):
+    """Raised when a valid annotation is below the frozen confidence threshold."""
+
+
+class FrozenSpanAnnotation(StrictRecord):
+    spans: tuple[EditableSpan, ...] = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    template_sha256: Sha256
+    response_sha256: Sha256
     model: str
     revision: str
-    offset_corrections: tuple[dict[str, object], ...] = ()
+
+    @model_validator(mode="after")
+    def validate_confidence(self) -> "FrozenSpanAnnotation":
+        if self.confidence != min(span.confidence for span in self.spans):
+            raise ValueError("confidence must equal the minimum span confidence")
+        if not self.model.strip() or not self.revision.strip():
+            raise ValueError("annotation model and revision must be non-empty")
+        return self
 
 
-@dataclass(frozen=True)
-class SpanAnnotationSettings:
-    """Immutable annotation policy; sampling and repair count are fixed."""
-
-    template: str
-    confidence_threshold: float
-    temperature: float = field(default=0.0, init=False)
-    repair_attempts: int = field(default=1, init=False)
-
-    def __post_init__(self) -> None:
-        if not self.template:
-            raise ValueError("span annotation template cannot be empty")
-        try:
-            threshold = float(self.confidence_threshold)
-        except (OverflowError, TypeError, ValueError):
-            threshold = math.nan
-        if (
-            isinstance(self.confidence_threshold, bool)
-            or not isinstance(self.confidence_threshold, (int, float))
-            or not math.isfinite(threshold)
-            or not 0.0 <= threshold <= 1.0
-        ):
-            raise ValueError("span annotation confidence threshold must be a finite probability")
+class _DuplicateJsonField(ValueError):
+    def __init__(self, field: str) -> None:
+        self.field = field
 
 
-class _StrictJSONError(ValueError):
-    pass
-
-
-def _reject_constant(value: str) -> None:
-    raise _StrictJSONError(f"non-standard JSON constant {value}")
-
-
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
-            raise _StrictJSONError(f"duplicate JSON key {key!r}")
+            raise _DuplicateJsonField(key)
         result[key] = value
     return result
 
 
-def _decode_response(raw_response: str) -> tuple[EditableSpan, ...]:
-    if not isinstance(raw_response, str):
-        raise _StrictJSONError("response must be a string")
+def _unique_casefolded_match(prompt: str, quote: str) -> tuple[int, int] | None:
+    """Return the unique case-insensitive match when offsets remain safe to map."""
+    folded_prompt = prompt.casefold()
+    folded_quote = quote.casefold()
+    if len(folded_prompt) != len(prompt) or len(folded_quote) != len(quote):
+        return None
+    start = folded_prompt.find(folded_quote)
+    if start < 0 or folded_prompt.find(folded_quote, start + 1) >= 0:
+        return None
+    return start, start + len(quote)
+
+
+def _schema_error(response: str, prompt: str) -> tuple[EditableSpan, ...]:
     try:
-        payload = json.loads(
-            raw_response,
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_constant,
-        )
-    except json.JSONDecodeError as error:
-        raise _StrictJSONError(
-            f"response is not valid JSON: {error.msg} at line {error.lineno} column {error.colno}"
+        payload = json.loads(response, object_pairs_hook=_unique_object)
+    except _DuplicateJsonField as error:
+        raise SpanAnnotationError(
+            f"response contains duplicate JSON field: {error.field}"
         ) from error
-    except ValueError as error:
-        raise _StrictJSONError(f"response JSON contains an invalid numeric value: {error}") from error
+    except json.JSONDecodeError as error:
+        raise SpanAnnotationError("response must be valid JSON") from error
     if not isinstance(payload, dict):
-        raise _StrictJSONError("response must be a JSON object")
-    if set(payload) != {"spans"}:
-        raise _StrictJSONError("response object must contain exactly the key 'spans'")
+        raise SpanAnnotationError("response must be a JSON object")
+
+    unexpected = sorted(set(payload) - {"spans"})
+    if unexpected:
+        raise SpanAnnotationError(
+            f"response has unexpected fields: {', '.join(unexpected)}"
+        )
+    if "spans" not in payload:
+        raise SpanAnnotationError("response is missing required field: spans")
     raw_spans = payload["spans"]
-    if not isinstance(raw_spans, list) or not raw_spans:
-        raise _StrictJSONError("spans must be a non-empty JSON array")
+    if not isinstance(raw_spans, list):
+        raise SpanAnnotationError("spans must be an array")
+    if len(raw_spans) != 1:
+        raise SpanAnnotationError("spans must contain exactly one item")
 
     spans: list[EditableSpan] = []
-    expected_fields = {"start", "end", "quote", "role", "confidence", "rationale"}
-    for index, item in enumerate(raw_spans):
-        prefix = f"span[{index}]"
-        if not isinstance(item, dict):
-            raise _StrictJSONError(f"{prefix} must be a JSON object")
-        if set(item) != expected_fields:
-            raise _StrictJSONError(
-                f"{prefix} must contain exactly start, end, quote, role, confidence, rationale"
+    previous_end = 0
+    for index, raw_span in enumerate(raw_spans):
+        prefix = f"spans[{index}]"
+        if not isinstance(raw_span, dict):
+            raise SpanAnnotationError(f"{prefix} must be an object")
+        unexpected = sorted(set(raw_span) - _SPAN_FIELDS)
+        if unexpected:
+            raise SpanAnnotationError(
+                f"{prefix} has unexpected fields: {', '.join(unexpected)}"
             )
-        start, end = item["start"], item["end"]
-        if isinstance(start, bool) or not isinstance(start, int):
-            raise _StrictJSONError(f"{prefix}.start must be an integer")
-        if isinstance(end, bool) or not isinstance(end, int):
-            raise _StrictJSONError(f"{prefix}.end must be an integer")
-        if start < 0 or end <= start:
-            raise _StrictJSONError(f"{prefix} requires non-empty ordered bounds")
-        quote = item["quote"]
+        missing = sorted(_SPAN_FIELDS - set(raw_span))
+        if missing:
+            raise SpanAnnotationError(
+                f"{prefix} is missing required fields: {', '.join(missing)}"
+            )
+
+        start = raw_span["start"]
+        end = raw_span["end"]
+        quote = raw_span["quote"]
+        role = raw_span["role"]
+        confidence = raw_span["confidence"]
+        rationale = raw_span["rationale"]
+        if type(start) is not int or start < 0:
+            raise SpanAnnotationError(f"{prefix}.start must be a non-negative integer")
+        if type(end) is not int or end <= start:
+            raise SpanAnnotationError(
+                f"{prefix}.end must be an integer greater than start"
+            )
         if not isinstance(quote, str) or not quote:
-            raise _StrictJSONError(f"{prefix}.quote must be a non-empty string")
-        role = item["role"]
-        if not isinstance(role, str):
-            raise _StrictJSONError(f"{prefix}.role must be a string")
-        try:
-            span_role = EditableSpanRole(role)
-        except ValueError as error:
-            raise _StrictJSONError(f"{prefix}.role is not an editable span role") from error
-        confidence = item["confidence"]
-        try:
-            numeric_confidence = float(confidence)
-        except (OverflowError, TypeError, ValueError):
-            numeric_confidence = math.nan
-        if (
-            isinstance(confidence, bool)
-            or not isinstance(confidence, (int, float))
-            or not math.isfinite(numeric_confidence)
-            or not 0.0 <= numeric_confidence <= 1.0
-        ):
-            raise _StrictJSONError(f"{prefix}.confidence must be a finite probability")
-        rationale = item["rationale"]
-        if not isinstance(rationale, str) or not rationale.strip():
-            raise _StrictJSONError(f"{prefix}.rationale must be a non-empty string")
+            raise SpanAnnotationError(f"{prefix}.quote must be a non-empty string")
+        if role not in _ROLE_VALUES:
+            raise SpanAnnotationError(
+                f"{prefix}.role must be one of: {', '.join(_ROLE_VALUES)}"
+            )
+        if type(confidence) not in (int, float):
+            raise SpanAnnotationError(f"{prefix}.confidence must be a number")
+        if not 0.0 <= confidence <= 1.0:
+            raise SpanAnnotationError(f"{prefix}.confidence must be between 0 and 1")
+        if not isinstance(rationale, str):
+            raise SpanAnnotationError(f"{prefix}.rationale must be a string")
+        if end <= len(prompt) and prompt[start:end] == quote:
+            resolved_start, resolved_end = start, end
+        else:
+            resolved_start = prompt.find(quote)
+            if resolved_start >= 0 and prompt.find(quote, resolved_start + 1) < 0:
+                resolved_end = resolved_start + len(quote)
+            else:
+                casefolded_match = _unique_casefolded_match(prompt, quote)
+                if casefolded_match is None:
+                    raise SpanAnnotationError(
+                        f"{prefix}.quote must equal prompt[start:end]"
+                    )
+                resolved_start, resolved_end = casefolded_match
+                quote = prompt[resolved_start:resolved_end]
+        if index and resolved_start < previous_end:
+            raise SpanAnnotationError("spans must be ordered and non-overlapping")
+
         spans.append(
             EditableSpan(
-                start=start,
-                end=end,
+                start=resolved_start,
+                end=resolved_end,
                 quote=quote,
-                role=span_role,
-                confidence=numeric_confidence,
+                role=role,
+                confidence=float(confidence),
                 rationale=rationale,
             )
         )
+        previous_end = resolved_end
     return tuple(spans)
 
 
-def _validate_offsets(full_text: str, spans: tuple[EditableSpan, ...]) -> None:
-    previous: EditableSpan | None = None
-    for index, span in enumerate(spans):
-        if previous is not None and span.start < previous.end:
-            raise _StrictJSONError(f"span[{index}] overlaps or precedes span[{index - 1}]")
-        if span.end > len(full_text) or full_text[span.start : span.end] != span.quote:
-            raise _StrictJSONError(
-                f"span[{index}].quote does not match full_text at the declared offsets"
-            )
-        previous = span
-
-
-def _parse_annotation(raw_response: str, full_text: str) -> tuple[EditableSpan, ...]:
-    spans = _decode_response(raw_response)
-    _validate_offsets(full_text, spans)
-    return spans
-
-
-def _correct_unique_quote_offsets(
-    raw_response: str, full_text: str
-) -> tuple[tuple[EditableSpan, ...], tuple[dict[str, object], ...]]:
-    spans = _decode_response(raw_response)
-    corrected: list[EditableSpan] = []
-    corrections: list[dict[str, object]] = []
-    for index, span in enumerate(spans):
-        if span.end <= len(full_text) and full_text[span.start : span.end] == span.quote:
-            corrected.append(span)
-            continue
-        start = full_text.find(span.quote)
-        if start < 0 or full_text.find(span.quote, start + 1) >= 0:
-            raise _StrictJSONError(
-                f"span[{index}].quote does not have one unique exact offset candidate"
-            )
-        end = start + len(span.quote)
-        corrected.append(span.model_copy(update={"start": start, "end": end}))
-        corrections.append({
-            "span": index,
-            "quote": span.quote,
-            "declared_bounds": [span.start, span.end],
-            "corrected_bounds": [start, end],
-        })
-    result = tuple(corrected)
-    _validate_offsets(full_text, result)
-    return result, tuple(corrections)
-
-
-def _input_message(
-    full_text: str,
-    seed_intent: str,
-    source_hints: Sequence[str],
-) -> str:
-    compact_ascii = len(full_text) > 512 and full_text.isascii()
-    payload = {
-        "full_text": full_text,
-        "seed_intent": seed_intent,
-        "source_hints": list(source_hints),
-        "unicode_codepoint_index": (
-            [] if compact_ascii
-            else [[index, character] for index, character in enumerate(full_text)]
-        ),
-        "offset_contract": (
-            "ASCII; Python code-point offsets equal byte-independent character offsets"
-            if compact_ascii else "unicode_codepoint_index is authoritative"
-        ),
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _exact_offset_candidates(full_text: str, raw_response: str) -> list[dict[str, object]]:
-    try:
-        spans = _decode_response(raw_response)
-    except _StrictJSONError:
-        return []
-    corrections: list[dict[str, object]] = []
-    for index, span in enumerate(spans):
-        bounds: list[list[int]] = []
-        start = 0
-        while True:
-            match = full_text.find(span.quote, start)
-            if match < 0:
-                break
-            bounds.append([match, match + len(span.quote)])
-            start = match + 1
-        if bounds:
-            corrections.append({
-                "span": index,
-                "quote": span.quote,
-                "candidate_bounds": bounds,
-            })
-    return corrections
-
-
-def _repair_message(error: str, *, full_text: str, raw_response: str) -> str:
-    message = (
-        "Your response was invalid. Return one corrected JSON object and no other text.\n"
-        f"Validation errors:\n- {error}"
+def _repair_message(error: SpanAnnotationError) -> str:
+    return (
+        "Your response failed validation:\n"
+        f"{error}\n"
+        "Return one corrected JSON object matching the required schema. JSON only."
     )
-    candidates = _exact_offset_candidates(full_text, raw_response)
-    if candidates:
-        message += "\nExact offset candidates:\n" + json.dumps(
-            candidates, ensure_ascii=False, separators=(",", ":")
-        )
-    return message
 
 
 class SpanAnnotator:
-    """Annotate exact editable character spans with one deterministic repair."""
+    """Apply the locked model annotator with one deterministic schema repair."""
 
     def __init__(
         self,
+        config: AnnotationConfig,
         transport: AnnotationTransport,
-        settings: SpanAnnotationSettings,
+        *,
+        confidence_threshold: float,
     ) -> None:
-        self.transport = transport
-        self.settings = settings
+        if type(confidence_threshold) not in (int, float) or not (
+            0.0 <= confidence_threshold <= 1.0
+        ):
+            raise ValueError("confidence_threshold must be a number between 0 and 1")
+        if transport.model != config.model or transport.revision != config.revision:
+            raise SpanAnnotationError(
+                "transport identity does not match the locked annotation config"
+            )
+
+        self._config = config
+        self._transport = transport
+        self._model = config.model
+        self._revision = config.revision
+        self._confidence_threshold = float(confidence_threshold)
+        template_bytes = Path(config.template_path).read_bytes()
+        try:
+            self._template = template_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise SpanAnnotationError("annotation template must be UTF-8") from error
+        self._template_sha256 = hashlib.sha256(template_bytes).hexdigest()
+
+    def _validate_transport_identity(self) -> None:
+        if (
+            self._transport.model != self._model
+            or self._transport.revision != self._revision
+        ):
+            raise SpanAnnotationError(
+                "transport identity does not match the locked annotation config"
+            )
+
+    def _complete(self, messages: Sequence[Mapping[str, str]]) -> str:
+        self._validate_transport_identity()
+        response = self._transport.complete(
+            messages,
+            temperature=self._config.temperature,
+        )
+        self._validate_transport_identity()
+        if not isinstance(response, str):
+            raise SpanAnnotationError("annotation response must be text")
+        return response
 
     def annotate(
         self,
-        full_text: str,
+        prompt: str,
+        *,
         seed_intent: str,
-        source_hints: Sequence[str],
+        source_hints: Mapping[str, object],
     ) -> FrozenSpanAnnotation:
-        messages: tuple[Mapping[str, str], ...] = (
-            {"role": "system", "content": self.settings.template},
-            {
-                "role": "user",
-                "content": _input_message(full_text, seed_intent, source_hints),
-            },
-        )
-        raw_response = self.transport.complete(
-            messages,
-            temperature=self.settings.temperature,
-        )
-        offset_corrections: tuple[dict[str, object], ...] = ()
+        if not isinstance(prompt, str) or not prompt:
+            raise SpanAnnotationError("prompt must be a non-empty string")
+        if not isinstance(seed_intent, str) or not seed_intent:
+            raise SpanAnnotationError("seed_intent must be a non-empty string")
+        if not isinstance(source_hints, Mapping):
+            raise SpanAnnotationError("source_hints must be an object")
+        if not all(isinstance(key, str) for key in source_hints):
+            raise SpanAnnotationError("source_hints keys must be strings")
+        context = {
+            "prompt": prompt,
+            "seed_intent": seed_intent,
+            "source_hints": dict(source_hints),
+        }
         try:
-            spans = _parse_annotation(raw_response, full_text)
-        except _StrictJSONError as first_error:
-            repair_messages = messages + (
-                {"role": "assistant", "content": raw_response},
-                {
-                    "role": "user",
-                    "content": _repair_message(
-                        str(first_error), full_text=full_text, raw_response=raw_response
-                    ),
-                },
-            )
-            raw_response = self.transport.complete(
-                repair_messages,
-                temperature=self.settings.temperature,
-            )
+            context_json = canonical_json(context)
+        except (TypeError, ValueError) as error:
+            raise SpanAnnotationError("annotation context must be canonical JSON") from error
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self._template},
+            {"role": "user", "content": context_json},
+        ]
+        first_response = self._complete(messages)
+        try:
+            spans = _schema_error(first_response, prompt)
+            accepted_response = first_response
+        except SpanAnnotationError as first_error:
+            repair_messages = [
+                *messages,
+                {"role": "assistant", "content": first_response},
+                {"role": "user", "content": _repair_message(first_error)},
+            ]
+            repaired_response = self._complete(repair_messages)
             try:
-                spans = _parse_annotation(raw_response, full_text)
-            except _StrictJSONError as second_error:
-                try:
-                    spans, offset_corrections = _correct_unique_quote_offsets(
-                        raw_response, full_text
-                    )
-                except _StrictJSONError as correction_error:
-                    raise SpanAnnotationError(
-                        "span annotation response invalid after one repair attempt: "
-                        f"{correction_error}"
-                    ) from second_error
+                spans = _schema_error(repaired_response, prompt)
+            except SpanAnnotationError as second_error:
+                raise SpanAnnotationError(
+                    f"annotation remained invalid after one repair: {second_error}"
+                ) from second_error
+            accepted_response = repaired_response
 
         confidence = min(span.confidence for span in spans)
-        if confidence < self.settings.confidence_threshold:
-            raise SpanAnnotationError(
-                "span annotation confidence "
-                f"{confidence} is below threshold {self.settings.confidence_threshold}"
+        if confidence < self._confidence_threshold:
+            raise LowConfidenceSpanAnnotationError(
+                f"minimum span confidence {confidence:g} is below frozen threshold "
+                f"{self._confidence_threshold:g}"
             )
         return FrozenSpanAnnotation(
             spans=spans,
             confidence=confidence,
-            template_sha256=hashlib.sha256(self.settings.template.encode("utf-8")).hexdigest(),
-            response_sha256=hashlib.sha256(raw_response.encode("utf-8")).hexdigest(),
-            model=self.transport.model,
-            revision=self.transport.revision,
-            offset_corrections=offset_corrections,
+            template_sha256=self._template_sha256,
+            response_sha256=hashlib.sha256(
+                accepted_response.encode("utf-8")
+            ).hexdigest(),
+            model=self._model,
+            revision=self._revision,
         )

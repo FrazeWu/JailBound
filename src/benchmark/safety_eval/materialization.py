@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+import hashlib
+from typing import Any, Iterable, Mapping
 
 import torch
 
 from .objective import EditableState
-from .prompt_contract import TokenizedEditablePrompt, scatter_editable
-from .schema import FailureKind, MaterializationRecord, RecordStatus
+from .io import canonical_hash
+from .prompt_contract import TokenizedEditablePrompt
+from .schema import FailureKind, MaterializationRecord, RecordStatus, TransportType, V2MaterializationRecord
 
 
 @dataclass(frozen=True)
@@ -40,47 +42,27 @@ class ContinuousCandidate:
 
 
 @dataclass(frozen=True)
-class V2MaterializationEvidence:
+class V2CandidateMaterialization:
+    """One-pass reconstruction evidence for an annotated prompt contract."""
+
+    projected_z_token_ids: tuple[int, ...]
+    projected_u_token_ids: tuple[int, ...]
     reconstructed_base_token_ids: tuple[int, ...]
     complete_token_ids: tuple[int, ...]
+    flat_prompt: str
     frozen_positions_unchanged: bool
-    text: str
 
 
-def materialize_v2_candidate(
-    *,
-    candidate: DiscreteCandidate,
-    prompt: TokenizedEditablePrompt,
-    tokenizer: Any,
-    special_token_ids: Iterable[int] = (),
-) -> V2MaterializationEvidence:
-    """Scatter projected U in place, prepend z, and decode the sequence once."""
-    if not candidate.prefix_token_ids or len(candidate.seed_token_ids) != len(prompt.editable_positions):
-        raise ValueError("projected z/U lengths do not match the prompt contract")
-    forbidden = {int(token_id) for token_id in special_token_ids}
-    projected = candidate.prefix_token_ids + candidate.seed_token_ids
-    if any(token_id in forbidden for token_id in projected):
-        raise ValueError("projected z/U contains a forbidden token")
-    base = prompt.base_token_ids
-    u_ids = torch.tensor([candidate.seed_token_ids], dtype=base.dtype, device=base.device)
-    reconstructed = scatter_editable(u_ids, base, prompt.editable_positions)
-    frozen_unchanged = all(
-        int(reconstructed[0, position]) == int(base[0, position])
-        for position in prompt.frozen_positions
-    )
-    if not frozen_unchanged:
-        raise ValueError("materialization changed a frozen token")
-    reconstructed_ids = tuple(int(token_id) for token_id in reconstructed[0].detach().cpu().tolist())
-    complete_ids = candidate.prefix_token_ids + reconstructed_ids
-    text = str(tokenizer.decode(list(complete_ids), skip_special_tokens=False))
-    if not text.strip():
-        raise ValueError("materialization decoded to empty text")
-    return V2MaterializationEvidence(
-        reconstructed_base_token_ids=reconstructed_ids,
-        complete_token_ids=complete_ids,
-        frozen_positions_unchanged=True,
-        text=text,
-    )
+def vocabulary_embedding_sha256(vocabulary_embeddings: torch.Tensor) -> str:
+    """Fingerprint the exact input-embedding row-to-token-ID mapping."""
+    if vocabulary_embeddings.ndim != 2:
+        raise ValueError("vocabulary embeddings must have shape [vocabulary, hidden]")
+    normalized = vocabulary_embeddings.detach().to(device="cpu").contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tuple(normalized.shape)).encode("ascii"))
+    digest.update(str(normalized.dtype).encode("ascii"))
+    digest.update(normalized.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def meets_semantic_threshold(similarity: float, *, threshold: float) -> bool:
@@ -88,6 +70,113 @@ def meets_semantic_threshold(similarity: float, *, threshold: float) -> bool:
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("semantic threshold must be in [0, 1]")
     return float(similarity) >= threshold
+
+
+def materialize_v2_candidate(
+    *,
+    candidate: ContinuousCandidate | DiscreteCandidate,
+    prompt: TokenizedEditablePrompt,
+    tokenizer: Any,
+    special_token_ids: Iterable[int] = (),
+) -> V2CandidateMaterialization:
+    """Project both editable blocks and reconstruct ``[z; Phi(p; U)]`` once."""
+    if isinstance(candidate, ContinuousCandidate):
+        evidence = materialize_continuous_state(
+            candidate.state,
+            candidate.vocabulary_embeddings,
+            forbidden_token_ids=tuple(special_token_ids) + candidate.forbidden_token_ids,
+        )
+        z_ids, u_ids = evidence.prefix_token_ids, evidence.seed_token_ids
+    else:
+        z_ids = tuple(int(token_id) for token_id in candidate.prefix_token_ids)
+        u_ids = tuple(int(token_id) for token_id in candidate.seed_token_ids)
+    if len(u_ids) != len(prompt.editable_positions):
+        raise ValueError("projected U token count must match editable prompt positions")
+    forbidden = {int(token_id) for token_id in special_token_ids}
+    if forbidden.intersection(z_ids + u_ids):
+        raise ValueError("projected editable tokens must not include forbidden IDs")
+    base = tuple(int(token_id) for token_id in prompt.base_token_ids[0].detach().cpu().tolist())
+    reconstructed = list(base)
+    for position, token_id in zip(prompt.editable_positions, u_ids):
+        reconstructed[position] = token_id
+    frozen_unchanged = all(reconstructed[position] == base[position] for position in prompt.frozen_positions)
+    if not frozen_unchanged:
+        raise AssertionError("v2 materialization changed a frozen prompt token")
+    complete = z_ids + tuple(reconstructed)
+    decoded = str(tokenizer.decode(list(complete), skip_special_tokens=True)).strip()
+    if not decoded:
+        raise ValueError("decoded v2 candidate must be non-empty")
+    return V2CandidateMaterialization(
+        projected_z_token_ids=z_ids,
+        projected_u_token_ids=u_ids,
+        reconstructed_base_token_ids=tuple(reconstructed),
+        complete_token_ids=complete,
+        flat_prompt=decoded,
+        frozen_positions_unchanged=True,
+    )
+
+
+def build_v2_materialization_record(
+    *,
+    result: V2CandidateMaterialization,
+    prompt: TokenizedEditablePrompt,
+    run_id: str,
+    config_hash: str,
+    sample_id: str,
+    source: str,
+    method: str,
+    branch: str,
+    step: int,
+    state_sha256: str,
+    surrogate_tokenizer_sha256: str,
+    surrogate_embedding_sha256: str,
+    transport: TransportType = TransportType.text,
+    full_prompt_similarity: float | None = None,
+    editable_span_similarity: float | None = None,
+) -> V2MaterializationRecord:
+    """Turn one v2 reconstruction into a strict materialization ledger row."""
+    if transport is not TransportType.text:
+        raise ValueError("v2 materialization supports text transport only")
+    original = tuple(int(value) for value in prompt.base_token_ids[0].tolist())
+    if full_prompt_similarity is None:
+        full_prompt_similarity = sum(left == right for left, right in zip(original, result.reconstructed_base_token_ids)) / len(original)
+    if editable_span_similarity is None:
+        editable_span_similarity = sum(
+            original[position] == token_id
+            for position, token_id in zip(prompt.editable_positions, result.projected_u_token_ids)
+        ) / len(prompt.editable_positions)
+    payload = {
+        "schema_version": "reviewer_eval.v2",
+        "run_id": run_id,
+        "config_hash": config_hash,
+        "sample_id": sample_id,
+        "source": source,
+        "method": method,
+        "branch": branch,
+        "step": step,
+        "transport": transport,
+        "state_sha256": state_sha256,
+        "surrogate_tokenizer_sha256": surrogate_tokenizer_sha256,
+        "surrogate_embedding_sha256": surrogate_embedding_sha256,
+        "editable_positions": prompt.editable_positions,
+        "original_token_ids": original,
+        "projected_z_token_ids": result.projected_z_token_ids,
+        "projected_u_token_ids": result.projected_u_token_ids,
+        "reconstructed_base_token_ids": result.reconstructed_base_token_ids,
+        "complete_token_ids": result.complete_token_ids,
+        "frozen_positions_unchanged": result.frozen_positions_unchanged,
+        "span_boundary_expansions": prompt.boundary_expansions,
+        "full_prompt_similarity": full_prompt_similarity,
+        "editable_span_similarity": editable_span_similarity,
+        "flat_prompt": result.flat_prompt,
+        "status": RecordStatus.complete,
+        "failure_kind": None,
+        "failure_reason": None,
+    }
+    return V2MaterializationRecord(
+        **payload,
+        materialization_sha256=canonical_hash(payload),
+    )
 
 
 def build_materialization_record(
@@ -288,30 +377,17 @@ def calibrate_threshold(
 def _allowed_vocabulary(
     vocabulary_embeddings: torch.Tensor,
     forbidden_token_ids: Iterable[int],
-    allowed_token_ids: Iterable[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if vocabulary_embeddings.ndim != 2:
         raise ValueError("vocabulary embeddings must have shape [vocabulary, hidden]")
     forbidden = set(int(token_id) for token_id in forbidden_token_ids)
-    if allowed_token_ids is None:
-        ids = torch.tensor(
-            [index for index in range(vocabulary_embeddings.shape[0]) if index not in forbidden],
-            device=vocabulary_embeddings.device,
-            dtype=torch.long,
-        )
-        if not len(ids):
-            raise ValueError("no allowed vocabulary ids remain after masking")
-    else:
-        allowed = tuple(int(token_id) for token_id in allowed_token_ids)
-        if not allowed:
-            raise ValueError("allowed token ids must not be empty")
-        if len(set(allowed)) != len(allowed):
-            raise ValueError("allowed token ids must be unique")
-        if any(token_id < 0 or token_id >= vocabulary_embeddings.shape[0] for token_id in allowed):
-            raise ValueError("allowed token ids must be in range")
-        if forbidden.intersection(allowed):
-            raise ValueError("allowed token ids must not be forbidden")
-        ids = torch.tensor(allowed, device=vocabulary_embeddings.device, dtype=torch.long)
+    ids = torch.tensor(
+        [index for index in range(vocabulary_embeddings.shape[0]) if index not in forbidden],
+        device=vocabulary_embeddings.device,
+        dtype=torch.long,
+    )
+    if not len(ids):
+        raise ValueError("no allowed vocabulary ids remain after masking")
     return ids, vocabulary_embeddings.index_select(0, ids)
 
 
@@ -320,6 +396,14 @@ def _project_block(
     allowed_ids: torch.Tensor,
     allowed_embeddings: torch.Tensor,
 ) -> tuple[tuple[int, ...], float]:
+    if block.ndim != 3 or block.shape[0] != 1:
+        raise ValueError("projection state must have batch size 1")
+    if block.shape[-1] != allowed_embeddings.shape[-1]:
+        raise ValueError("projection state hidden size must match vocabulary")
+    if not block.is_floating_point() or not torch.isfinite(block).all().item():
+        raise ValueError("projection state must contain finite floating-point values")
+    if torch.any(torch.linalg.vector_norm(block, dim=-1) == 0).item():
+        raise ValueError("projection state must not contain zero-norm vectors")
     positions = block.detach().reshape(-1, block.shape[-1]).float()
     vocabulary = allowed_embeddings.detach().float()
     positions = torch.nn.functional.normalize(positions, dim=-1)
@@ -330,98 +414,17 @@ def _project_block(
     return tuple(int(token_id) for token_id in token_ids), float(maxima.mean().cpu())
 
 
-def _validate_position_masks(
-    vocabulary_embeddings: torch.Tensor,
-    forbidden_token_ids: Iterable[int],
-    masks: Sequence[Sequence[int]],
-    *,
-    position_count: int,
-) -> tuple[tuple[int, ...], ...]:
-    canonical_masks = tuple(tuple(int(token_id) for token_id in mask) for mask in masks)
-    if len(canonical_masks) != position_count:
-        raise ValueError("position mask count must match editable position count")
-    for mask in canonical_masks:
-        _allowed_vocabulary(vocabulary_embeddings, forbidden_token_ids, mask)
-    return canonical_masks
-
-
-def _project_block_by_position(
-    block: torch.Tensor,
-    vocabulary_embeddings: torch.Tensor,
-    forbidden_token_ids: Iterable[int],
-    masks: Sequence[tuple[int, ...]],
-) -> tuple[tuple[int, ...], float]:
-    positions = block.detach().reshape(-1, block.shape[-1])
-    grouped_positions: dict[tuple[int, ...], list[int]] = {}
-    for position, mask in enumerate(masks):
-        grouped_positions.setdefault(mask, []).append(position)
-
-    projected_ids = [0] * len(masks)
-    cosine_sum = 0.0
-    for mask, position_indices in grouped_positions.items():
-        indices = torch.tensor(position_indices, device=block.device, dtype=torch.long)
-        allowed_ids, allowed_embeddings = _allowed_vocabulary(
-            vocabulary_embeddings, forbidden_token_ids, mask
-        )
-        group_ids, group_cosine = _project_block(
-            positions.index_select(0, indices), allowed_ids, allowed_embeddings
-        )
-        for position, token_id in zip(position_indices, group_ids, strict=True):
-            projected_ids[position] = token_id
-        cosine_sum += group_cosine * len(position_indices)
-
-    return tuple(projected_ids), cosine_sum / len(masks)
-
-
 def materialize_continuous_state(
     state: EditableState,
     vocabulary_embeddings: torch.Tensor,
     *,
     forbidden_token_ids: Iterable[int] = (),
-    allowed_token_ids: Iterable[int] | None = None,
-    prefix_allowed_token_ids_by_position: Sequence[Sequence[int]] | None = None,
-    seed_allowed_token_ids_by_position: Sequence[Sequence[int]] | None = None,
 ) -> ContinuousMaterialization:
     """Project *both* ``z`` and ``u`` against one masked vocabulary."""
-    has_prefix_position_masks = prefix_allowed_token_ids_by_position is not None
-    has_seed_position_masks = seed_allowed_token_ids_by_position is not None
-    if allowed_token_ids is not None and (
-        has_prefix_position_masks or has_seed_position_masks
-    ):
-        raise ValueError("global and position-specific allowed token masks conflict")
-    if has_prefix_position_masks != has_seed_position_masks:
-        raise ValueError("position masks are required for both prefix and seed blocks")
-    if has_prefix_position_masks:
-        forbidden = tuple(forbidden_token_ids)
-        prefix_position_count = state.z.numel() // state.z.shape[-1]
-        seed_position_count = state.u.numel() // state.u.shape[-1]
-        prefix_masks = _validate_position_masks(
-            vocabulary_embeddings,
-            forbidden,
-            prefix_allowed_token_ids_by_position,
-            position_count=prefix_position_count,
-        )
-        seed_masks = _validate_position_masks(
-            vocabulary_embeddings,
-            forbidden,
-            seed_allowed_token_ids_by_position,
-            position_count=seed_position_count,
-        )
-        prefix_ids, prefix_cosine = _project_block_by_position(
-            state.z, vocabulary_embeddings, forbidden, prefix_masks
-        )
-        seed_ids, seed_cosine = _project_block_by_position(
-            state.u, vocabulary_embeddings, forbidden, seed_masks
-        )
-        return ContinuousMaterialization(
-            prefix_token_ids=prefix_ids,
-            seed_token_ids=seed_ids,
-            prefix_projection_cosine=prefix_cosine,
-            seed_projection_cosine=seed_cosine,
-        )
-
+    if not vocabulary_embeddings.is_floating_point() or not torch.isfinite(vocabulary_embeddings).all().item():
+        raise ValueError("vocabulary embeddings must contain finite floating-point values")
     allowed_ids, allowed_embeddings = _allowed_vocabulary(
-        vocabulary_embeddings, forbidden_token_ids, allowed_token_ids
+        vocabulary_embeddings, forbidden_token_ids
     )
     prefix_ids, prefix_cosine = _project_block(state.z, allowed_ids, allowed_embeddings)
     seed_ids, seed_cosine = _project_block(state.u, allowed_ids, allowed_embeddings)

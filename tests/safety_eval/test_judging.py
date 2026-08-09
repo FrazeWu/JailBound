@@ -184,6 +184,17 @@ def test_compat_judge_derives_label_from_score_and_requested_threshold() -> None
     assert record.unsafe_label is True
 
 
+def test_compat_judge_uses_an_explicit_snapshot_revision() -> None:
+    judge = Qwen32CompatJudge(
+        endpoint="http://localhost:8001/v1",
+        revision="local-sha256:" + "a" * 64,
+    )
+    try:
+        assert judge.revision == "local-sha256:" + "a" * 64
+    finally:
+        judge.close()
+
+
 def test_compat_judge_returns_structured_error_without_echoing_input() -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(

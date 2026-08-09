@@ -7,13 +7,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Literal
 
 import torch
 
-from .io import JsonlLedger, atomic_write_json, read_jsonl
-from .schema import ComputeCounters, OptimizationRecord, RecordStatus
+from .io import JsonlLedger, atomic_write_json, read_jsonl, sha256_file
+from .schema import ComputeCounters, OptimizationRecord, RecordStatus, stable_id
 
 
 class RunConfigMismatch(RuntimeError):
@@ -91,6 +93,7 @@ class OptimizationSnapshot:
     internal_margin: float | None = None
     state_filename: str | None = None
     state: dict[str, Any] | None = None
+    branch_pool: tuple[Any, ...] = ()
 
 
 SnapshotFactory = Callable[[tuple[int, ...]], Iterable[OptimizationSnapshot]]
@@ -158,12 +161,49 @@ class OptimizationRunner:
             if snapshot.checkpoint not in expected or snapshot.checkpoint in observed:
                 raise ValueError("snapshot factory returned an unexpected checkpoint")
             observed.add(snapshot.checkpoint)
+            self._persist_branch_pool(job, snapshot, path.parent)
             record = self._record_for(job, snapshot, path.parent)
             if ledger.append_once(record.model_dump(mode="json")):
                 written.append(record)
         if observed != expected:
             raise ValueError("snapshot factory did not return every requested checkpoint")
         return written
+
+    def _persist_branch_pool(
+        self, job: OptimizationJob, snapshot: OptimizationSnapshot, method_directory: Path
+    ) -> None:
+        if not snapshot.branch_pool:
+            return
+        ledger = JsonlLedger(
+            method_directory / "branch_pool.jsonl",
+            key_fields=("cell_id", "sample_id", "branch", "step"),
+        )
+        for item in snapshot.branch_pool:
+            value = item if isinstance(item, dict) else vars(item)
+            branch, step = value["branch"], value["step"]
+            state_id = stable_id("branch_state", (job.cell_id, job.sample_id, branch, step))
+            state_path = method_directory / "branch_states" / f"{state_id}.pt"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            if not state_path.exists():
+                state = value["state"]
+                torch.save(
+                    {"z": state.z.detach().cpu(), "u": state.u.detach().cpu()}, state_path
+                )
+            ledger.append_once(
+                {
+                    "schema_version": self.schema_version,
+                    "run_id": self.run_id,
+                    "config_hash": self.config_hash,
+                    "cell_id": job.cell_id,
+                    "sample_id": job.sample_id,
+                    "branch": branch,
+                    "step": step,
+                    "attack_loss": value["attack_loss"],
+                    "fol": value["fol"],
+                    "branch_objective": value["branch_objective"],
+                    "state_path": str(state_path),
+                }
+            )
 
     def _lock_config_hash(self) -> None:
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -217,7 +257,8 @@ class OptimizationRunner:
         snapshot: OptimizationSnapshot,
         method_directory: Path,
     ) -> OptimizationRecord:
-        state_path = self._persist_state(job, snapshot, method_directory)
+        self._validate_v2_snapshot(snapshot)
+        state_path, state_sha256 = self._persist_state(job, snapshot, method_directory)
         return OptimizationRecord(
             schema_version=self.schema_version,
             run_id=self.run_id,
@@ -233,6 +274,7 @@ class OptimizationRunner:
             failure_kind=None,
             failure_reason=None,
             state_path=state_path,
+            state_sha256=state_sha256,
             representation=snapshot.representation,
             attack_loss=snapshot.attack_loss,
             fol=snapshot.fol,
@@ -240,6 +282,19 @@ class OptimizationRunner:
             materialized_prompt=None,
             counters=snapshot.counters,
         )
+
+    def _validate_v2_snapshot(self, snapshot: OptimizationSnapshot) -> None:
+        if self.schema_version != "reviewer_eval.v2":
+            return
+        if not isinstance(snapshot.state, dict):
+            raise ValueError("complete v2 snapshots require a persisted state payload")
+        input_embedding_sha256 = snapshot.state.get("input_embedding_sha256")
+        if not isinstance(input_embedding_sha256, str) or len(input_embedding_sha256) != 64:
+            raise ValueError("complete v2 snapshots require input_embedding_sha256")
+        try:
+            int(input_embedding_sha256, 16)
+        except ValueError as error:
+            raise ValueError("complete v2 snapshots require input_embedding_sha256") from error
 
     @staticmethod
     def _state_path(state_filename: str | None, method_directory: Path) -> str | None:
@@ -254,18 +309,36 @@ class OptimizationRunner:
         job: OptimizationJob,
         snapshot: OptimizationSnapshot,
         method_directory: Path,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         if snapshot.state is None:
-            return self._state_path(snapshot.state_filename, method_directory)
+            state_path = self._state_path(snapshot.state_filename, method_directory)
+            if state_path is None:
+                return None, None
+            if not Path(state_path).is_file():
+                raise ValueError("state filename must reference an existing file")
+            return state_path, sha256_file(state_path)
         if snapshot.state_filename is not None:
             raise ValueError("state payload uses the runner-managed state path")
         state_id = stable_state_id(job, snapshot.checkpoint)
         state_path = method_directory / "states" / f"{state_id}.pt"
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = state_path.with_suffix(".tmp")
-        torch.save(snapshot.state, temporary_path)
-        temporary_path.replace(state_path)
-        return str(state_path)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{state_path.name}.", suffix=".tmp", dir=state_path.parent
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        try:
+            torch.save(snapshot.state, temporary_path)
+            state_sha256 = sha256_file(temporary_path)
+            try:
+                # link(2) publishes atomically without replacing another worker's state.
+                os.link(temporary_path, state_path)
+            except FileExistsError:
+                if sha256_file(state_path) != state_sha256:
+                    raise ValueError("existing checkpoint state has different bytes")
+            return str(state_path), sha256_file(state_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def stable_state_id(job: OptimizationJob, checkpoint: int) -> str:

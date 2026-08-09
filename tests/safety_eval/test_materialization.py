@@ -12,11 +12,12 @@ from benchmark.safety_eval.materialization import (
     materialize_checkpoint,
     meets_semantic_threshold,
     materialize_continuous_state,
-    materialize_v2_candidate,
+    vocabulary_embedding_sha256,
 )
 from benchmark.safety_eval.objective import EditableState
 from benchmark.safety_eval.prompt_contract import TokenizedEditablePrompt
-from benchmark.safety_eval.schema import FailureKind, MaterializationRecord, RecordStatus
+from benchmark.safety_eval.schema import FailureKind, MaterializationRecord, RecordStatus, TransportType, V2MaterializationRecord
+from benchmark.safety_eval.io import canonical_hash
 
 
 def _state() -> EditableState:
@@ -46,135 +47,18 @@ def test_materializer_projects_both_editable_blocks_independently() -> None:
     assert materialize_continuous_state(changed_u, vocabulary).seed_token_ids != baseline.seed_token_ids
 
 
+def test_vocabulary_embedding_sha256_binds_tensor_shape_dtype_and_values() -> None:
+    baseline = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    assert vocabulary_embedding_sha256(baseline) == vocabulary_embedding_sha256(baseline.clone())
+    assert vocabulary_embedding_sha256(baseline) != vocabulary_embedding_sha256(baseline.to(torch.bfloat16))
+    assert vocabulary_embedding_sha256(baseline) != vocabulary_embedding_sha256(baseline[:, :1])
+
+
 def test_materializer_rejects_forbidden_projection_ids() -> None:
     vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     with pytest.raises(ValueError, match="no allowed vocabulary"):
         materialize_continuous_state(_state(), vocabulary, forbidden_token_ids=(0, 1))
-
-
-def test_materializer_projects_both_blocks_only_into_explicit_allowed_ids() -> None:
-    vocabulary = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
-
-    materialization = materialize_continuous_state(
-        _state(), vocabulary, allowed_token_ids=(1, 3)
-    )
-
-    assert materialization.prefix_token_ids == (1,)
-    assert materialization.seed_token_ids == (3,)
-
-
-@pytest.mark.parametrize("allowed_token_ids", [(), (4,), (1, 1)])
-def test_materializer_rejects_invalid_explicit_allowed_token_ids(
-    allowed_token_ids: tuple[int, ...],
-) -> None:
-    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-
-    with pytest.raises(ValueError, match="allowed token"):
-        materialize_continuous_state(
-            _state(), vocabulary, allowed_token_ids=allowed_token_ids
-        )
-
-
-def test_materializer_projects_distinct_position_masks_for_both_blocks() -> None:
-    vocabulary = torch.tensor(
-        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
-    )
-    state = EditableState(
-        z=torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]]),
-        u=torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]]),
-        z0=torch.zeros(1, 2, 2),
-        u0=torch.zeros(1, 2, 2),
-    )
-
-    materialization = materialize_continuous_state(
-        state,
-        vocabulary,
-        prefix_allowed_token_ids_by_position=((1,), (2, 3)),
-        seed_allowed_token_ids_by_position=((0, 1), (3,)),
-    )
-
-    assert materialization.prefix_token_ids == (1, 2)
-    assert materialization.seed_token_ids == (0, 3)
-
-
-@pytest.mark.parametrize(
-    "position_masks",
-    [
-        {"prefix_allowed_token_ids_by_position": ((0,),)},
-        {"seed_allowed_token_ids_by_position": ((1,),)},
-    ],
-)
-def test_materializer_rejects_global_and_position_mask_conflicts(
-    position_masks: dict[str, tuple[tuple[int, ...], ...]],
-) -> None:
-    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-
-    with pytest.raises(ValueError, match="global and position"):
-        materialize_continuous_state(
-            _state(), vocabulary, allowed_token_ids=(0, 1), **position_masks
-        )
-
-
-@pytest.mark.parametrize(
-    "position_masks",
-    [
-        {"prefix_allowed_token_ids_by_position": ((0,),)},
-        {"seed_allowed_token_ids_by_position": ((1,),)},
-    ],
-)
-def test_materializer_requires_position_masks_for_both_blocks(
-    position_masks: dict[str, tuple[tuple[int, ...], ...]],
-) -> None:
-    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-
-    with pytest.raises(ValueError, match="both prefix and seed"):
-        materialize_continuous_state(_state(), vocabulary, **position_masks)
-
-
-@pytest.mark.parametrize(
-    "position_masks",
-    [
-        {
-            "prefix_allowed_token_ids_by_position": ((0,), (1,)),
-            "seed_allowed_token_ids_by_position": ((1,),),
-        },
-        {
-            "prefix_allowed_token_ids_by_position": ((0,),),
-            "seed_allowed_token_ids_by_position": ((1,), (0,)),
-        },
-    ],
-)
-def test_materializer_rejects_wrong_position_mask_count(
-    position_masks: dict[str, tuple[tuple[int, ...], ...]],
-) -> None:
-    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-
-    with pytest.raises(ValueError, match="position mask count"):
-        materialize_continuous_state(_state(), vocabulary, **position_masks)
-
-
-@pytest.mark.parametrize(
-    ("invalid_mask", "error"),
-    [
-        ((), "must not be empty"),
-        ((0, 0), "must be unique"),
-        ((2,), "must be in range"),
-        ((1,), "must not be forbidden"),
-    ],
-)
-def test_materializer_rejects_invalid_position_masks(
-    invalid_mask: tuple[int, ...], error: str
-) -> None:
-    vocabulary = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-
-    with pytest.raises(ValueError, match=error):
-        materialize_continuous_state(
-            _state(),
-            vocabulary,
-            forbidden_token_ids=(1,),
-            prefix_allowed_token_ids_by_position=(invalid_mask,),
-            seed_allowed_token_ids_by_position=((0,),),
-        )
 
 
 def test_discrete_candidate_builds_a_complete_strict_materialization_record() -> None:
@@ -294,43 +178,82 @@ class _Tokenizer:
         return " ".join(f"token-{token_id}" for token_id in token_ids if token_id != 0)
 
 
-class _RecordingV2Tokenizer:
-    all_special_ids: list[int] = []
+def test_v2_materialization_scatters_u_and_decodes_complete_sequence_once() -> None:
+    class RecordingTokenizer:
+        all_special_ids: list[int] = []
 
-    def __init__(self) -> None:
-        self.decode_calls: list[tuple[int, ...]] = []
+        def __init__(self) -> None:
+            self.decode_calls: list[tuple[int, ...]] = []
 
-    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
-        assert skip_special_tokens is False
-        self.decode_calls.append(tuple(token_ids))
-        return "decoded prompt"
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+            assert skip_special_tokens is True
+            self.decode_calls.append(tuple(token_ids))
+            return "decoded"
 
-
-def test_v2_materialization_replaces_u_in_place_and_decodes_once() -> None:
-    tokenizer = _RecordingV2Tokenizer()
     prompt = TokenizedEditablePrompt(
-        full_text="fixture",
+        full_text="abcd",
         base_token_ids=torch.tensor([[10, 11, 12, 13]]),
         attention_mask=torch.ones((1, 4), dtype=torch.long),
         editable_positions=(1, 3),
         frozen_positions=(0, 2),
         token_offsets=((0, 1), (1, 2), (2, 3), (3, 4)),
-        boundary_expansions=((1, 2), (3, 4)),
+        boundary_expansions=((1, 2),),
         tokenizer_revision="fixture-r1",
     )
+    tokenizer = RecordingTokenizer()
 
-    result = materialize_v2_candidate(
+    result = materialization_module.materialize_v2_candidate(
         candidate=DiscreteCandidate(prefix_token_ids=(20, 21), seed_token_ids=(30, 31)),
         prompt=prompt,
         tokenizer=tokenizer,
-        special_token_ids=(),
     )
 
     assert result.reconstructed_base_token_ids == (10, 30, 12, 31)
     assert result.complete_token_ids == (20, 21, 10, 30, 12, 31)
-    assert result.frozen_positions_unchanged is True
-    assert result.text == "decoded prompt"
     assert tokenizer.decode_calls == [(20, 21, 10, 30, 12, 31)]
+    assert result.frozen_positions_unchanged is True
+
+
+def test_v2_materialization_record_rejects_embedding_transport_and_tampered_hash() -> None:
+    payload = {
+        "schema_version": "reviewer_eval.v2", "run_id": "run:fixture", "config_hash": "a" * 64,
+        "sample_id": "s:1", "source": "s", "method": "method", "branch": "method", "step": 100,
+        "transport": TransportType.text, "state_sha256": "b" * 64, "surrogate_tokenizer_sha256": "c" * 64, "surrogate_embedding_sha256": "d" * 64,
+        "editable_positions": (1,), "original_token_ids": (3, 4), "projected_z_token_ids": (7,),
+        "projected_u_token_ids": (8,), "reconstructed_base_token_ids": (3, 8), "complete_token_ids": (7, 3, 8),
+        "frozen_positions_unchanged": True, "span_boundary_expansions": ((0, 1),),
+        "full_prompt_similarity": 0.5, "editable_span_similarity": 0.0, "flat_prompt": "fixture",
+        "status": RecordStatus.complete, "failure_kind": None, "failure_reason": None,
+    }
+    record = V2MaterializationRecord.model_validate({
+        **payload, "materialization_sha256": canonical_hash(payload),
+    })
+    assert record.materialization_sha256 == canonical_hash(payload)
+
+    with pytest.raises(ValueError, match="text transport"):
+        V2MaterializationRecord.model_validate({**record.model_dump(mode="json"), "transport": TransportType.embedding})
+    with pytest.raises(ValueError, match="materialization sha256"):
+        V2MaterializationRecord.model_validate({**record.model_dump(mode="json"), "flat_prompt": "tampered"})
+
+
+def test_v2_materialization_rejects_special_projection_and_invalid_batches() -> None:
+    prompt = TokenizedEditablePrompt(
+        full_text="ab", base_token_ids=torch.tensor([[1, 2]]),
+        attention_mask=torch.ones((1, 2), dtype=torch.long), editable_positions=(1,),
+        frozen_positions=(0,), token_offsets=((0, 1), (1, 2)),
+        boundary_expansions=((1, 2),), tokenizer_revision="fixture",
+    )
+    result = materialization_module.materialize_v2_candidate(
+            candidate=ContinuousCandidate(
+                state=EditableState(torch.tensor([[[1.0, 0.0]]]), torch.tensor([[[1.0, 0.0]]]), torch.zeros(1, 1, 2), torch.zeros(1, 1, 2)),
+                vocabulary_embeddings=torch.eye(2),
+            ), prompt=prompt, tokenizer=_Tokenizer(), special_token_ids=(0,),
+        )
+    assert 0 not in result.projected_z_token_ids + result.projected_u_token_ids
+    with pytest.raises(ValueError, match="batch size 1"):
+        materialization_module.materialize_continuous_state(
+            EditableState(torch.ones(2, 1, 2), torch.ones(2, 1, 2), torch.ones(2, 1, 2), torch.ones(2, 1, 2)), torch.eye(2)
+        )
 
 
 def test_materialize_checkpoint_prefers_discrete_token_ids_and_retains_checkpoint_identity() -> None:

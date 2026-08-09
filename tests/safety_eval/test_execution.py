@@ -13,6 +13,7 @@ import pytest
 import torch
 from torch import nn
 
+import benchmark.safety_eval.execution as execution
 from benchmark.safety_eval.execution import (
     ExecutionError,
     ExecutionMode,
@@ -33,16 +34,23 @@ def test_tensor_recovery_sdpa_method_resolves_to_o_plus() -> None:
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_eager_retry") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_checkpointed") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_rebalanced") == "jailbound_o_plus"
-    assert tensor_method_for_recovery("jailbound_o_plus_recovery_cpu_offload") == "jailbound_o_plus"
-    assert tensor_method_for_recovery("jailbound_o_plus_recovery_two_gpu") == "jailbound_o_plus"
-    assert tensor_method_for_recovery("jailbound_o_plus_recovery_two_gpu_checkpointed") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_fd") == "jailbound_o_plus"
     assert tensor_method_for_recovery("jailbound_o_plus_recovery_fd_sdpa") == "jailbound_o_plus"
-from benchmark.safety_eval.io import read_jsonl
-from benchmark.safety_eval.manifest import write_controlled_manifest
-from benchmark.safety_eval.runner import OptimizationJob, OptimizationSnapshot
+from benchmark.safety_eval.io import read_jsonl, sha256_file
+from benchmark.safety_eval.materialization import vocabulary_embedding_sha256
+from benchmark.safety_eval.manifest import write_controlled_manifest, write_v2_controlled_manifest
+from benchmark.safety_eval.runner import OptimizationJob, OptimizationRunner, OptimizationSnapshot
 from benchmark.safety_eval.runtime import ResolvedModel
-from benchmark.safety_eval.schema import BenchmarkExample, ComputeCounters, FailureKind, RecordStatus
+from benchmark.safety_eval.runtime import PreflightError
+from benchmark.safety_eval.objective import EditableState
+from benchmark.safety_eval.schema import (
+    BenchmarkExample,
+    ComputeCounters,
+    FailureKind,
+    OptimizationRecord,
+    RecordStatus,
+    V2BenchmarkExample,
+)
 
 
 def _example(index: int) -> BenchmarkExample:
@@ -99,6 +107,45 @@ def _request(tmp_path: Path) -> ExecutionRequest:
         requested_limit=1,
         seed=20260725,
     )
+
+
+def _v2_request(tmp_path: Path) -> ExecutionRequest:
+    request = _request(tmp_path)
+    for path in (request.output_root / "manifests").glob("controlled_fixture.*"):
+        path.unlink()
+    write_v2_controlled_manifest(
+        request.output_root,
+        "fixture",
+        (_v2_example_with_middle_span(),),
+        source_file_sha256="a" * 64,
+        config_hash="b" * 64,
+    )
+    return replace(request, schema_version="reviewer_eval.v2")
+
+
+def test_direct_v2_run_execution_rejects_a_mixed_legacy_optimization_ledger(
+    tmp_path: Path,
+) -> None:
+    request = _v2_request(tmp_path)
+    records = request.output_root / "optimization" / "fixture" / "fixture_method" / "records.jsonl"
+    records.parent.mkdir(parents=True)
+    valid = OptimizationRecord(
+        schema_version="reviewer_eval.v2", run_id="run:fixture", config_hash="b" * 64,
+        git_revision="fixture", cell_id="cell:fixture", sample_id="fixture:001",
+        source="fixture", method="fixture_method", checkpoint=0, random_seed=1,
+        status=RecordStatus.failed, failure_kind=FailureKind.compatibility,
+        failure_reason="fixture", state_path=None, state_sha256=None,
+        representation="unavailable", attack_loss=None, fol=None, internal_margin=None,
+        materialized_prompt=None, counters=ComputeCounters(),
+    )
+    records.write_text(
+        json.dumps(valid.model_dump(mode="json")) + "\n"
+        '{"schema_version":"reviewer_eval.v1"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PreflightError, match="schema-v1 artifact"):
+        run_execution(request, mode=ExecutionMode.dry_run)
 
 
 def test_dry_run_validates_offline_assets_and_selects_locked_manifest_without_loading_model(tmp_path: Path) -> None:
@@ -527,46 +574,6 @@ def test_two_gpu_recovery_map_splits_transformer_layers_evenly(tmp_path: Path) -
     assert mapping["model.layers.27"] == "cpu"
 
 
-def test_h1_v2_cpu_offload_recovery_map_keeps_edge_layers_on_visible_gpu(monkeypatch, tmp_path: Path) -> None:
-    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run_h1_v2_candidate_optimization.py"
-    monkeypatch.syspath_prepend(str(script_path.parent))
-    spec = importlib.util.spec_from_file_location("h1_v2_candidate_optimization", script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 28}), encoding="utf-8")
-
-    mapping = module._cpu_offload_recovery_device_map(tmp_path)
-
-    assert sum(key.startswith("model.layers.") and value == 0 for key, value in mapping.items()) == 14
-    assert sum(key.startswith("model.layers.") and value == "cpu" for key, value in mapping.items()) == 14
-    assert mapping["model.embed_tokens"] == 0
-    assert mapping["model.layers.6"] == 0
-    assert mapping["model.layers.7"] == "cpu"
-    assert mapping["model.layers.20"] == "cpu"
-    assert mapping["model.layers.21"] == 0
-    assert mapping["model.norm"] == 0
-    assert mapping["lm_head"] == 0
-
-
-def test_h1_v2_baseline_shards_are_disjoint_and_cover_sorted_ids(monkeypatch) -> None:
-    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run_h1_v2_baseline_generation.py"
-    monkeypatch.syspath_prepend(str(script_path.parent))
-    spec = importlib.util.spec_from_file_location("h1_v2_baseline_generation", script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    ids = ("source:c", "source:a", "source:b", "source:d", "source:e")
-    first = module._select_shard_ids(ids, shard_index=0, shard_count=2)
-    second = module._select_shard_ids(ids, shard_index=1, shard_count=2)
-
-    assert first == ("source:a", "source:c", "source:e")
-    assert second == ("source:b", "source:d")
-    assert set(first).isdisjoint(second)
-
-
 def test_smoke_closes_loaded_local_qwen_handle_after_runner_writes_records(tmp_path: Path) -> None:
     request = _request(tmp_path)
     model = _FakeModel()
@@ -596,24 +603,136 @@ def test_smoke_closes_loaded_local_qwen_handle_after_runner_writes_records(tmp_p
 
 
 class _TensorTokenizer:
-    def __call__(
-        self,
-        _: str,
-        *,
-        return_tensors: str,
-        add_special_tokens: bool,
-        max_length: int | None = None,
-        truncation: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        assert return_tensors == "pt"
-        assert add_special_tokens is True
-        assert max_length in {None, 256}
-        assert truncation is (max_length == 256)
+    all_special_ids = [0, 6, 7]
+
+    def __call__(self, text: str, **kwargs: object) -> dict[str, torch.Tensor | list[tuple[int, int]]]:
+        if kwargs == {"return_offsets_mapping": True}:
+            assert text == "aa PAYLOAD zz"
+            return {
+                "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "offset_mapping": [(0, 2), (3, 6), (6, 10), (11, 13)],
+            }
+        assert kwargs == {"return_tensors": "pt", "add_special_tokens": True}
         return {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
 
     def encode(self, value: str, *, add_special_tokens: bool) -> list[int]:
         assert add_special_tokens is False
         return [1 if value == "answer" else 2]
+
+
+class _OffsetTensorTokenizer(_TensorTokenizer):
+    def __call__(self, text: str, **kwargs: object) -> dict[str, torch.Tensor | list[tuple[int, int]]]:
+        if kwargs == {"return_offsets_mapping": True}:
+            assert text == "aa PAYLOAD zz"
+            return {
+                "input_ids": torch.tensor([[10, 11, 12, 13]], dtype=torch.long),
+                "attention_mask": torch.ones((1, 4), dtype=torch.long),
+                "offset_mapping": [(0, 2), (3, 6), (6, 10), (11, 13)],
+            }
+        return super().__call__(text, **kwargs)  # type: ignore[arg-type]
+
+    def encode(self, value: str, *, add_special_tokens: bool) -> list[int]:
+        assert add_special_tokens is False
+        return {"!": [7], "answer": [41, 42, 43], "refusal": [51, 52]}[value]
+
+
+def _v2_example_with_middle_span() -> V2BenchmarkExample:
+    example = _example(1)
+    return V2BenchmarkExample.model_validate(
+        {
+            **example.model_dump(mode="json"),
+            "schema_version": "reviewer_eval.v2",
+            "intent_sha256": "b" * 64,
+            "editable_spans": [
+                {
+                    "start": 3,
+                    "end": 10,
+                    "quote": "PAYLOAD",
+                    "role": "harmful_payload",
+                    "confidence": 1.0,
+                    "rationale": "fixture",
+                }
+            ],
+            "annotator_model": "fixture",
+            "annotator_revision": "fixture-r1",
+            "annotation_template_sha256": "c" * 64,
+            "annotation_response_sha256": "d" * 64,
+            "annotation_confidence": 1.0,
+            "attack_text": "aa PAYLOAD zz",
+            "prompt_sha256": hashlib.sha256(b"aa PAYLOAD zz").hexdigest(),
+        }
+    )
+
+
+def test_tensor_executor_uses_annotated_middle_span_and_full_anchor_sequences(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class RecordingObjective:
+        forward_passes_per_evaluation = 1
+
+        def __init__(self, _model: object, **kwargs: object) -> None:
+            observed.update(kwargs)
+
+        def build_editable_state(self, z_ids: torch.Tensor, *_legacy: torch.Tensor) -> EditableState:
+            observed["z_ids"] = z_ids.detach().clone()
+            return EditableState(
+                z=torch.zeros((1, z_ids.shape[1], 3), requires_grad=True),
+                u=torch.zeros((1, 2, 3), requires_grad=True),
+                z0=torch.zeros((1, z_ids.shape[1], 3)),
+                u0=torch.zeros((1, 2, 3)),
+            )
+
+    class RecordingOptimizer:
+        def run(self, _objective: object, state: EditableState, *_args: object) -> list[object]:
+            observed["initial_state"] = state
+            return []
+
+    monkeypatch.setattr(execution, "TransformerAttackObjective", RecordingObjective)
+    monkeypatch.setattr(execution, "_tensor_optimizer", lambda *_args: RecordingOptimizer())
+    handle = LocalQwenHandle(tokenizer=_OffsetTensorTokenizer(), model=_TinyTensorCausalModel())
+    job = OptimizationJob("fixture", "zol", "cell:fixture", "fixture:001", 1)
+
+    assert list(execution._run_local_qwen_tensor(handle, _v2_example_with_middle_span(), job, (0, 1, 2), _tensor_settings())) == []
+    prompt = observed["prompt"]
+    assert prompt.editable_positions == (1, 2)
+    assert tuple(ids.tolist() for ids in observed["answer_anchor_ids"]) == ([41, 42, 43],)
+    assert tuple(ids.tolist() for ids in observed["refusal_anchor_ids"]) == ([51, 52],)
+
+
+@pytest.mark.parametrize("method", ("pez", "gbda", "gcg"))
+def test_tensor_baseline_optimizers_receive_all_tokenizer_special_ids(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    observed: list[tuple[str, tuple[int, ...]]] = []
+
+    class RecordingOptimizer:
+        def run(self, *_args: object) -> list[object]:
+            return []
+
+    def build_recording_optimizer(
+        selected_method: str,
+        _settings: TensorOptimizationSettings,
+        _embedding: torch.Tensor,
+        _z_ids: torch.Tensor,
+        _u_ids: torch.Tensor,
+        forbidden_token_ids: tuple[int, ...],
+    ) -> RecordingOptimizer:
+        observed.append((selected_method, forbidden_token_ids))
+        return RecordingOptimizer()
+
+    monkeypatch.setattr(execution, "_baseline_optimizer", build_recording_optimizer)
+    handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
+    job = OptimizationJob("fixture", method, "cell:fixture", "fixture:001", 1)
+
+    assert list(
+        execution._run_local_qwen_tensor(
+            handle, _v2_example_with_middle_span(), job, (0, 1, 2), _tensor_settings()
+        )
+    ) == []
+    assert observed == [(method, (0, 6, 7))]
 
 
 class _TinyTensorCausalModel(nn.Module):
@@ -646,7 +765,6 @@ def _tensor_settings(*, checkpoints: tuple[int, ...] = (0, 1, 2)) -> TensorOptim
         dual_branch_updates={"o_minus": 1, "o_plus": 1},
         candidate_cap=3,
         prefix_tokens=2,
-        editable_seed_tokens=2,
         learning_rate=0.01,
         lambda_fol=0.1,
         epsilon=0.1,
@@ -670,7 +788,7 @@ def test_tensor_settings_enable_finite_difference_fol_only_when_requested() -> N
 
 
 def test_tensor_smoke_zol_maps_optimizer_snapshots_to_runner_records_and_closes_model(tmp_path: Path) -> None:
-    request = replace(_request(tmp_path), method="zol", checkpoints=(0, 1, 2))
+    request = replace(_v2_request(tmp_path), method="zol", checkpoints=(0, 1, 2))
     model = _TinyTensorCausalModel()
     handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=model)
 
@@ -696,8 +814,11 @@ def test_tensor_smoke_zol_maps_optimizer_snapshots_to_runner_records_and_closes_
 
 
 def test_tensor_smoke_persists_content_free_checkpoint_state(tmp_path: Path) -> None:
-    request = replace(_request(tmp_path), method="pez", checkpoints=(0, 1, 2))
+    request = replace(_v2_request(tmp_path), method="pez", checkpoints=(0, 1, 2))
     handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
+    expected_embedding_sha256 = vocabulary_embedding_sha256(
+        handle.model.get_input_embeddings().weight
+    )
 
     run_execution(
         request,
@@ -710,10 +831,90 @@ def test_tensor_smoke_persists_content_free_checkpoint_state(tmp_path: Path) -> 
     paths = [Path(row["state_path"]) for row in rows]
     assert all(path.is_file() for path in paths)
     payload = torch.load(paths[-1], weights_only=True)
-    assert set(payload) == {"u", "u_token_ids", "z", "z_token_ids"}
+    assert set(payload) == {
+        "base_token_ids",
+        "editable_positions",
+            "editable_span_hashes",
+            "input_embedding_sha256",
+            "tokenizer_revision",
+        "u",
+        "u_token_ids",
+        "z",
+        "z_token_ids",
+    }
+    assert payload["input_embedding_sha256"] == expected_embedding_sha256
+    assert payload["base_token_ids"].tolist() == [[1, 2, 3, 4]]
+    assert payload["editable_positions"].tolist() == [1, 2]
+    assert payload["tokenizer_revision"] == "local-tokenizer"
+    assert len(payload["editable_span_hashes"]) == 1
     assert payload["z"].ndim == 3
     assert payload["u"].ndim == 3
     assert payload["z_token_ids"].ndim == payload["u_token_ids"].ndim == 2
+
+
+def test_run_execution_rejects_v2_success_snapshot_without_persisted_embedding_state(tmp_path: Path) -> None:
+    request = replace(_v2_request(tmp_path), checkpoints=(0,), method="init")
+
+    summary = run_execution(
+        request,
+        mode=ExecutionMode.smoke,
+        model_loader=lambda _: object(),
+        executor=lambda *_: [OptimizationSnapshot(
+            checkpoint=0,
+            representation="fixture",
+            attack_loss=None,
+            counters=ComputeCounters(),
+        )],
+    )
+
+    rows = read_jsonl(request.output_root / "optimization" / "fixture" / "init" / "records.jsonl")
+    assert summary.completed_records == 0
+    assert summary.failed_records == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["state_path"] is None
+
+
+def test_local_qwen_init_executor_rejects_v2_examples() -> None:
+    job = OptimizationJob(
+        source="fixture", method="init", cell_id="cell:fixture", sample_id="fixture:001", random_seed=1,
+    )
+    with pytest.raises(ExecutionError, match="v1 manifests only"):
+        list(local_qwen_init_executor(LocalQwenHandle(tokenizer=object(), model=object()), _v2_example_with_middle_span(), job, (0,)))
+
+
+def test_runner_records_sha256_of_persisted_state(tmp_path: Path) -> None:
+    runner = OptimizationRunner(
+        tmp_path,
+        config_hash="a" * 64,
+        run_id="run:fixture",
+        git_revision="fixture-revision",
+        schema_version="reviewer_eval.v2",
+    )
+    job = OptimizationJob(
+        source="fixture",
+        method="pez",
+        cell_id="cell:fixture",
+        sample_id="fixture:001",
+        random_seed=1,
+    )
+
+    def snapshots(_: tuple[int, ...]):
+        yield OptimizationSnapshot(
+            checkpoint=0,
+            representation="tensor_embeddings:pez",
+            attack_loss=0.0,
+            counters=ComputeCounters(),
+                state={
+                    "z": torch.zeros((1, 1, 2)),
+                    "u": torch.zeros((1, 1, 2)),
+                    "input_embedding_sha256": "b" * 64,
+                },
+        )
+
+    record = runner.run(job, checkpoints=(0,), snapshot_factory=snapshots)[0]
+
+    assert record.state_path is not None
+    assert record.state_sha256 == sha256_file(record.state_path)
 
 
 def test_tensor_smoke_supports_budgeted_random_mutation_without_text_output() -> None:
@@ -723,59 +924,27 @@ def test_tensor_smoke_supports_budgeted_random_mutation_without_text_output() ->
     handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
 
     snapshots = list(
-        executor(handle, _example(1), OptimizationJob("fixture", "random_mutation", "cell:fixture", "fixture:001", 9), (0, 25, 50, 100))
+        executor(handle, _v2_example_with_middle_span(), OptimizationJob("fixture", "random_mutation", "cell:fixture", "fixture:001", 9), (0, 25, 50, 100))
     )
 
     assert [snapshot.checkpoint for snapshot in snapshots] == [0, 25, 50, 100]
     assert [snapshot.counters.updates for snapshot in snapshots] == [0, 25, 50, 100]
-    assert [snapshot.counters.forward_passes for snapshot in snapshots] == [2, 52, 102, 202]
+    assert [snapshot.counters.forward_passes for snapshot in snapshots] == [1, 26, 51, 101]
     assert snapshots[-1].counters.candidates_attempted == 100
     assert all(snapshot.representation == "tensor_embeddings:random_mutation" for snapshot in snapshots)
 
 
-@pytest.mark.parametrize("method", ["pez", "gbda", "gbda_official", "gcg"])
+@pytest.mark.parametrize("method", ["pez", "gbda", "gcg"])
 def test_tensor_smoke_dispatches_discrete_and_continuous_baselines(method: str) -> None:
-    settings = replace(_tensor_settings(), candidate_cap=120)
-    executor = build_local_qwen_tensor_executor(settings)
+    executor = build_local_qwen_tensor_executor(_tensor_settings())
     handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
 
-    snapshots = list(executor(handle, _example(1), OptimizationJob("fixture", method, "cell:fixture", "fixture:001", 1), (0, 1, 2)))
+    snapshots = list(executor(handle, _v2_example_with_middle_span(), OptimizationJob("fixture", method, "cell:fixture", "fixture:001", 1), (0, 1, 2)))
 
     assert [snapshot.checkpoint for snapshot in snapshots] == [0, 1, 2]
     assert {snapshot.representation for snapshot in snapshots} == {f"tensor_embeddings:{method}"}
     assert all(snapshot.attack_loss is not None for snapshot in snapshots)
     assert all(snapshot.fol is None for snapshot in snapshots)
-
-
-def test_official_gbda_uses_the_upstream_256_token_input_limit() -> None:
-    calls: list[dict[str, object]] = []
-
-    class RecordingTokenizer(_TensorTokenizer):
-        def __call__(self, value: str, **kwargs: object) -> dict[str, torch.Tensor]:
-            calls.append(dict(kwargs))
-            return {"input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long)}
-
-    settings = replace(_tensor_settings(), candidate_cap=120)
-    executor = build_local_qwen_tensor_executor(settings)
-    handle = LocalQwenHandle(tokenizer=RecordingTokenizer(), model=_TinyTensorCausalModel())
-
-    list(
-        executor(
-            handle,
-            _example(1),
-            OptimizationJob("fixture", "gbda_official", "cell:fixture", "fixture:001", 1),
-            (0, 1, 2),
-        )
-    )
-
-    assert calls == [
-        {
-            "return_tensors": "pt",
-            "add_special_tokens": True,
-            "max_length": 256,
-            "truncation": True,
-        }
-    ]
 
 
 def test_tensor_smoke_dispatches_dual_branch_and_rejects_unknown_method() -> None:
@@ -784,7 +953,7 @@ def test_tensor_smoke_dispatches_dual_branch_and_rejects_unknown_method() -> Non
     executor = build_local_qwen_tensor_executor(_tensor_settings())
     dual_job = OptimizationJob("fixture", "dual_branch", "cell:fixture", "fixture:001", 1)
 
-    snapshots = list(executor(handle, _example(1), dual_job, (0, 1, 2)))
+    snapshots = list(executor(handle, _v2_example_with_middle_span(), dual_job, (0, 1, 2)))
 
     assert [snapshot.checkpoint for snapshot in snapshots] == [0, 1, 2]
     assert all(snapshot.fol is not None for snapshot in snapshots)
@@ -801,7 +970,7 @@ def test_tensor_smoke_init_uses_transformer_objective_at_checkpoint_zero_only() 
     handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
     job = OptimizationJob("fixture", "init", "cell:fixture", "fixture:001", 1)
 
-    snapshots = list(executor(handle, _example(1), job, (0,)))
+    snapshots = list(executor(handle, _v2_example_with_middle_span(), job, (0,)))
 
     assert len(snapshots) == 1
     assert snapshots[0].checkpoint == 0
@@ -817,7 +986,7 @@ def test_tensor_smoke_supports_each_fol_branch_with_fake_model(method: str) -> N
     handle = LocalQwenHandle(tokenizer=_TensorTokenizer(), model=_TinyTensorCausalModel())
     job = OptimizationJob("fixture", method, "cell:fixture", "fixture:001", 1)
 
-    snapshots = list(executor(handle, _example(1), job, (0, 1, 2)))
+    snapshots = list(executor(handle, _v2_example_with_middle_span(), job, (0, 1, 2)))
 
     assert [snapshot.checkpoint for snapshot in snapshots] == [0, 1, 2]
     assert all(snapshot.fol is not None for snapshot in snapshots)

@@ -182,7 +182,9 @@ def _run_smoke(
             dual_branch_updates=dict(config.optimization.dual_branch_updates),
             candidate_cap=config.optimization.candidate_cap,
             prefix_tokens=config.optimization.prefix_tokens,
-            editable_seed_tokens=config.optimization.editable_seed_tokens,
+            prefix_token_text=getattr(
+                getattr(config.optimization, "prefix_initialization", None), "token_text", "!"
+            ),
             learning_rate=config.optimization.learning_rate,
             lambda_fol=config.optimization.lambda_fol,
             epsilon=config.optimization.epsilon,

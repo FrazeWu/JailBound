@@ -50,7 +50,9 @@ def _settings(config: object, *, finite_difference_fol: bool = False) -> TensorO
         dual_branch_updates=dict(optimization.dual_branch_updates),
         candidate_cap=optimization.candidate_cap,
         prefix_tokens=optimization.prefix_tokens,
-        editable_seed_tokens=optimization.editable_seed_tokens,
+        prefix_token_text=getattr(
+            getattr(optimization, "prefix_initialization", None), "token_text", "!"
+        ),
         learning_rate=optimization.learning_rate,
         lambda_fol=optimization.lambda_fol,
         epsilon=optimization.epsilon,

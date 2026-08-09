@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from enum import StrEnum
-import hashlib
 from typing import Annotated, Any, Literal, Mapping, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -37,15 +36,16 @@ class FailureKind(StrEnum):
     transport = "transport"
 
 
-class EditableSpanRole(StrEnum):
-    seed_intent = "seed_intent"
-    harmful_payload = "harmful_payload"
-    attack_instruction = "attack_instruction"
-
-
 def stable_id(prefix: str, payload: object) -> str:
     """Return a compact, reproducible identifier for a canonical payload."""
     return f"{prefix}:{canonical_hash(payload)[:20]}"
+
+
+def token_ids_sha256(token_ids: tuple[int, ...]) -> str:
+    """Hash the exact v2 discrete-token transport payload."""
+    if any(not isinstance(token_id, int) or token_id < 0 for token_id in token_ids):
+        raise ValueError("token IDs must be non-negative integers")
+    return canonical_hash({"complete_token_ids": token_ids})
 
 
 class StrictRecord(BaseModel):
@@ -88,23 +88,6 @@ class StrictRecord(BaseModel):
         return self
 
 
-class EditableSpan(StrictRecord):
-    start: int
-    end: int
-    quote: str
-    role: EditableSpanRole
-    confidence: float = Field(ge=0.0, le=1.0)
-    rationale: str
-
-    @model_validator(mode="after")
-    def validate_bounds(self) -> "EditableSpan":
-        if self.start < 0 or self.end <= self.start or not self.quote:
-            raise ValueError("editable span requires non-empty ordered bounds")
-        if not self.rationale.strip():
-            raise ValueError("editable span requires a rationale")
-        return self
-
-
 class BenchmarkExample(StrictRecord):
     example_id: str
     source: str
@@ -126,10 +109,36 @@ class BenchmarkExample(StrictRecord):
     preprocessing: tuple[str, ...]
 
 
+class EditableSpanRole(StrEnum):
+    seed_intent = "seed_intent"
+    harmful_payload = "harmful_payload"
+    attack_instruction = "attack_instruction"
+
+
+class EditableSpan(StrictRecord):
+    start: int = Field(ge=0)
+    end: int
+    quote: str = Field(min_length=1)
+    role: EditableSpanRole
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "EditableSpan":
+        if self.end <= self.start:
+            raise ValueError("editable span end must be greater than start")
+        return self
+
+
+class TransportType(StrEnum):
+    text = "text"
+    embedding = "embedding"
+
+
 class V2BenchmarkExample(BenchmarkExample):
     schema_version: Literal["reviewer_eval.v2"]
     intent_sha256: Sha256
-    editable_spans: tuple[EditableSpan, ...]
+    editable_spans: tuple[EditableSpan, ...] = Field(min_length=1)
     annotator_model: str
     annotator_revision: str
     annotation_template_sha256: Sha256
@@ -137,24 +146,22 @@ class V2BenchmarkExample(BenchmarkExample):
     annotation_confidence: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
-    def validate_annotation(self) -> "V2BenchmarkExample":
-        if not self.editable_spans:
-            raise ValueError("v2 examples require editable spans")
-        previous_end = -1
-        for span in self.editable_spans:
-            if span.start < previous_end:
+    def validate_editable_spans(self) -> "V2BenchmarkExample":
+        previous_end = 0
+        for index, span in enumerate(self.editable_spans):
+            if span.end > len(self.attack_text):
+                raise ValueError("editable span end must be within attack_text")
+            if self.attack_text[span.start : span.end] != span.quote:
+                raise ValueError("editable span quote must exactly match attack_text")
+            if index and span.start < previous_end:
                 raise ValueError("editable spans must be ordered and non-overlapping")
-            if span.end > len(self.attack_text) or self.attack_text[span.start : span.end] != span.quote:
-                raise ValueError("editable span quote does not match attack_text")
             previous_end = span.end
-        if self.annotation_confidence != min(span.confidence for span in self.editable_spans):
-            raise ValueError("annotation confidence must equal minimum span confidence")
-        if not self.annotator_model.strip() or not self.annotator_revision.strip():
-            raise ValueError("v2 examples require annotator model provenance")
-        if self.prompt_sha256 != hashlib.sha256(self.attack_text.encode("utf-8")).hexdigest():
-            raise ValueError("prompt hash does not match attack_text")
-        if self.intent_sha256 != hashlib.sha256(self.intent.encode("utf-8")).hexdigest():
-            raise ValueError("intent hash does not match intent")
+
+        minimum_confidence = min(span.confidence for span in self.editable_spans)
+        if self.annotation_confidence != minimum_confidence:
+            raise ValueError(
+                "annotation_confidence must equal the minimum span confidence"
+            )
         return self
 
 
@@ -213,12 +220,34 @@ class OptimizationRecord(StrictRecord):
     failure_kind: FailureKind | None
     failure_reason: str | None
     state_path: str | None
+    state_sha256: Sha256 | None = None
     representation: str
     attack_loss: float | None
     fol: float | None
     internal_margin: float | None
     materialized_prompt: str | None
     counters: ComputeCounters
+
+    @model_validator(mode="after")
+    def validate_state_reference(self) -> "OptimizationRecord":
+        has_path = self.state_path is not None
+        has_digest = self.state_sha256 is not None
+
+        if self.status is RecordStatus.failed:
+            if has_path or has_digest:
+                raise ValueError("failed optimization records cannot include optimizer state")
+            return self
+
+        if has_path != has_digest:
+            if self.schema_version == "reviewer_eval.v1" and has_path:
+                # V1 may reference an external legacy state snapshot whose bytes
+                # were not managed by this runner.
+                return self
+            raise ValueError("complete optimizer state requires both path and sha256")
+
+        if self.schema_version == "reviewer_eval.v2" and not has_path:
+            raise ValueError("complete v2 optimization records require optimizer state")
+        return self
 
 
 class MaterializationRecord(StrictRecord):
@@ -248,6 +277,65 @@ class MaterializationRecord(StrictRecord):
     failure_reason: str | None
 
 
+class V2MaterializationRecord(StrictRecord):
+    """Auditable in-place reconstruction for one v2 optimization state."""
+
+    schema_version: Literal["reviewer_eval.v2"]
+    run_id: str
+    config_hash: Sha256
+    sample_id: str
+    source: str
+    method: str
+    branch: str
+    step: int = Field(ge=0)
+    transport: TransportType
+    state_sha256: Sha256
+    surrogate_tokenizer_sha256: Sha256
+    surrogate_embedding_sha256: Sha256
+    materialization_sha256: Sha256
+    editable_positions: tuple[int, ...] = Field(min_length=1)
+    original_token_ids: tuple[int, ...] = Field(min_length=1)
+    projected_z_token_ids: tuple[int, ...] = Field(min_length=1)
+    projected_u_token_ids: tuple[int, ...] = Field(min_length=1)
+    reconstructed_base_token_ids: tuple[int, ...] = Field(min_length=1)
+    complete_token_ids: tuple[int, ...] = Field(min_length=1)
+    frozen_positions_unchanged: bool
+    span_boundary_expansions: tuple[tuple[int, int], ...] = Field(min_length=1)
+    full_prompt_similarity: float = Field(ge=0.0, le=1.0)
+    editable_span_similarity: float = Field(ge=0.0, le=1.0)
+    flat_prompt: str
+    status: RecordStatus
+    failure_kind: FailureKind | None
+    failure_reason: str | None
+
+    @model_validator(mode="after")
+    def validate_reconstruction(self) -> "V2MaterializationRecord":
+        if self.transport is not TransportType.text:
+            raise ValueError("v2 materialization supports text transport only")
+        if len(self.projected_u_token_ids) != len(self.editable_positions):
+            raise ValueError("projected U token count must match editable positions")
+        if len(self.reconstructed_base_token_ids) != len(self.original_token_ids):
+            raise ValueError("reconstructed base token count must match original tokens")
+        if self.complete_token_ids != self.projected_z_token_ids + self.reconstructed_base_token_ids:
+            raise ValueError("complete token IDs must prepend projected z to reconstructed base")
+        if self.editable_positions != tuple(sorted(set(self.editable_positions))):
+            raise ValueError("editable positions must be sorted and unique")
+        if any(position < 0 or position >= len(self.original_token_ids) for position in self.editable_positions):
+            raise ValueError("editable positions are outside original token IDs")
+        editable = set(self.editable_positions)
+        for index, (original, reconstructed) in enumerate(zip(self.original_token_ids, self.reconstructed_base_token_ids)):
+            if index not in editable and original != reconstructed:
+                raise ValueError("reconstructed v2 materialization changed a frozen token")
+        if tuple(self.reconstructed_base_token_ids[index] for index in self.editable_positions) != self.projected_u_token_ids:
+            raise ValueError("reconstructed editable tokens must equal projected U token IDs")
+        if self.status is RecordStatus.complete and not self.frozen_positions_unchanged:
+            raise ValueError("complete v2 materializations must preserve frozen positions")
+        payload = self.model_dump(mode="json", exclude={"materialization_sha256"})
+        if self.materialization_sha256 != canonical_hash(payload):
+            raise ValueError("v2 materialization sha256 does not match record content")
+        return self
+
+
 class ResponseRecord(StrictRecord):
     schema_version: str
     run_id: str
@@ -265,6 +353,24 @@ class ResponseRecord(StrictRecord):
     status: RecordStatus
     failure_kind: FailureKind | None
     failure_reason: str | None
+
+
+class V2ResponseRecord(ResponseRecord):
+    schema_version: Literal["reviewer_eval.v2"]
+    branch: str
+    state_step: int = Field(ge=0)
+    transport: TransportType
+    materialization_sha256: Sha256
+    target_tokenizer_sha256: Sha256
+    executed_token_ids_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_execution_identity(self) -> "V2ResponseRecord":
+        if self.transport is not TransportType.text:
+            raise ValueError("v2 responses support text transport only")
+        if self.prompt_hash != self.executed_token_ids_sha256:
+            raise ValueError("v2 response prompt hash must equal executed token ID hash")
+        return self
 
 
 class JudgmentRecord(StrictRecord):
@@ -286,3 +392,21 @@ class JudgmentRecord(StrictRecord):
     status: RecordStatus
     failure_kind: FailureKind | None
     failure_reason: str | None
+
+
+class V2JudgmentRecord(JudgmentRecord):
+    schema_version: Literal["reviewer_eval.v2"]
+    branch: str
+    state_step: int = Field(ge=0)
+    transport: TransportType
+    materialization_sha256: Sha256
+    target_revision: str
+    target_tokenizer_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_execution_identity(self) -> "V2JudgmentRecord":
+        if self.transport is not TransportType.text:
+            raise ValueError("v2 judgments support text transport only")
+        if not self.target_revision:
+            raise ValueError("v2 judgment target revision must be non-empty")
+        return self

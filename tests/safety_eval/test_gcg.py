@@ -47,6 +47,27 @@ def test_gcg_uses_coordinate_gradient_to_select_best_allowed_token() -> None:
     assert snapshots[-1].attack_loss > snapshots[0].attack_loss
 
 
+def test_gcg_accepts_shared_embedding_state_when_given_internal_hard_ids() -> None:
+    ledger = BudgetLedger(update_limit=1, candidate_limit=1)
+    initial = EditableState(
+        z=_embedding()[torch.tensor([[0]])].detach().clone().requires_grad_(True),
+        u=_embedding()[torch.tensor([[0]])].detach().clone().requires_grad_(True),
+        z0=_embedding()[torch.tensor([[0]])],
+        u0=_embedding()[torch.tensor([[0]])],
+    )
+
+    snapshots = GCGOptimizer(
+        _embedding(),
+        search_width=1,
+        top_k=2,
+        initial_z_token_ids=torch.tensor([[0]]),
+        initial_u_token_ids=torch.tensor([[0]]),
+    ).run(_objective(), initial, ledger, CheckpointEmitter([0, 1]))
+
+    assert snapshots[-1].z_token_ids.tolist() == [[1]]
+    assert torch.equal(snapshots[0].state.u0, initial.u0)
+
+
 def test_gcg_masks_forbidden_candidate_ids() -> None:
     ledger = BudgetLedger(update_limit=1, candidate_limit=2)
 

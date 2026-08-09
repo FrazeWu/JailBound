@@ -98,6 +98,31 @@ def test_hidden_mean_encoder_reuses_an_injected_loaded_model() -> None:
     assert vectors[0].tolist() == pytest.approx([0.6, 0.8])
 
 
+def test_hidden_mean_encoder_close_releases_the_loaded_model() -> None:
+    class Model:
+        def __init__(self) -> None:
+            self.device = "cpu"
+            self.destination: str | None = None
+
+        def eval(self) -> "Model":
+            return self
+
+        def to(self, destination: str) -> "Model":
+            self.destination = destination
+            return self
+
+    model = Model()
+    encoder = QwenHiddenMeanEncoder(
+        "/not-used-when-injected", tokenizer=object(), model=model, revision="local:fixture"
+    )
+
+    encoder.close()
+
+    assert model.destination == "cpu"
+    assert encoder._model is None
+    assert encoder._tokenizer is None
+
+
 def test_calibration_holdouts_are_disjoint_and_have_same_category_negative_partners() -> None:
     candidates = (
         CalibrationCandidate("source:001", "source", "category_a", "intent 1"),

@@ -9,22 +9,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pytest
+from omegaconf import OmegaConf
 
 from benchmark.safety_eval.config import (
     ExperimentConfig,
-    H1V2Config,
-    H1V3StudyConfig,
+    V2ExperimentConfig,
     load_config,
-    load_h1_v2_config,
-    load_h1_v3_config,
+    load_v2_config,
+    structured_artifact_contains_v1,
 )
+from benchmark.safety_eval.schema import ComputeCounters, OptimizationRecord, RecordStatus
 
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs/benchmark/safety_eval_additions.yaml"
-GBDA_OFFICIAL_CONFIG = ROOT / "configs/benchmark/safety_eval_gbda_official.yaml"
-H1_V2_CONFIG = ROOT / "configs/benchmark/safety_eval_h1_v2.yaml"
-H1_V3_CONFIG = ROOT / "configs/benchmark/safety_eval_h1_v3.yaml"
+V2_CONFIG = ROOT / "configs/benchmark/safety_eval_paper_v2.yaml"
 PYPROJECT = ROOT / "pyproject.toml"
 
 Mutation = Callable[[Any], Any]
@@ -56,6 +55,242 @@ DICT_MUTATIONS: list[tuple[str, Mutation]] = [
 ]
 
 
+def _v2_payload() -> dict[str, Any]:
+    payload = OmegaConf.to_container(OmegaConf.load(V2_CONFIG), resolve=True)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _write_v2_config(tmp_path: Path, payload: dict[str, Any]) -> Path:
+    path = tmp_path / "v2.yaml"
+    OmegaConf.save(config=OmegaConf.create(payload), f=path)
+    return path
+
+
+def test_checked_in_v2_config_loads_strict_paper_contract() -> None:
+    config = load_v2_config(V2_CONFIG)
+
+    assert isinstance(config, V2ExperimentConfig)
+    assert not isinstance(config, ExperimentConfig)
+    assert config.run.schema_version == "reviewer_eval.v2"
+    assert config.run.output_root == Path("outputs/results/reviewer_eval_v2")
+    assert config.annotation.model == "de-aligned-annotator"
+    assert config.annotation.revision == "immutable-revision"
+    assert config.annotation.temperature == 0.0
+    assert config.annotation.repair_attempts == 1
+    assert config.optimization.prefix_tokens == 20
+    assert config.optimization.prefix_initialization.strategy == "repeat_token"
+    assert config.optimization.prefix_initialization.token_text == "!"
+
+
+def test_v2_smoke_mode_requires_an_isolated_one_sample_output(tmp_path: Path) -> None:
+    payload = _v2_payload()
+    payload["run"]["smoke_mode"] = True
+    payload["run"]["output_root"] = "outputs/results/smoke/one-sample"
+    payload["data"]["sources"] = ["advbench"]
+    payload["data"]["samples_per_source"] = 1
+    payload["optimization"]["methods"] = ["random_mutation"]
+
+    config = load_v2_config(_write_v2_config(tmp_path, payload))
+    assert config.run.smoke_mode is True
+
+    payload["run"]["output_root"] = "outputs/results/reviewer_eval_v2"
+    with pytest.raises(ValueError, match="smoke output root"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+    payload["run"]["output_root"] = "outputs/results/smoke/one-sample"
+    payload["optimization"]["methods"] = ["dual_branch"]
+    with pytest.raises(ValueError, match="does not support dual_branch"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_requires_a_local_secondary_judge_snapshot(tmp_path: Path) -> None:
+    payload = _v2_payload()
+    payload["judging"]["secondary"]["local_path"] = "/fixture/qwen32"
+    del payload["judging"]["secondary"]["local_path"]
+
+    with pytest.raises(ValueError, match="secondary judge requires a local snapshot"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("optimization", "prefix_initialization", "strategy"), None, "strategy"),
+        (("annotation", "temperature"), 0.1, "temperature"),
+        (("annotation", "temperature"), 0, "temperature"),
+        (("annotation", "temperature"), False, "temperature"),
+        (("annotation", "repair_attempts"), 2, "repair_attempts"),
+        (("annotation", "repair_attempts"), True, "repair_attempts"),
+        (("optimization", "final_states_per_branch"), 0, "final_states_per_branch"),
+        (("optimization", "anchor_set_version"), "", "anchor_set_version"),
+        (("run", "schema_version"), "reviewer_eval.v1", "reviewer_eval.v2"),
+    ],
+    ids=[
+        "missing-prefix-strategy",
+        "nonzero-annotation-temperature",
+        "integer-annotation-temperature",
+        "boolean-annotation-temperature",
+        "wrong-repair-attempts",
+        "boolean-repair-attempts",
+        "no-final-states",
+        "empty-anchor-set-version",
+        "v1-schema-version",
+    ],
+)
+def test_v2_loader_rejects_invalid_contract_fields(
+    tmp_path: Path,
+    path: tuple[str, ...],
+    value: object,
+    message: str,
+) -> None:
+    payload = _v2_payload()
+    target: dict[str, Any] = payload
+    for key in path[:-1]:
+        target = target[key]
+    if value is None:
+        del target[path[-1]]
+    else:
+        target[path[-1]] = value
+
+    with pytest.raises(ValueError, match=message):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("model", ""), ("revision", "")],
+    ids=["empty-model", "empty-revision"],
+)
+def test_v2_loader_rejects_empty_annotation_identity(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    payload = _v2_payload()
+    payload["annotation"][field] = value
+
+    with pytest.raises(ValueError, match=field):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_rejects_invalid_repeat_token_initialization(tmp_path: Path) -> None:
+    payload = _v2_payload()
+    payload["optimization"]["prefix_initialization"]["token_text"] = ""
+
+    with pytest.raises(ValueError, match="token_text"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_rejects_output_root_with_structured_v1_artifact(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "candidate"
+    output_root.mkdir()
+    (output_root / "locked_config.json").write_text(
+        json.dumps({"run": {"schema_version": "reviewer_eval.v1"}}),
+        encoding="utf-8",
+    )
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_structured_artifact_contains_v1_is_public(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text(
+        json.dumps({"record": {"schema_version": "reviewer_eval.v1"}}),
+        encoding="utf-8",
+    )
+
+    assert structured_artifact_contains_v1(artifact)
+
+
+def test_v2_loader_cannot_hide_standard_v1_lock_with_renamed_config_lock(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "candidate"
+    output_root.mkdir()
+    (output_root / "locked_config.json").write_text(
+        json.dumps({"run": {"schema_version": "reviewer_eval.v1"}}),
+        encoding="utf-8",
+    )
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+    payload["run"]["locked_config_name"] = "v2_locked_config.json"
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_rejects_nested_structured_v1_jsonl_ledger(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "candidate"
+    ledger = output_root / "optimization" / "advbench" / "pez" / "records.jsonl"
+    ledger.parent.mkdir(parents=True)
+    record = OptimizationRecord(
+        schema_version="reviewer_eval.v1",
+        run_id="run:legacy",
+        config_hash="a" * 64,
+        git_revision="1234567890abcdef",
+        cell_id="cell:legacy",
+        sample_id="advbench:000000:legacy",
+        source="advbench",
+        method="pez",
+        checkpoint=25,
+        random_seed=20260725,
+        status=RecordStatus.complete,
+        failure_kind=None,
+        failure_reason=None,
+        state_path=None,
+        representation="token_ids",
+        attack_loss=0.25,
+        fol=0.5,
+        internal_margin=0.1,
+        materialized_prompt=None,
+        counters=ComputeCounters(),
+    )
+    ledger.write_text(record.model_dump_json() + "\n", encoding="utf-8")
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_rejects_nested_uppercase_v1_jsonl_ledger(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "candidate"
+    ledger = output_root / "optimization" / "records.JSONL"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        "{}\n"
+        + json.dumps({"record": {"schema_version": "reviewer_eval.v1"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+
+    with pytest.raises(ValueError, match="structured reviewer_eval.v1 artifact"):
+        load_v2_config(_write_v2_config(tmp_path, payload))
+
+
+def test_v2_loader_does_not_guess_artifact_version_from_directory_name(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "reviewer_eval_v1_but_empty"
+    output_root.mkdir()
+    payload = _v2_payload()
+    payload["run"]["output_root"] = str(output_root)
+
+    config = load_v2_config(_write_v2_config(tmp_path, payload))
+
+    assert config.run.output_root == output_root
+
+
 def test_checked_in_config_has_approved_scope() -> None:
     config = load_config(CONFIG)
     assert config.run.output_root == Path(
@@ -79,71 +314,6 @@ def test_checked_in_config_has_approved_scope() -> None:
     assert config.models.surrogate.local_path == Path("/home/wh/models/qwen/Qwen2___5-7B-Instruct")
     assert config.fol.validation_per_source == 17
     assert (config.fol.low, config.fol.middle, config.fol.high) == (7, 3, 7)
-
-
-def test_official_gbda_config_is_isolated_and_preserves_the_controlled_scope() -> None:
-    base = load_config(CONFIG)
-    config = load_config(GBDA_OFFICIAL_CONFIG)
-
-    assert config.run.output_root.name == "reviewer_gbda_official_n17"
-    assert config.run.output_root != base.run.output_root
-    assert config.data == base.data
-    assert config.models == base.models
-    assert config.optimization.methods == [
-        "init",
-        "random_mutation",
-        "zol",
-        "pez",
-        "gbda",
-        "gbda_official",
-        "gcg",
-        "jailbound_o_minus",
-        "jailbound_o_plus",
-        "dual_branch",
-    ]
-
-
-def test_h1_v2_config_is_isolated_and_uses_the_frozen_confirmation_counts() -> None:
-    config = load_h1_v2_config(H1_V2_CONFIG)
-
-    assert config.h1_v2.output_root.name == "fol_h1_v2"
-    assert config.h1_v2.primary_judge_local_path == Path("/home/dasp/models/Octopus-SEval-14B")
-    assert config.h1_v2.candidate_count == 81
-    assert (config.h1_v2.low, config.h1_v2.middle, config.h1_v2.high) == (17, 3, 17)
-    assert config.h1_v2.accepted_directions == 32
-    assert config.h1_v2.output_root != config.base.run.output_root
-
-
-def test_h1_v2_config_rejects_non_prime_display_band_count() -> None:
-    payload = load_h1_v2_config(H1_V2_CONFIG).model_dump(mode="json")
-    payload["h1_v2"]["low"] = 15
-
-    with pytest.raises(ValueError, match="prime"):
-        H1V2Config.model_validate(payload)
-
-
-def test_h1_v3_config_isolated_to_the_new_local_radius_extension() -> None:
-    config = load_h1_v3_config(H1_V3_CONFIG)
-
-    assert config.h1_v3.output_root.name == "fol_h1_v3"
-    assert config.h1_v3.source_root.name == "fol_h1_v2"
-    assert config.h1_v3.source_root != config.h1_v3.output_root
-    assert config.h1_v3.radius_candidates == [0.4, 0.6]
-    assert config.h1_v3.accepted_directions == 32
-
-
-def test_h1_v3_rejects_nonlocal_or_h1_v2_output_roots() -> None:
-    payload = load_h1_v3_config(H1_V3_CONFIG).model_dump(mode="json")
-    payload["h1_v3"]["output_root"] = (
-        "outputs/results/reviewer_additions_n17_qwen7b_local_qwen32_compat_eager_randomfix/fol_h1_v2"
-    )
-    with pytest.raises(ValueError, match="fol_h1_v3"):
-        H1V3StudyConfig.model_validate(payload["h1_v3"])
-
-    payload = load_h1_v3_config(H1_V3_CONFIG).model_dump(mode="json")
-    payload["h1_v3"]["radius_candidates"] = [0.4]
-    with pytest.raises(ValueError, match="requires exactly"):
-        H1V3StudyConfig.model_validate(payload["h1_v3"])
 
 
 def test_config_rejects_non_matched_dual_budget() -> None:

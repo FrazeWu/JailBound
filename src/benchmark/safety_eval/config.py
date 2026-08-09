@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Literal, Mapping, NoReturn, Self
 
 from omegaconf import OmegaConf
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 _MODEL_COPY_UPDATE_UNSET = object()
@@ -117,6 +118,15 @@ class RunConfig(StrictModel):
     attention_implementation: Literal["eager"]
 
 
+class V2RunConfig(StrictModel):
+    schema_version: Literal["reviewer_eval.v2"]
+    seed: Literal[20260725]
+    output_root: Path
+    locked_config_name: str
+    attention_implementation: Literal["eager"]
+    smoke_mode: bool = False
+
+
 class DataConfig(StrictModel):
     sources: list[str]
     samples_per_source: int
@@ -142,6 +152,44 @@ class ModelsConfig(StrictModel):
     octopus: ModelSpec
 
 
+class AnnotationConfig(StrictModel):
+    model: str
+    revision: str
+    endpoint: str
+    template_path: Path
+    confidence_artifact: Path
+    temperature: float = Field(strict=True)
+    repair_attempts: int = Field(strict=True)
+
+    @field_validator("model", "revision")
+    @classmethod
+    def validate_non_empty_identity(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("annotation model and revision must be non-empty")
+        return value
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def validate_temperature_type(cls, value: object) -> object:
+        if type(value) is not float:
+            raise ValueError("annotation temperature must be a strict float")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: float) -> float:
+        if value != 0.0:
+            raise ValueError("annotation temperature must be exactly 0.0")
+        return value
+
+    @field_validator("repair_attempts")
+    @classmethod
+    def validate_repair_attempts(cls, value: int) -> int:
+        if value != 1:
+            raise ValueError("annotation repair_attempts must be exactly 1")
+        return value
+
+
 class OptimizationConfig(StrictModel):
     methods: list[str]
     update_budget: int
@@ -162,6 +210,40 @@ class OptimizationConfig(StrictModel):
     refusal_anchors: list[str]
 
 
+class PrefixInitializationConfig(StrictModel):
+    strategy: Literal["repeat_token"]
+    token_text: str = Field(min_length=1)
+
+
+class V2OptimizationConfig(StrictModel):
+    methods: list[str]
+    update_budget: int
+    dual_branch_updates: dict[str, int]
+    checkpoints: list[int]
+    prefix_tokens: int
+    prefix_initialization: PrefixInitializationConfig
+    final_states_per_branch: int = Field(ge=1)
+    anchor_set_version: str = Field(min_length=1)
+    candidate_cap: int
+    learning_rate: float
+    gbda_learning_rate: float
+    gcg_search_width: int
+    lambda_fol: float
+    epsilon: float
+    gamma_z: float
+    gamma_u: float
+    grad_clip: float
+    answer_anchors: list[str]
+    refusal_anchors: list[str]
+
+    @field_validator("anchor_set_version")
+    @classmethod
+    def validate_anchor_set_version(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("anchor_set_version must be non-empty")
+        return value
+
+
 class SemanticConfig(StrictModel):
     calibration_examples_per_source: int
     target_positive_recall: float
@@ -176,6 +258,7 @@ class JudgeSpec(StrictModel):
     threshold_offsets: list[float]
     model: str | None = None
     endpoint: str | None = None
+    local_path: Path | None = None
     temperature: float = 0.0
 
 
@@ -207,6 +290,89 @@ class FolConfig(StrictModel):
     permutation_replicates: int
 
 
+def _validate_approved_scope(
+    *,
+    data: DataConfig,
+    models: ModelsConfig,
+    optimization: OptimizationConfig | V2OptimizationConfig,
+    judging: JudgingConfig,
+    fol: FolConfig,
+) -> None:
+    expected_sources = [
+        "advbench",
+        "harmbench",
+        "safetybench",
+        "sg_bench",
+        "jailbreakbench",
+        "jailbound",
+        "s_eval",
+    ]
+    expected_methods = [
+        "init",
+        "random_mutation",
+        "zol",
+        "pez",
+        "gbda",
+        "gcg",
+        "jailbound_o_minus",
+        "jailbound_o_plus",
+        "dual_branch",
+    ]
+    expected_targets = ["qwen2_5_7b"]
+    if data.sources != expected_sources or data.samples_per_source != 17:
+        raise ValueError(
+            "controlled data must use seven approved sources with 17 samples each"
+        )
+    if optimization.methods != expected_methods:
+        raise ValueError("optimization method identities or order changed")
+    if optimization.update_budget != 100:
+        raise ValueError("single-branch update budget must be 100")
+    if optimization.dual_branch_updates != {"o_minus": 50, "o_plus": 50}:
+        raise ValueError("dual branch must consume exactly 100 updates as 50/50")
+    if optimization.checkpoints != [0, 25, 50, 100]:
+        raise ValueError("checkpoint policy must be 0/25/50/100")
+    if [model.key for model in models.targets] != expected_targets:
+        raise ValueError("target models must remain in the approved serial order")
+    if models.surrogate.key != "qwen2_5_7b":
+        raise ValueError("white-box surrogate must be the local Qwen2.5-7B-Instruct")
+    primary = judging.primary
+    if (
+        primary.key,
+        primary.model,
+        primary.endpoint,
+        primary.temperature,
+    ) != ("octopus_seval_14b", None, None, 0.0):
+        raise ValueError("primary judge must remain the approved local Octopus definition")
+    secondary = judging.secondary
+    if (
+        secondary.key,
+        secondary.model,
+        secondary.endpoint,
+        secondary.temperature,
+    ) != (
+        "qwen32_compat",
+        "qwen3-32b-awq",
+        "http://localhost:8001/v1",
+        0.0,
+    ):
+        raise ValueError(
+            "secondary judge must remain the approved local Qwen compatibility endpoint"
+        )
+    if (
+        fol.validation_per_source,
+        fol.low,
+        fol.middle,
+        fol.high,
+    ) != (17, 7, 3, 7):
+        raise ValueError(
+            "FOL validation must retain the approved 7/3/7 split within 17"
+        )
+    if fol.sources != ["jailbound", "s_eval"]:
+        raise ValueError(
+            "focused FOL validation is restricted to JailBound and S-Eval"
+        )
+
+
 class ExperimentConfig(StrictModel):
     run: RunConfig
     data: DataConfig
@@ -218,82 +384,51 @@ class ExperimentConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_approved_scope(self) -> "ExperimentConfig":
-        expected_sources = [
-            "advbench",
-            "harmbench",
-            "safetybench",
-            "sg_bench",
-            "jailbreakbench",
-            "jailbound",
-            "s_eval",
-        ]
-        expected_methods = [
-            "init",
-            "random_mutation",
-            "zol",
-            "pez",
-            "gbda",
-            "gcg",
-            "jailbound_o_minus",
-            "jailbound_o_plus",
-            "dual_branch",
-        ]
-        official_gbda_methods = [
-            *expected_methods[:5],
-            "gbda_official",
-            *expected_methods[5:],
-        ]
-        expected_targets = ["qwen2_5_7b"]
-        if self.data.sources != expected_sources or self.data.samples_per_source != 17:
-            raise ValueError(
-                "controlled data must use seven approved sources with 17 samples each"
-            )
-        if tuple(self.optimization.methods) not in {tuple(expected_methods), tuple(official_gbda_methods)}:
-            raise ValueError("optimization method identities or order changed")
-        if self.optimization.update_budget != 100:
-            raise ValueError("single-branch update budget must be 100")
-        if self.optimization.dual_branch_updates != {"o_minus": 50, "o_plus": 50}:
-            raise ValueError("dual branch must consume exactly 100 updates as 50/50")
-        if self.optimization.checkpoints != [0, 25, 50, 100]:
-            raise ValueError("checkpoint policy must be 0/25/50/100")
-        if [model.key for model in self.models.targets] != expected_targets:
-            raise ValueError("target models must remain in the approved serial order")
-        if self.models.surrogate.key != "qwen2_5_7b":
-            raise ValueError("white-box surrogate must be the local Qwen2.5-7B-Instruct")
-        primary = self.judging.primary
-        if (
-            primary.key,
-            primary.model,
-            primary.endpoint,
-            primary.temperature,
-        ) != ("octopus_seval_14b", None, None, 0.0):
-            raise ValueError("primary judge must remain the approved local Octopus definition")
-        secondary = self.judging.secondary
-        if (
-            secondary.key,
-            secondary.model,
-            secondary.endpoint,
-            secondary.temperature,
-        ) != (
-            "qwen32_compat",
-            "qwen3-32b-awq",
-            "http://localhost:8001/v1",
-            0.0,
-        ):
-            raise ValueError("secondary judge must remain the approved local Qwen compatibility endpoint")
-        if (
-            self.fol.validation_per_source,
-            self.fol.low,
-            self.fol.middle,
-            self.fol.high,
-        ) != (17, 7, 3, 7):
-            raise ValueError(
-                "FOL validation must retain the approved 7/3/7 split within 17"
-            )
-        if self.fol.sources != ["jailbound", "s_eval"]:
-            raise ValueError(
-                "focused FOL validation is restricted to JailBound and S-Eval"
-            )
+        _validate_approved_scope(
+            data=self.data,
+            models=self.models,
+            optimization=self.optimization,
+            judging=self.judging,
+            fol=self.fol,
+        )
+        return self
+
+
+class V2ExperimentConfig(StrictModel):
+    run: V2RunConfig
+    data: DataConfig
+    models: ModelsConfig
+    optimization: V2OptimizationConfig
+    semantic: SemanticConfig
+    judging: JudgingConfig
+    fol: FolConfig
+    annotation: AnnotationConfig
+
+    @model_validator(mode="after")
+    def validate_approved_scope(self) -> "V2ExperimentConfig":
+        if self.judging.secondary.local_path is None:
+            raise ValueError("v2 secondary judge requires a local snapshot")
+        if self.run.smoke_mode:
+            if "smoke" not in self.run.output_root.parts:
+                raise ValueError("smoke output root must contain a smoke path component")
+            if (
+                len(self.data.sources) != 1
+                or self.data.samples_per_source != 1
+                or len(self.optimization.methods) != 1
+            ):
+                raise ValueError(
+                    "smoke mode requires exactly one source, sample, and method"
+                )
+            if self.optimization.methods[0] == "dual_branch":
+                raise ValueError("smoke mode does not support dual_branch")
+            return self
+        _validate_approved_scope(
+            data=self.data,
+            models=self.models,
+            optimization=self.optimization,
+            judging=self.judging,
+            fol=self.fol,
+        )
         return self
 
 
@@ -304,158 +439,65 @@ def load_config(path: str | Path) -> ExperimentConfig:
     return ExperimentConfig.model_validate(payload)
 
 
-class H1V2StudyConfig(StrictModel):
-    """Locked, independent confirmation settings for the FOL boundary study."""
-
-    output_root: Path
-    primary_judge_local_path: Path
-    sources: list[str]
-    candidate_count: int
-    minimum_baseline_safe_count: int
-    low: int
-    middle: int
-    high: int
-    reserves: int
-    accepted_directions: int
-    max_direction_attempts: int
-    radius_candidates: list[float]
-    semantic_acceptance_floor: float
-    relative_state_change_cap: float
-    permutation_replicates: int
-    bootstrap_replicates: int
-
-    @field_validator("low", "middle", "high")
-    @classmethod
-    def _require_prime_display_band(cls, value: int) -> int:
-        if value < 2 or any(value % divisor == 0 for divisor in range(2, int(value ** 0.5) + 1)):
-            raise ValueError("H1-v2 endpoint-band counts must be prime")
-        return value
-
-    @model_validator(mode="after")
-    def validate_confirmatory_protocol(self) -> "H1V2StudyConfig":
-        if self.sources != ["jailbound", "s_eval"]:
-            raise ValueError("H1-v2 is restricted to JailBound and S-Eval")
-        if self.candidate_count != 81:
-            raise ValueError("H1-v2 requires exactly 81 new candidates per source")
-        if self.minimum_baseline_safe_count != 41:
-            raise ValueError("H1-v2 requires 41 baseline-safe candidates before selection")
-        if (self.low, self.middle, self.high) != (17, 3, 17):
-            raise ValueError("H1-v2 requires the frozen 17/3/17 selection")
-        if self.reserves != 4:
-            raise ValueError("H1-v2 requires four ordered reserves")
-        if self.accepted_directions != 32 or self.max_direction_attempts < self.accepted_directions:
-            raise ValueError("H1-v2 requires 32 accepted directions and a sufficient attempt cap")
-        radii = tuple(float(radius) for radius in self.radius_candidates)
-        if len(radii) < 2 or any(radius <= 0.0 for radius in radii) or any(
-            later <= earlier for earlier, later in zip(radii, radii[1:], strict=False)
-        ):
-            raise ValueError("H1-v2 radius candidates must be positive and strictly increasing")
-        if not 0.0 < self.semantic_acceptance_floor <= 1.0:
-            raise ValueError("H1-v2 semantic acceptance floor must be a probability")
-        if self.relative_state_change_cap <= 0.0:
-            raise ValueError("H1-v2 relative-state-change cap must be positive")
-        if self.permutation_replicates < 999 or self.bootstrap_replicates < 999:
-            raise ValueError("H1-v2 requires at least 999 permutation and bootstrap replicates")
-        if self.output_root.name != "fol_h1_v2":
-            raise ValueError("H1-v2 output root must end in fol_h1_v2")
-        if self.primary_judge_local_path.name != "Octopus-SEval-14B":
-            raise ValueError("H1-v2 primary judge path must identify Octopus-SEval-14B")
-        return self
+def _contains_v1_schema_version(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("schema_version") == "reviewer_eval.v1":
+            return True
+        return any(_contains_v1_schema_version(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_v1_schema_version(item) for item in value)
+    return False
 
 
-class H1V2Config(StrictModel):
-    """Base controlled experiment plus isolated H1-v2 confirmation contract."""
+def structured_artifact_contains_v1(path: Path) -> bool:
+    try:
+        if path.suffix.lower() == ".jsonl":
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if _contains_v1_schema_version(payload):
+                        return True
+            return False
 
-    base: ExperimentConfig
-    h1_v2: H1V2StudyConfig
-
-    @model_validator(mode="after")
-    def validate_isolation(self) -> "H1V2Config":
-        if self.h1_v2.output_root == self.base.run.output_root:
-            raise ValueError("H1-v2 output root must differ from the exploratory experiment root")
-        return self
-
-
-def load_h1_v2_config(path: str | Path) -> H1V2Config:
-    """Load the separate H1-v2 protocol without loosening the base contract."""
-    source = Path(path)
-    payload = OmegaConf.to_container(OmegaConf.load(source), resolve=True)
-    if not isinstance(payload, dict):
-        raise ValueError("H1-v2 configuration must be a mapping")
-    base_path = payload.pop("base_config", None)
-    if not isinstance(base_path, str) or not base_path:
-        raise ValueError("H1-v2 configuration requires a base_config path")
-    resolved_base = Path(base_path)
-    if not resolved_base.is_absolute():
-        resolved_base = source.parent / resolved_base
-    payload["base"] = load_config(resolved_base).model_dump(mode="json")
-    return H1V2Config.model_validate(payload)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return _contains_v1_schema_version(payload)
 
 
-class H1V3StudyConfig(StrictModel):
-    """Strictly isolated settings for the H1-v3 local-radius extension."""
+def _reject_structured_v1_artifacts(config: V2ExperimentConfig) -> None:
+    artifact_names = {
+        "locked_config.json",
+        config.run.locked_config_name,
+        "run_manifest.json",
+        "optimization_config.json",
+    }
+    artifacts = {
+        config.run.output_root / artifact_name for artifact_name in artifact_names
+    }
+    if config.run.output_root.is_dir():
+        artifacts.update(
+            path
+            for path in config.run.output_root.rglob("*")
+            if path.suffix.lower() in {".json", ".jsonl"}
+        )
 
-    source_root: Path
-    output_root: Path
-    primary_judge_local_path: Path
-    sources: list[str]
-    radius_candidates: list[float]
-    accepted_directions: int = 32
-    max_direction_attempts: int = 64
-    semantic_acceptance_floor: float = 0.95
-    relative_state_change_cap: float = 0.10
-    permutation_replicates: int = 10_000
-    bootstrap_replicates: int = 10_000
-
-    @model_validator(mode="after")
-    def validate_local_radius_extension(self) -> "H1V3StudyConfig":
-        if self.sources != ["jailbound", "s_eval"]:
-            raise ValueError("H1-v3 is restricted to JailBound and S-Eval")
-        if tuple(float(value) for value in self.radius_candidates) != (0.4, 0.6):
-            raise ValueError("H1-v3 requires exactly the new local radii [0.4, 0.6]")
-        if self.accepted_directions != 32 or self.max_direction_attempts < 32:
-            raise ValueError("H1-v3 requires 32 accepted directions and a sufficient attempt cap")
-        if not 0.0 < self.semantic_acceptance_floor <= 1.0:
-            raise ValueError("H1-v3 semantic acceptance floor must be a probability")
-        if self.relative_state_change_cap != 0.10:
-            raise ValueError("H1-v3 relative-state-change cap must remain 0.10")
-        if self.permutation_replicates < 999 or self.bootstrap_replicates < 999:
-            raise ValueError("H1-v3 requires at least 999 permutation and bootstrap replicates")
-        if self.source_root.name != "fol_h1_v2":
-            raise ValueError("H1-v3 source root must end in fol_h1_v2")
-        if self.output_root.name != "fol_h1_v3":
-            raise ValueError("H1-v3 output root must end in fol_h1_v3")
-        if self.source_root == self.output_root:
-            raise ValueError("H1-v3 source and output roots must differ")
-        if self.primary_judge_local_path.name != "Octopus-SEval-14B":
-            raise ValueError("H1-v3 primary judge path must identify Octopus-SEval-14B")
-        return self
+    for artifact in sorted(artifacts):
+        if artifact.is_file() and structured_artifact_contains_v1(artifact):
+            raise ValueError(
+                f"v2 output root contains a structured reviewer_eval.v1 artifact: {artifact}"
+            )
 
 
-class H1V3Config(StrictModel):
-    """Base controlled experiment plus the isolated H1-v3 extension contract."""
-
-    base: ExperimentConfig
-    h1_v3: H1V3StudyConfig
-
-    @model_validator(mode="after")
-    def validate_isolation(self) -> "H1V3Config":
-        if self.h1_v3.output_root == self.base.run.output_root:
-            raise ValueError("H1-v3 output root must differ from the exploratory experiment root")
-        return self
-
-
-def load_h1_v3_config(path: str | Path) -> H1V3Config:
-    """Load the H1-v3 follow-up without permitting writes to H1-v2."""
-    source = Path(path)
-    payload = OmegaConf.to_container(OmegaConf.load(source), resolve=True)
-    if not isinstance(payload, dict):
-        raise ValueError("H1-v3 configuration must be a mapping")
-    base_path = payload.pop("base_config", None)
-    if not isinstance(base_path, str) or not base_path:
-        raise ValueError("H1-v3 configuration requires a base_config path")
-    resolved_base = Path(base_path)
-    if not resolved_base.is_absolute():
-        resolved_base = source.parent / resolved_base
-    payload["base"] = load_config(resolved_base).model_dump(mode="json")
-    return H1V3Config.model_validate(payload)
+def load_v2_config(path: str | Path) -> V2ExperimentConfig:
+    payload: dict[str, Any] = OmegaConf.to_container(
+        OmegaConf.load(path), resolve=True
+    )
+    config = V2ExperimentConfig.model_validate(payload)
+    _reject_structured_v1_artifacts(config)
+    return config
