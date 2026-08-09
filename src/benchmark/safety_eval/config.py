@@ -439,6 +439,94 @@ def load_config(path: str | Path) -> ExperimentConfig:
     return ExperimentConfig.model_validate(payload)
 
 
+class H1V2StudyConfig(StrictModel):
+    """Locked, independent confirmation settings for the FOL boundary study."""
+
+    output_root: Path
+    primary_judge_local_path: Path
+    sources: list[str]
+    candidate_count: int
+    minimum_baseline_safe_count: int
+    low: int
+    middle: int
+    high: int
+    reserves: int
+    accepted_directions: int
+    max_direction_attempts: int
+    radius_candidates: list[float]
+    semantic_acceptance_floor: float
+    relative_state_change_cap: float
+    permutation_replicates: int
+    bootstrap_replicates: int
+
+    @field_validator("low", "middle", "high")
+    @classmethod
+    def _require_prime_display_band(cls, value: int) -> int:
+        if value < 2 or any(value % divisor == 0 for divisor in range(2, int(value ** 0.5) + 1)):
+            raise ValueError("H1-v2 endpoint-band counts must be prime")
+        return value
+
+    @model_validator(mode="after")
+    def validate_confirmatory_protocol(self) -> "H1V2StudyConfig":
+        if self.sources != ["jailbound", "s_eval"]:
+            raise ValueError("H1-v2 is restricted to JailBound and S-Eval")
+        if self.candidate_count != 81:
+            raise ValueError("H1-v2 requires exactly 81 new candidates per source")
+        if self.minimum_baseline_safe_count != 41:
+            raise ValueError("H1-v2 requires 41 baseline-safe candidates before selection")
+        if (self.low, self.middle, self.high) != (17, 3, 17):
+            raise ValueError("H1-v2 requires the frozen 17/3/17 selection")
+        if self.reserves != 4:
+            raise ValueError("H1-v2 requires four ordered reserves")
+        if self.accepted_directions != 32 or self.max_direction_attempts < self.accepted_directions:
+            raise ValueError("H1-v2 requires 32 accepted directions and a sufficient attempt cap")
+        radii = tuple(float(radius) for radius in self.radius_candidates)
+        if len(radii) < 2 or any(radius <= 0.0 for radius in radii) or any(
+            later <= earlier for earlier, later in zip(radii, radii[1:], strict=False)
+        ):
+            raise ValueError("H1-v2 radius candidates must be positive and strictly increasing")
+        if not 0.0 < self.semantic_acceptance_floor <= 1.0:
+            raise ValueError("H1-v2 semantic acceptance floor must be a probability")
+        if self.relative_state_change_cap <= 0.0:
+            raise ValueError("H1-v2 relative-state-change cap must be positive")
+        if self.permutation_replicates < 999 or self.bootstrap_replicates < 999:
+            raise ValueError("H1-v2 requires at least 999 permutation and bootstrap replicates")
+        if self.output_root.name != "fol_h1_v2":
+            raise ValueError("H1-v2 output root must end in fol_h1_v2")
+        if self.primary_judge_local_path.name != "Octopus-SEval-14B":
+            raise ValueError("H1-v2 primary judge path must identify Octopus-SEval-14B")
+        return self
+
+
+class H1V2Config(StrictModel):
+    """Base controlled experiment plus isolated H1-v2 confirmation contract."""
+
+    base: ExperimentConfig
+    h1_v2: H1V2StudyConfig
+
+    @model_validator(mode="after")
+    def validate_isolation(self) -> "H1V2Config":
+        if self.h1_v2.output_root == self.base.run.output_root:
+            raise ValueError("H1-v2 output root must differ from the exploratory experiment root")
+        return self
+
+
+def load_h1_v2_config(path: str | Path) -> H1V2Config:
+    """Load the separate H1-v2 protocol without loosening the base contract."""
+    source = Path(path)
+    payload = OmegaConf.to_container(OmegaConf.load(source), resolve=True)
+    if not isinstance(payload, dict):
+        raise ValueError("H1-v2 configuration must be a mapping")
+    base_path = payload.pop("base_config", None)
+    if not isinstance(base_path, str) or not base_path:
+        raise ValueError("H1-v2 configuration requires a base_config path")
+    resolved_base = Path(base_path)
+    if not resolved_base.is_absolute():
+        resolved_base = source.parent / resolved_base
+    payload["base"] = load_config(resolved_base).model_dump(mode="json")
+    return H1V2Config.model_validate(payload)
+
+
 def _contains_v1_schema_version(value: object) -> bool:
     if isinstance(value, dict):
         if value.get("schema_version") == "reviewer_eval.v1":

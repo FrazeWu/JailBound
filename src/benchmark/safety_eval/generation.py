@@ -130,32 +130,6 @@ def generate_from_embeddings(
     )
 
 
-def generate_from_token_ids(
-    model: Any,
-    tokenizer: Any,
-    *,
-    input_ids: Any,
-    max_new_tokens: int,
-) -> GenerationResult:
-    """Generate greedily from an already-constructed token sequence."""
-    input_ids = move_to_model_input_device(input_ids, model)
-    output_ids = model.generate(
-        input_ids,
-        attention_mask=_full_attention_mask(input_ids),
-        **_greedy_kwargs(max_new_tokens),
-    )
-    input_sequence = _first_sequence(input_ids)
-    output_sequence = _first_sequence(output_ids)
-    generated_ids = output_sequence[len(input_sequence) :]
-    response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return GenerationResult(
-        response=response,
-        input_tokens=len(input_sequence),
-        generated_tokens=len(generated_ids),
-        used_system_fallback=False,
-    )
-
-
 def generate_from_embedding_batch(
     model: Any,
     tokenizer: Any,
