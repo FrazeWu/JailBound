@@ -11,7 +11,7 @@
 | S-Eval | 20.1 | 27.8 | 41.4 | 37.9 | 56.2 | 60.9 | 58.6 |
 
 
-### Qwen3-72B Judge
+### Qwen3-32B-AWQ Judge
 
 | Source | Init | GBDA | GCG | PEZ | ZOL-only | High-Value | Safety-Sensitivity |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -56,8 +56,8 @@ Differences are computed from unrounded BFR values.
 |---|---|---:|---:|---:|
 | Octopus-SEval-14B | JailBound | 18.3 | 60.4 | **64.5** |
 | Octopus-SEval-14B | S-Eval | 20.1 | 56.2 | **60.9** |
-| Qwen3-72B | JailBound | 16.6 | 60.4 | **62.7** |
-| Qwen3-72B | S-Eval | 20.1 | 55.0 | **59.8** |
+| Qwen3-32B-AWQ | JailBound | 16.6 | 60.4 | **62.7** |
+| Qwen3-32B-AWQ | S-Eval | 20.1 | 55.0 | **59.8** |
 
 ## Within-Pipeline Materialization Ablation
 
